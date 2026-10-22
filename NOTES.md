@@ -96,25 +96,82 @@ PSCI) or confirm PSCI returns on alioth.
    and ufs.c name_is() so the LLVM toolchain links (see STATE). Built alioth + sweet images here
    with clang/lld (see STATE).
 
+### >>> STAGE 2 RESULT 2026-10-22 (kernel runs on alioth) <<<
+
+**CI/artifacts (new since the boot result above):** gh 2.103.0 installed locally (no sudo,
+~/.local/bin), signed in as **nurako**. Upstream run **#94** (2026-10-18, success, sha fdad0de)
+built EXACTLY our patch set (verified: no xnu/patches or workflow commits fdad0de..origin/main).
+Downloaded: `xnu-kernel` -> xnu/out/kernel.development.sweet (17206064 B, SHA256 OK, Mach-O arm64)
+and `xnu-buildtree` -> research/ci-buildtree/ (extracted; gitignored; patched xnu + generated
+headers + sdk-kernel-platform => local single-file compiles and driver work before spending CI).
+Note: clone is SHALLOW - deepen before ancestry checks. Our local main = 3 commits unpushed.
+
+**Stage-2 image:** `mkadt.py shim/out/alioth.adt --board alioth --highmem` (10104 B; sweet-fbcon
+node reg 0x9c000000/0x1700000, width 0x5a0 height 0xb40 stride 0x1680 = 1440x2880x5760 CORRECT;
+virtual-timer-intid 27) -> `mkpayload.py ... --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1
+sweettouch=0 sweetkeys=0'` (payload 16610976 B, magic SWEETXNU) -> `build.sh out/payload.bin`
+-> shim-boot-alioth.img 17645568 B. mkadt warning "no /product node" = research/ipsw-x/d22ap.adt
+absent (gitignored); impact unknown, did not block boot.
+
+**BOOT (17:45, fastboot boot, nothing flashed):** OBSERVED (user report; NO photo - the phone
+rebooted before one was taken): not a red screen; a wall of SCRAMBLED unreadable text; readable
+fragments `Boot version:sweet-shim` (= "iBoot version: sweet-shim", pe_init.c:251, value from our
+ADT chosen) and `"name" not a kext` (OSKext.cpp:4668, boot-kext dictionary processing). Later the
+phone was in adb as ANDROID => the image's kernel session ended in a reset -> normal power-on.
+
+**ASSESSMENT: STAGE 2 PASSED.** The kernel ran from entry through PE_init and into libkern's
+OSKext kext phase - far past memory/interrupts/timer. No instant reboot => the highmem range
+0x1_00000000..0x23ff00000 did not bounce off a protected carve-out (at least in the first 24 s).
+
+**SCRAMBLE ROOT CAUSE (confirmed in source, not a guess):** xnu/patches/0010 hardcodes the sweet
+panel - start.s band at (0x9c000000+2368*4320) stride 4320, sweet_early.c EARLY_WIDTH 1080 /
+EARLY_HEIGHT 2400 / EARLY_STRIDE 4320/4, stage marks at y=2368. Against alioth's 5760-stride panel
+every early line shears diagonally. The normal console (patch 0003 fbcon) is ADT-driven and drew
+CORRECTLY (its readable fragments) - the scramble is the early console's output (stage marks +
+panic dump) interleaved over it. => The guide's hardware list (mkadt/shim/0060-0063) is INCOMPLETE;
+**0010 is board-specific too**. Fix = parameterize the early geometry (DT at first use, or board
+define) and bundle it with the next kernel patch batch (ONE CI run).
+
+**REBOOT CAUSE = GUESS, UNCONFIRMED:** kernel panic at/after the kext phase; its dump went through
+the broken early console so it is unreadable, and the panic reset landed in a normal power-on =>
+Android. Ruled out: root-wait (prints "Still waiting for root device" forever, no reset) and
+SweetWatchdog (0040 is a deliberate no-reset stub: "SWEET has no reset path"). Needs a readable
+panic after the 0010 fix.
+
+**Persistent log 0047 = dead end for rootless boots:** the RAM ring (hooked in _cnputs) fills from
+kernel start without a root, but sweet_log_thread only persists when `su.writable` (rw root
+mounted) => nothing was written for this boot; sweet-log-pull.sh would find nothing. Screen after
+the geometry fix is the only panic channel for now.
+
 **STATUS vs the porting guide:**
 - ~~Stage 1 (shim text on screen)~~ DONE 2026-10-22 (see BOOT RESULT above). Header-v2 accepted
   by alioth ABL; display + console + UFS + GPT all working. Reboot test: `fastboot boot
   shim/out/shim-boot-alioth.img` (per-board file; never the shared shim-boot.img blindly).
+- ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22 (see STAGE 2 RESULT above). Kernel reaches
+  the kext phase on alioth; screen partly scrambled (0010 geometry) and the session ended in a
+  reset of unknown cause - both logged above for the next kernel batch.
 
 **UNFINISHED / NEXT (rough order):**
-- **BLOCKER = XNU kernel for alioth (stage 2: kernel messages).** The full XNU source build tree
-  (research/btNN on the original machine) is NOT in this fresh clone - research/ is gitignored.
-  To build a kernel: need the Apple XNU tree + the 81 applied patches + GitHub Actions CI (user has
-  a GitHub account, will sign in for CI). This is the next major setup task and gates everything
-  after it. Local single-file syntax checks (tools/xnu-cc.py) need the tree too.
-- ADT: `mkadt.py --board alioth --highmem` -> mkpayload -> build.sh with the payload as $1. Do this
-  once an alioth XNU kernel exists; boot with `cpus=1 sweettouch=0 sweetkeys=0` first (guide).
-- Driver ports (need the xnu tree + CI): patch 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch
-  (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); patch 0062 touch power rail
-  (L10C + GPIO69); patch 0061 panel 1440x2880. Patches 0010/0012 unchanged (FB base/size match).
-- Minor: fix the auto-reset-to-fastboot (goes to Android; see OPEN hypothesis - try PSHOLD-only).
-- IPSW download + userdata-flash stages: ON HOLD - user is deciding ("Need to think about it").
-  Do NOT plan flash steps yet.
+- ~~BLOCKER = XNU kernel~~ RESOLVED 2026-10-22: kernel + build tree pulled from CI run #94 (see
+  STAGE 2 RESULT). Kernel at xnu/out/kernel.development.sweet; tree at research/ci-buildtree/xnu.
+  Pipeline proven end-to-end: mkadt --board alioth --highmem -> mkpayload -> build.sh <payload> ->
+  fastboot boot shim/out/shim-boot-alioth.img.
+- **Next kernel patch batch (ONE CI run):** (a) fix xnu/patches/0010 early-console geometry for
+  alioth (CONFIRMED board-specific: 1080/2400/4320 hardcoded; need 1440/2880/5760 - parameterize,
+  keep sweet working); (b) driver ports: 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch
+  (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); 0062 touch power rail
+  (L10C + GPIO69); 0061 panel 1440x2880. (0012 needs review, was wrongly listed as unchanged.)
+  Validate locally first with research/ci-buildtree + tools/xnu-cc.py (AGENTS: cheap beats CI).
+- **Push/GitHub decision:** local main is 3(+1) commits ahead of origin; origin = dipa-studio
+  (upstream, likely no write access for nurako). To trigger CI: fork + push + workflow_dispatch
+  on xnu.yml (inputs default macos 13.5 / DEVELOPMENT / SWEET). Ask user which route.
+- After rebuild: re-boot, read the now-readable panic (cause of the stage-2 reset still unknown),
+  then continue boot further (root-wait expected until a root exists).
+- Stage 4 (Apple logo/lock) needs the iOS root: IPSW -> HFS -> flash into userdata (no GPT
+  changes; approved in principle 2026-10-15, but confirm the concrete step with the user first -
+  currently ON HOLD, "Need to think about it").
+- Minor: shim auto-reset lands in Android not fastboot (IMEM 0x146bf65c verified correct; GUESS
+  PSCI reset bypasses imem - try PSHOLD-only). Non-blocking.
 
 # ===== SWEET DEVICE (Redmi Note 10 Pro) below - unchanged =====
 
