@@ -1,0 +1,629 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/alioth_keys.c			standard
++bsd/dev/alioth_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void alioth_keys_init(void);
++extern void alioth_touch_init(void);
+ extern bool alioth_board(void);
+ 
+ #define REG_CAP         0x00
+@@ -664,7 +665,11 @@
+ 	} else {
+ 		sweet_keys_init();
+ 	}
+-	sweet_touch_init();
++	if (alioth_board()) {
++		alioth_touch_init();
++	} else {
++		sweet_touch_init();
++	}
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,12 +12,17 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern bool alioth_board(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+ #define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
++/* On kona (alioth) RH_DICT_PA names qcom,ddr-stats, not the cmd-db locator;
++ * live.dts gives cmd-db@80860000 size 20000, so use those constants. */
++#define RH_ALIOTH_DB_PA     0x80860000u
++#define RH_ALIOTH_DB_SIZE   0x20000u
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+@@ -106,10 +111,10 @@
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
++	if (!alioth_board() && !rh_dict) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
++	if (!rh_rsc || !rh_tcs || (!alioth_board() && !rh_dict)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -129,9 +134,18 @@
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		uint32_t pa;
++		uint32_t size;
++		if (alioth_board()) {
++			/* kona locator register is ddr-stats; use the DT values. */
++			pa = RH_ALIOTH_DB_PA;
++			size = RH_ALIOTH_DB_SIZE;
++			printf("SWEET RPMH: alioth cmd-db from DT pa=%#x size=%#x\n", pa, size);
++		} else {
++			pa = rh_read(rh_dict, 0);
++			size = rh_read(rh_dict, 4);
++			printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		}
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+--- /dev/null
++++ b/bsd/dev/alioth_touch.c
+@@ -0,0 +1,538 @@
++/*
++ * ALIOTH SE4 FIFO SPI / FT3698 touch bring-up (kona).
++ *
++ * Mirrors sweet_touch.c: one polled thread, GCC clock vote, TLMM pin setup,
++ * GENI FIFO transfers and a vendor event parser, all diagnostic-first. The
++ * board-specific parts: QUP wrap0 SE4 at 0x990000, kona TLMM banks (SOUTH
++ * holds reset 33 / irq 39 / vddio 69, NORTH holds the qup4 SPI pins 8-11),
++ * FTS SPI framing ([addr_hi,addr_lo,len,0x0A] full-duplex, data at rx[4]),
++ * and the L10C rail through sweet_rpmh.c. Probes read 0xa3/0x9f (expect
++ * 0x54:0x52) and the FT3698 event layout matches the FTS parser ported from
++ * sweet_touch.c (63 bytes from reg 0, 12-bit points, <=1079/<=2399).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern bool alioth_board(void);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void alioth_touch_init(void);
++
++#define TOUCH_SE_PA      0x00990000u /* qupv3 wrap0 SE4 (spi@990000, 16 KiB) */
++#define TOUCH_GCC_PA     0x00100000u
++#define TOUCH_TLMM_PA    0x0f000000u /* kona TLMM, 16 MiB window */
++#define TOUCH_TLMM_SIZE  0x1000000u
++
++/* kona GCC_QUPV3_WRAP_CLK_ENA = 0x52008 (lito's 0x5200c bit layout differs). */
++#define TOUCH_GCC_VOTE   0x52008u
++#define TOUCH_GCC_MASK   ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | \
++                          (1u << 14)) /* m_ahb, s_ahb, core, core_2x, wrap0 SE4 */
++/* gcc-kona.c: wrap0_s4 RCG cmd_rcgr 0x174d0, halt 0x174cc. */
++#define TOUCH_RCG        0x174d0u
++
++/* GENI SE common registers (geni-se.h); same map as the I2C engine. */
++#define SE_STATUS        0x040u
++#define SE_MCLK          0x048u
++#define SE_FW            0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_SPI_CPHA      0x224u
++#define SE_SPI_CPOL      0x230u
++#define SE_SPI_DEMUX     0x250u
++#define SE_BYTE_GRAN     0x254u
++#define SE_DMA           0x258u
++#define SE_SPI_TRANS_CFG 0x25cu  /* bit0 CS_TOGGLE */
++#define SE_SPI_WORD_LEN  0x268u
++#define SE_SPI_TX_LEN    0x26cu
++#define SE_SPI_RX_LEN    0x270u
++#define SE_CMD           0x600u
++#define SE_CTRL          0x604u
++#define SE_IRQ           0x610u
++#define SE_IRQ_EN        0x614u
++#define SE_IRQ_CLR       0x618u
++#define SE_TX            0x700u
++#define SE_RX            0x780u
++#define SE_TX_COUNT      0x800u
++#define SE_RX_COUNT      0x804u
++#define SE_HW_TX         0xe24u
++#define SE_HW_RX         0xe28u
++#define SE_DONE          (1u << 0)
++/* SPI error bits (no I2C NACK/ARB): overrun/failure + FIFO read/write errors. */
++#define SE_ERRORS        (0x0eu | (3u << 24) | (3u << 28))
++#define SE_EVENTS        (SE_DONE | SE_ERRORS | (1u << 5) | (1u << 26) | \
++                          (1u << 27) | (1u << 30))
++
++/* M_CMD opcodes for SPI (spi-geni-qcom.c). */
++#define SPI_FULL_DUPLEX  3u
++
++/* kona TLMM: per-pin blocks of 0x1000 (cfg, io at +4) in bank regions. */
++#define TLMM_SOUTH       0x500000u /* reset 33, irq 39, vddio 69 */
++#define TLMM_NORTH       0x900000u /* qup4 SPI pins 8..11 */
++#define TOUCH_GPIO_CFG(bank, n) ((bank) + (uint32_t)(n) * 0x1000u)
++#define TOUCH_GPIO_IO(bank, n)  (TOUCH_GPIO_CFG(bank, n) + 4u)
++
++#define TOUCH_MAX        10u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead;
++	int irq_hint;
++	uint32_t irq_status, active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++} st;
++static int touch_sleep_chan;
++
++static uint32_t
++touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(touch_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++touch_gpio(uint32_t bank, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	uint32_t off = TOUCH_GPIO_CFG(bank, pin);
++	uint32_t cfg = touch_rd(st.gpio, off);
++	if (out) {
++		/* Set the desired latch before enabling output (reset is active low). */
++		touch_wr(st.gpio, TOUCH_GPIO_IO(bank, pin),
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(bank, pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	touch_wr(st.gpio, off, cfg);
++}
++
++static bool
++touch_clocks(void)
++{
++	/* Vote only wrapper0 SE4 and its wrapper; other users are untouched. */
++	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | TOUCH_GCC_MASK);
++	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	printf("ALIOTH TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
++		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("ALIOTH TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++			return false;
++		}
++	} else {
++		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
++		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
++		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++			printf("ALIOTH TOUCH: RCG update stuck (%#x)\n", touch_rd(st.gcc, TOUCH_RCG));
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x17004, 0x17008, 0x23000, 0x174cc};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("ALIOTH TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
++			    touch_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Called only for a transfer started by this driver, including a stretched TX. */
++static void
++touch_abort(void)
++{
++	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		printf("ALIOTH TOUCH: abort failed status=%#x irq=%#x; stopping\n",
++		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++	}
++	/* Bound drain even if the hardware reports an impossible FIFO count. */
++	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)touch_rd(st.se, SE_RX);
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
++		st.dead = true;
++		printf("ALIOTH TOUCH: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++/*
++ * One full-duplex SPI command: n FIFO words out and n in (words are
++ * little-endian bytes; four 8-bit bytes per word). Mirrors Linux setup_fifo_
++ * xfer: both TRANS_LENs count 8-bit words, CS_TOGGLE stays clear so the GENI
++ * auto-toggles CS per command, M_CMD0 = FULL_DUPLEX. RX data lands at rx[0..n).
++ */
++static int
++touch_spi(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	unsigned sent = 0, got = 0;
++	uint32_t irq = 0;
++
++	if (st.dead || n == 0 || n > 90) {
++		return EIO;
++	}
++	if (touch_rd(st.se, SE_STATUS) & 1u) {
++		touch_abort();
++		return st.dead ? EIO : EBUSY;
++	}
++	unsigned depth = ((touch_rd(st.se, SE_HW_TX) >> 24) & 0x3fu);
++	if (depth == 0 || depth > 64) {
++		depth = 32;
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, SE_SPI_TX_LEN, n); /* 8-bit words: count == bytes */
++	touch_wr(st.se, SE_SPI_RX_LEN, n);
++	touch_wr(st.se, SE_SPI_TRANS_CFG,
++	    touch_rd(st.se, SE_SPI_TRANS_CFG) & ~1u); /* CS_TOGGLE clear */
++	touch_wr(st.se, SE_CMD, (SPI_FULL_DUPLEX << 27));
++	for (unsigned i = 0; i < 20000 && !st.dead; ++i) {
++		irq = touch_rd(st.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			st.irq_status = irq;
++			touch_abort();
++			printf("ALIOTH TOUCH: spi irq=%#x sent=%u got=%u\n", irq, sent, got);
++			return EIO;
++		}
++		while (sent < n && ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) < depth)) {
++			uint32_t w = 0;
++			for (unsigned b = 0; b < 4 && sent + b < n; ++b) {
++				w |= (uint32_t)tx[sent + b] << (8 * b);
++			}
++			touch_wr(st.se, SE_TX, w);
++			sent += 4;
++			if (sent > n) {
++				sent = n;
++			}
++		}
++		while (got < n && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++			uint32_t w = touch_rd(st.se, SE_RX);
++			for (unsigned b = 0; b < 4 && got < n; ++b) {
++				rx[got++] = (uint8_t)(w >> (8 * b));
++			}
++		}
++		if ((irq & SE_DONE) && sent >= n && got >= n) {
++			st.irq_status = irq;
++			return 0;
++		}
++	}
++	st.irq_status = irq;
++	touch_abort();
++	printf("ALIOTH TOUCH: spi timeout irq=%#x sent=%u got=%u\n", irq, sent, got);
++	return EIO;
++}
++
++/* FTS SPI: read [hi,lo,len,0x0A,dummy...]; the IC answers on MISO at rx[4]. */
++static int
++touch_read(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	uint8_t tx[68], rx[68];
++	unsigned total = 4 + len;
++
++	if (len == 0 || len > 64) {
++		return EIO;
++	}
++	tx[0] = (uint8_t)(reg >> 8);
++	tx[1] = (uint8_t)reg;
++	tx[2] = (uint8_t)len;
++	tx[3] = 0x0a;
++	for (unsigned i = 4; i < total; ++i) {
++		tx[i] = 0xff;
++	}
++	int err = touch_spi(tx, rx, total);
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		buf[i] = rx[4 + i];
++	}
++	return 0;
++}
++
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++touch_focaltech(void)
++{
++	uint8_t buf[63];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0, seen = 0;
++	int err = touch_read(0, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	unsigned n = buf[2] & 15u, active = 0;
++	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *p = buf + 3u + 6u * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= TOUCH_MAX) {
++			break; /* vendor's unused-record sentinel */
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u) {
++			continue; /* UP record */
++		}
++		if (event == 3u) {
++			return EIO;
++		}
++		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		if (px > 1079 || py > 2399) {
++			return EIO;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++		++active;
++	}
++	if (active != n) {
++		return EIO;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static bool
++touch_se_init(void)
++{
++	uint32_t fw = touch_rd(st.se, SE_FW);
++	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
++	printf("ALIOTH TOUCH: se4 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
++	    touch_rd(st.se, 0x908));
++	if (((fw >> 8) & 0xffu) != 1u || (touch_rd(st.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("ALIOTH TOUCH: need ABL-loaded SPI firmware and 32-bit FIFOs; probes skipped\n");
++		return false;
++	}
++	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("ALIOTH TOUCH: SE4 already busy; probes skipped\n");
++		return false;
++	}
++	touch_wr(st.se, 0xe18, 0); /* no GSI events */
++	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	touch_wr(st.se, 0x644, 0);
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, 0x648, 0xffffffffu);
++	touch_wr(st.se, SE_DMA, 0); /* FIFO mode */
++	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
++	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
++	touch_wr(st.se, 0x24, 0x7f);
++	touch_wr(st.se, 0x20, 1);
++	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	/* SPI mode 0, CS demux output 0, CS auto-toggled per command. */
++	touch_wr(st.se, SE_SPI_CPHA, touch_rd(st.se, SE_SPI_CPHA) & ~1u);
++	touch_wr(st.se, SE_SPI_CPOL, touch_rd(st.se, SE_SPI_CPOL) & ~4u);
++	touch_wr(st.se, SE_SPI_DEMUX, 0);
++	touch_wr(st.se, SE_SPI_TRANS_CFG,
++	    touch_rd(st.se, SE_SPI_TRANS_CFG) & ~1u);
++	touch_wr(st.se, SE_SPI_WORD_LEN,
++	    (touch_rd(st.se, SE_SPI_WORD_LEN) & ~0x3ffu) | 4u); /* 8-bit words */
++	/* Four 8-bit bytes per 32-bit word, LSB byte first (Linux packing). */
++	touch_wr(st.se, SE_BYTE_GRAN, 0);
++	touch_wr(st.se, 0x260, 0x0004380eu);
++	touch_wr(st.se, 0x264, 0x000c3e0eu);
++	touch_wr(st.se, 0x284, 0x0004380eu);
++	touch_wr(st.se, 0x288, 0x000c3e0eu);
++	touch_wr(st.se, 0x80c, 1);
++	touch_wr(st.se, 0x810, 0);
++	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("ALIOTH TOUCH: inherited FIFO data; probes skipped\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45;
++	(void)arg;
++	(void)result;
++	/*
++	 * Start late (boot-arg sweettouchdelay, seconds): if the bus access
++	 * below hangs the SoC, the persistent log and the GUI got there first.
++	 */
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("ALIOTH TOUCH: starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++	printf("ALIOTH TOUCH: mapping GCC/TLMM/SE4\n");
++	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
++	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("ALIOTH TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!touch_clocks() || !touch_se_init()) {
++		goto out;
++	}
++	printf("ALIOTH TOUCH: TLMM reset33=%#x irq39=%#x vddio69=%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 33)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 39)),
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 69)));
++	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
++	touch_gpio(TLMM_SOUTH, 39, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
++	touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, false);  /* reset held low */
++	touch_gpio(TLMM_SOUTH, 69, 0, 0, 0, true, true);   /* vddio enable, high */
++	int power_error = sweet_rpmh_vreg_enable("ldoc10", 3000);
++	if (power_error) {
++		printf("ALIOTH TOUCH: L10C RPMh enable failed %d; probes skipped\n", power_error);
++		goto out;
++	}
++	touch_wait(10); /* conservative rail settling; not a DT timing value */
++	touch_gpio(TLMM_NORTH, 8, 1, 1, 2, false, false);  /* qup4 SPI pins, 6 mA */
++	touch_gpio(TLMM_NORTH, 9, 1, 1, 2, false, false);
++	touch_gpio(TLMM_NORTH, 10, 1, 1, 2, false, false);
++	touch_gpio(TLMM_NORTH, 11, 1, 3, 7, false, false); /* CS pull-up, 16 mA */
++	/* Vendor reset sequence: low 2 ms, then high. */
++	touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, false);
++	touch_wait(2);
++	touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, true);
++	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
++	uint8_t fid1 = 0, fid2 = 0;
++	int fe1 = touch_read(0xa3, &fid1, 1);
++	int fe2 = touch_read(0x9f, &fid2, 1);
++	printf("ALIOTH TOUCH: probe err=%d/%d chip-id=%02x:%02x irq=%#x\n",
++	    fe1, fe2, fid1, fid2, st.irq_status);
++	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
++	if (st.dead || !fts) {
++		printf("ALIOTH TOUCH: FT3698 not confirmed (chip-id=%02x:%02x dead=%d); stopping\n",
++		    fid1, fid2, st.dead);
++		goto out;
++	}
++	printf("ALIOTH TOUCH: selected FTS FT3698, 1080x2400, poll=10ms irq-hint=%d\n",
++	    st.irq_hint);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		/* Optional IRQ hint still reads every 100ms, and always while down. */
++		if (!st.irq_hint || st.active ||
++		    !(touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 39)) & 1u) ||
++		    (++ticks % 10u) == 0) {
++			int err = touch_focaltech();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("ALIOTH TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++alioth_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	if (!alioth_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	if (!enabled) {
++		printf("ALIOTH TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ALIOTH TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
