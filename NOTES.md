@@ -21,8 +21,10 @@ in ../phone/ (OUTSIDE the repo). No kernel driver / XNU work done yet.
 `fastboot boot shim/out/shim-boot-alioth.img` (header v2, embedded ../phone/live.dtb; NOTHING
 flashed) runs on the Mi 11X. Red diagnostic screen (photo, user):
 - `SHIM sweet milestone 4: xnu loader` -> shim running on SM8250; ABL accepted the header-v2
-  image over fastboot boot (v2-vs-v3 risk RESOLVED); framebuffer draws to the 1440x2880 panel
-  via 0x9c000000.
+  image over fastboot boot (v2-vs-v3 risk RESOLVED); framebuffer draws to the panel via
+  0x9c000000 at stride 4320 - the SHIM's own (sweet, unconditional) 1080x2400 geometry rendered
+  READABLY, which later proved the panel is 1080x2400, not 1440x2880 (see PANEL CORRECTION,
+  2026-10-22). This readable screen is the ground truth that overturned the bad extraction.
 - `INITRD lo=0xAFFFE000 hi=0xAFFFE061` (bootloader handed the ramdisk; the tiny 0x61 range is
   unexplained - low priority), `LOADER no SWEETXNU payload` (expected: empty ramdisk, no kernel).
 - **UFS milestone 5 probe (read-only): ver=0x300, cap=0x1587031F (~172 GiB), UTRLBA=0x9B13F000,
@@ -65,7 +67,12 @@ PSCI) or confirm PSCI returns on alioth.
   clock-frequency 0x124f800 = 19.2 MHz (same TIMEBASE as sweet).
 - IMEM restart_reason @0x146bf65c (sweet: 0x146aa65c - MUST differ). PSHOLD 0xc264000 (same).
 - UFS 0x1d84000 (same). TLMM 0xf000000 size 0x1000000 (sweet keys driver uses 0x3900000 - differs).
-- Panel: 1440x2880 AMOLED (qcom,mdss-dsi-panel-width 0x5a0 / height 0xb40); stride 1440*4=5760.
+- Panel: ~~1440x2880~~ **CORRECTED 2026-10-22: 1080x2400, stride 4320 - IDENTICAL to sweet.**
+  The earlier 1440x2880 came from the FIRST qcom,mdss-dsi-panel-width hit (live.dts:19059), a
+  non-active timing node. Ground truth: cmdline `msm_drm.dsi_display0=
+  qcom,mdss_dsi_k11a_38_08_0a_dsc_cmd` -> node live.dts:24074, timing@0 width 0x438 height
+  0x960; corroborated by the shim's stride-4320 screen rendering readably on the phone and by
+  sweet history (NOTES line ~203: "shows the centered 1080x2400").
   cont_splash @0x9c000000 matches sweet FB base.
 - Touch: **FocalTech FT3698 ("focaltech,fts") over SPI** on QUP SE4 spi@990000 (0x990000), NOT
   sweet's Goodix GT9896 over I2C SE7 (0xa84000). reset GPIO 33, IRQ GPIO 39, vdd=L10C(PM8150L),
@@ -80,13 +87,14 @@ PSCI) or confirm PSCI returns on alioth.
 **DONE this session (built + phone-boot verified; stage 1+3 pass):**
 1. tools/mkadt.py: added BOARDS dict + `--board sweet|alioth`. alioth sets PHYS_BASE 0xb4000000/
    MEM_SIZE 0x7000000 (low window above disp_rdump), HIGH 0x100000000/0x140000000 (5 GB, leaves
-   headroom in the 6 GB high bank - GUESS, verify at boot), FB 1440x2880 stride 5760, VTIMER_INTID
+   headroom in the 6 GB high bank - GUESS, verify at boot), FB ~~1440x2880 stride 5760~~
+   **corrected 2026-10-22 to 1080x2400/4320 (PANEL CORRECTION below)**, VTIMER_INTID
    27, synthetic ECID 0x414c494f54480001 ('ALIOTH'+1), root compatible
    D22AP|iPhone10,3|xiaomi,alioth|xiaomi,sweet|qcom,sm8250|AppleARM (keeps 'xiaomi,sweet' so
    SweetPlatformExpert still matches; drivers test for 'xiaomi,alioth'), cpu kryo480 tri-cluster
    freqs (1804/2419/2841 MHz). GICD/GICR/UFS/FB-base/TIMEBASE unchanged. Verified: all 4 flag
    combos build; sweet output byte-for-byte unchanged (10088 B); alioth dump correct (INTID 27,
-   1440x2880, canvas 1125x2436, dram-base 0xb4000000, kryo480).
+   ~~1440x2880~~ panel since fixed, canvas 1125x2436, dram-base 0xb4000000, kryo480).
 2. shim/shim.c: `#ifdef ALIOTH` switches IMEM_RESTART_REASON 0x146bf65c, VTIMER_INTID 27,
    PTIMER_INTID 30 (sweet keeps 0x146aa65c/19/18). Verified via `gcc -E -dM` both ways: no
    redefinition, constants resolve correctly.
@@ -104,14 +112,15 @@ built EXACTLY our patch set (verified: no xnu/patches or workflow commits fdad0d
 Downloaded: `xnu-kernel` -> xnu/out/kernel.development.sweet (17206064 B, SHA256 OK, Mach-O arm64)
 and `xnu-buildtree` -> research/ci-buildtree/ (extracted; gitignored; patched xnu + generated
 headers + sdk-kernel-platform => local single-file compiles and driver work before spending CI).
-Note: clone is SHALLOW - deepen before ancestry checks. Our local main = 3 commits unpushed.
+Note: clone is SHALLOW - deepen before ancestry checks. Local main was pushed to the fork
+nurako/ios-sweet (4 commits after rebase onto 067c9b3) - see UNFINISHED/Push DONE.
 
 **Stage-2 image:** `mkadt.py shim/out/alioth.adt --board alioth --highmem` (10104 B; sweet-fbcon
-node reg 0x9c000000/0x1700000, width 0x5a0 height 0xb40 stride 0x1680 = 1440x2880x5760 CORRECT;
-virtual-timer-intid 27) -> `mkpayload.py ... --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1
-sweettouch=0 sweetkeys=0'` (payload 16610976 B, magic SWEETXNU) -> `build.sh out/payload.bin`
--> shim-boot-alioth.img 17645568 B. mkadt warning "no /product node" = research/ipsw-x/d22ap.adt
-absent (gitignored); impact unknown, did not block boot.
+node reg 0x9c000000/0x1700000, width 0x5a0 height 0xb40 stride 0x1680 - **these panel values were
+WRONG, see PANEL CORRECTION below**; virtual-timer-intid 27) -> `mkpayload.py ... --cmdline
+'debug=0xc serial=3 cpus=1 keepsyms=1 sweettouch=0 sweetkeys=0'` (payload 16610976 B, magic
+SWEETXNU) -> `build.sh out/payload.bin` -> shim-boot-alioth.img 17645568 B. mkadt warning "no
+/product node" = research/ipsw-x/d22ap.adt absent (gitignored); impact unknown, did not block boot.
 
 **BOOT (17:45, fastboot boot, nothing flashed):** OBSERVED (user report; NO photo - the phone
 rebooted before one was taken): not a red screen; a wall of SCRAMBLED unreadable text; readable
@@ -123,50 +132,67 @@ phone was in adb as ANDROID => the image's kernel session ended in a reset -> no
 OSKext kext phase - far past memory/interrupts/timer. No instant reboot => the highmem range
 0x1_00000000..0x23ff00000 did not bounce off a protected carve-out (at least in the first 24 s).
 
-**SCRAMBLE ROOT CAUSE (confirmed in source, not a guess):** xnu/patches/0010 hardcodes the sweet
-panel - start.s band at (0x9c000000+2368*4320) stride 4320, sweet_early.c EARLY_WIDTH 1080 /
-EARLY_HEIGHT 2400 / EARLY_STRIDE 4320/4, stage marks at y=2368. Against alioth's 5760-stride panel
-every early line shears diagonally. The normal console (patch 0003 fbcon) is ADT-driven and drew
-CORRECTLY (its readable fragments) - the scramble is the early console's output (stage marks +
-panic dump) interleaved over it. => The guide's hardware list (mkadt/shim/0060-0063) is INCOMPLETE;
-**0010 is board-specific too**. Fix = parameterize the early geometry (DT at first use, or board
-define) and bundle it with the next kernel patch batch (ONE CI run).
+### >>> PANEL CORRECTION 2026-10-22 (supersedes the 0010 theory) <<<
 
-**REBOOT CAUSE = GUESS, UNCONFIRMED:** kernel panic at/after the kext phase; its dump went through
-the broken early console so it is unreadable, and the panic reset landed in a normal power-on =>
-Android. Ruled out: root-wait (prints "Still waiting for root device" forever, no reset) and
-SweetWatchdog (0040 is a deliberate no-reset stub: "SWEET has no reset path"). Needs a readable
-panic after the 0010 fix.
+**The stage-2 scramble was OUR bad ADT, not xnu/patches/0010.** RETRACTION: the earlier "0010 is
+board-specific" conclusion was wrong on both facts - it claimed the early console sheared against
+a "5760-stride alioth panel" that does not exist, and credited fbcon with the readable text when
+fbcon was actually the scrambled one. Corrected model:
+- **Panel is 1080x2400 @4320, IDENTICAL to sweet** (cmdline msm_drm.dsi_display0 =
+  qcom,mdss_dsi_k11a_38_08_0a_dsc_cmd -> live.dts:24074 timing width 0x438 height 0x960; the
+  wrong 1440x2880 came from the first panel-width grep hit at live.dts:19059, a non-active node).
+  Ground truth that exposed it: the shim (unconditional sweet 1080x2400/4320 console) drew a
+  READABLE stage-1 screen on this phone - impossible with a 5760-real stride.
+- **0010's hardcoded 1080/2400/4320 is CORRECT on alioth - NO kernel change needed.**
+- **The scramble = patch 0003 fbcon using OUR wrong sweet-fbcon node (1440/2880/5760).** It shears
+  kprintf output (rows drift +33%): the first fbcon lines (cursor at top, PE_init messages like
+  "iBoot version: sweet-shim") were aligned/readable; everything later drifted into the wall of
+  garbage - matches the user report exactly. The early console's lines were the other readable bits.
+- **Fix (DONE, verified): tools/mkadt.py BOARDS['alioth'] FB_W/FB_H/FB_STRIDE = 1080/2400/4320.**
+  Sweet output re-verified textually identical (byte diff is only the per-run random-seed);
+  alioth sweet-fbcon dump now 0x438/0x960/0x10e0. Consequence: patch 0061's "panel 1440x2880"
+  plan item is also void (0061 presents the iPhone X canvas 1125x2436 over a 1080x2400 panel -
+  same as sweet; no alioth change). Remaining real driver ports: 0060 keys + touch (SPI/FocalTech
+  re-write), 0062 power rail.
+
+**REBOOT CAUSE = GUESS, UNCONFIRMED:** kernel panic at/after the kext phase (its dump was mixed
+into the scramble) and the panic reset landed in a normal power-on => Android. Ruled out:
+root-wait (prints "Still waiting for root device" forever, no reset) and SweetWatchdog (0040 is a
+deliberate no-reset stub: "SWEET has no reset path"). Next boot with the fixed ADT gives a fully
+readable console (fbcon correct + early console correct) - that is the diagnostic step.
 
 **Persistent log 0047 = dead end for rootless boots:** the RAM ring (hooked in _cnputs) fills from
 kernel start without a root, but sweet_log_thread only persists when `su.writable` (rw root
-mounted) => nothing was written for this boot; sweet-log-pull.sh would find nothing. Screen after
-the geometry fix is the only panic channel for now.
+mounted) => nothing was written for this boot; sweet-log-pull.sh would find nothing. The screen
+on the next boot (fixed ADT) is the only panic channel for now.
 
 **STATUS vs the porting guide:**
 - ~~Stage 1 (shim text on screen)~~ DONE 2026-10-22 (see BOOT RESULT above). Header-v2 accepted
   by alioth ABL; display + console + UFS + GPT all working. Reboot test: `fastboot boot
   shim/out/shim-boot-alioth.img` (per-board file; never the shared shim-boot.img blindly).
-- ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22 (see STAGE 2 RESULT above). Kernel reaches
-  the kext phase on alioth; screen partly scrambled (0010 geometry) and the session ended in a
-  reset of unknown cause - both logged above for the next kernel batch.
+- ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22 (see STAGE 2 RESULT + PANEL CORRECTION
+  above). Kernel reaches the kext phase on alioth; the first boot's scramble was our wrong
+  sweet-fbcon panel values (fixed in mkadt); the session's reset cause is still unknown and is
+  the thing the next (fully readable) boot is for.
 
 **UNFINISHED / NEXT (rough order):**
 - ~~BLOCKER = XNU kernel~~ RESOLVED 2026-10-22: kernel + build tree pulled from CI run #94 (see
   STAGE 2 RESULT). Kernel at xnu/out/kernel.development.sweet; tree at research/ci-buildtree/xnu.
   Pipeline proven end-to-end: mkadt --board alioth --highmem -> mkpayload -> build.sh <payload> ->
   fastboot boot shim/out/shim-boot-alioth.img.
-- **Next kernel patch batch (ONE CI run):** (a) fix xnu/patches/0010 early-console geometry for
-  alioth (CONFIRMED board-specific: 1080/2400/4320 hardcoded; need 1440/2880/5760 - parameterize,
-  keep sweet working); (b) driver ports: 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch
-  (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); 0062 touch power rail
-  (L10C + GPIO69); 0061 panel 1440x2880. (0012 needs review, was wrongly listed as unchanged.)
+- **Immediate next step (NO CI needed):** regenerate the image with the fixed mkadt panel values
+  (`mkadt --board alioth --highmem` -> mkpayload -> build.sh -> fastboot boot) and boot: the
+  console should now be fully readable end to end; read the stage-2 reset cause off the screen
+  (panic dump), then push further (root-wait expected until a root exists).
+- **Next kernel patch batch (ONE CI run, when driver work is designed):** driver ports only -
+  0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 + FocalTech
+  FT3698 - not Goodix/I2C); 0062 touch power rail (L10C + GPIO69). NOT in the batch: 0010 (panel
+  is identical to sweet, retracted) and 0061 (canvas 1125x2436 over 1080x2400 = same as sweet).
   Validate locally first with research/ci-buildtree + tools/xnu-cc.py (AGENTS: cheap beats CI).
-- **Push/GitHub decision:** local main is 3(+1) commits ahead of origin; origin = dipa-studio
-  (upstream, likely no write access for nurako). To trigger CI: fork + push + workflow_dispatch
-  on xnu.yml (inputs default macos 13.5 / DEVELOPMENT / SWEET). Ask user which route.
-- After rebuild: re-boot, read the now-readable panic (cause of the stage-2 reset still unknown),
-  then continue boot further (root-wait expected until a root exists).
+- **Push/GitHub DONE 2026-10-22:** forked to nurako/ios-sweet, rebased onto upstream 067c9b3
+  (MIT License; no patch changes), pushed main (4 commits). The push deliberately did NOT touch
+  xnu/patches/** so no CI run fired. CI via `gh workflow run xnu.yml -R nurako/ios-sweet`
+  (inputs default macos 13.5 / DEVELOPMENT / SWEET). gh signed in as nurako.
 - Stage 4 (Apple logo/lock) needs the iOS root: IPSW -> HFS -> flash into userdata (no GPT
   changes; approved in principle 2026-10-15, but confirm the concrete step with the user first -
   currently ON HOLD, "Need to think about it").

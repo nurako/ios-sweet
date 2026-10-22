@@ -43,9 +43,15 @@ QEMU_VTIMER_INTID = 27
 # ---- per-board constants ----
 # GICD/GICR/UFS/FB/TIMEBASE are identical on sweet (SM7150) and alioth (SM8250):
 # both use the kona-family layout at 0x17a00000/0x17a60000/0x01d84000/0x9c000000.
-# What differs: DRAM layout, panel size, the architected timer's virtual PPI
-# (sweet DT wires CNTV to PPI 3 = INTID 19; alioth to PPI 11 = INTID 27, the
-# standard position), and the CPU (kryo470 vs kryo480 tri-cluster).
+# What differs: DRAM layout, the architected timer's virtual PPI (sweet DT wires
+# CNTV to PPI 3 = INTID 19; alioth to PPI 11 = INTID 27, the standard
+# position), and the CPU (kryo470 vs kryo480 tri-cluster). The panel does NOT
+# differ: alioth's active panel (cmdline msm_drm.dsi_display0 =
+# qcom,mdss_dsi_k11a_38_08_0a_dsc_cmd, node at live.dts:24074) is 1080x2400
+# @4320, the same as sweet - an earlier extraction read a non-active 1440x2880
+# timing node (first panel-width hit) and that wrong value made the kernel's
+# ADT-driven fbcon shear text (stage-2 scramble, 2026-10-22). Verified against
+# the shim rendering at stride 4320 on the phone.
 # FREQS is a list of (lowest_core_in_cluster, clock_frequency) breakpoints ordered
 # highest-cluster first; a core takes the frequency of the first breakpoint whose
 # core index is <= it.
@@ -76,7 +82,7 @@ BOARDS = {
         HIGH_PHYS_BASE=0x100000000, HIGH_MEM_SIZE=0x140000000,
         GICD=0x17a00000, GICR=0x17a60000,
         FB=0x9c000000, FB_SIZE=0x1700000,
-        FB_W=1440, FB_H=2880, FB_STRIDE=1440 * 4,
+        FB_W=1080, FB_H=2400, FB_STRIDE=1080 * 4,
         ECID=0x414c494f54480001,  # 'ALIOTH'+1, synthetic
         UFS=0x01d84000, UFS_SIZE=0x3000,
         TIMEBASE=19200000, VTIMER_INTID=27,
