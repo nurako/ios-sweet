@@ -203,37 +203,61 @@ Kryo 460; SweetCPU prints a hardcoded "Kryo 470" anyway) and ml_parse_cpu_topolo
 compatible => mkadt-only change, NO kernel patch, NO CI needed. Verified by dump: all 8 alioth
 cpu nodes now `compatible = 'qcom,kryo470|ARM,v8'`. Image rebuilt (same cmdline
 `debug=0xc serial=3 cpus=1 keepsyms=1 sweettouch=0 sweetkeys=0`, shim-boot-alioth.img
-17645568 B) - NOT YET BOOTED.
+17645568 B) - booted as boot 3, fix CONFIRMED (see STAGE 2 COMPLETE below).
+
+### >>> STAGE 2 COMPLETE 2026-10-22 ~21:30 (boot 3: CPU fix confirmed, root-wait reached) <<<
+
+**BOOT 3 (fastboot boot of the CPU-compat-fix image, nothing flashed): OBSERVED (user photo) -**
+the fix landed and the kernel now boots end to end to the BSD root wait:
+- `SWEET CPU: requested=1 selected=1 (limit=8)` then `SWEET CPU: cpu=0 came alive; 1/1 CPUs
+  initialized` - ml_set_max_cpus() fired, ml_wait_max_cpus() released the startup thread.
+- **Apple copyright banner** (bsd_init reached), NFC framework, buffer headers, mcache,
+  SWEET AMFI Mobile File Integrity + permissive Sandbox policies, `SWEET HFS: hfs-627.100.6
+  registered`, dll_init, lo0/gif0/stf0 ifnet_attach.
+- **`Waiting on <dict ID="6"><key>IOProviderClass</key><string ID="1">IOMedia</string><key>Content
+  </key><string ID="2">Apple_HFS</string></dict>`** - IOBSD root matching started. This is the
+  CORRECT terminal state without a root filesystem.
+- Newest line = `Failed to write boot-picker-bringup-reason to NVRAM.`; screen stable, no panic,
+  no reset.
+
+**Why the loop stops there (code-proven):** the root-wait loop (IOKitBSDInit.cpp:921-927) on the
+first 10 s timeout takes the `#if XNU_TARGET_OS_OSX && defined(__arm64__)` branch - empirically
+proven because `IOSetRecoveryBoot(BSD_BOOTFAIL_MEDIA_MISSING, ..., reboot=true)` ran (its NVRAM
+write failure is the last line on screen). Consequences: (1) the iOS `panic("Failed to mount root
+device")` branch is compiled out of this build (it is the #elif XNU_TARGET_OS_IOS), and (2) the
+"Still waiting for root device" IOLog is in the complementary #if, hence never printed. Then
+IOSetRecoveryBoot calls `IOService::waitForService(serviceMatching("IODTNVRAM"))` with NO
+timeout - no NVRAM service exists on our platform, so it blocks forever and never reaches
+PEHaltRestart (hence the stable hang instead of a reset). Benign for the port: with a real Apple_
+HFS IOMedia the matching succeeds and none of this runs.
+
+**STAGE 2 STATUS: DONE.** Kernel + shim + UFS + GPT all work on alioth; the boot stops only
+because there is no iOS root yet (stage 4, still ON HOLD).
 
 **STATUS vs the porting guide:**
 - ~~Stage 1 (shim text on screen)~~ DONE 2026-10-22 (see BOOT RESULT above). Header-v2 accepted
   by alioth ABL; display + console + UFS + GPT all working. Reboot test: `fastboot boot
   shim/out/shim-boot-alioth.img` (per-board file; never the shared shim-boot.img blindly).
-- ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22 (see STAGE 2 RESULT + PANEL CORRECTION
-  above). Kernel reaches the kext phase on alioth; the first boot's scramble was our wrong
-  sweet-fbcon panel values (fixed in mkadt); boot 2 with the fixed ADT was fully readable and
-  stable 25+ min (boot 1's reset did NOT reproduce - GUESS: it required the bad scramble-era
-  ADT, e.g. the sheared fbcon writes; unconfirmed).
+- ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22, CONFIRMED COMPLETE by boot 3 (see STAGE 2
+  RESULT + PANEL CORRECTION + FREEZE FOUND + STAGE 2 COMPLETE above). Kernel reaches BSD root
+  matching (`Waiting on <IOMedia, Apple_HFS>`) on alioth; blocks there only because no iOS root
+  exists yet. Boot 1's scramble = our wrong sweet-fbcon panel values; boot 1's reset did NOT
+  reproduce in boots 2/3 (GUESS: tied to the bad scramble-era ADT; unconfirmed, non-blocking).
 
 **UNFINISHED / NEXT (rough order):**
 - ~~BLOCKER = XNU kernel~~ RESOLVED 2026-10-22: kernel + build tree pulled from CI run #94 (see
   STAGE 2 RESULT). Kernel at xnu/out/kernel.development.sweet; tree at research/ci-buildtree/xnu.
   Pipeline proven end-to-end: mkadt --board alioth --highmem -> mkpayload -> build.sh <payload> ->
   fastboot boot shim/out/shim-boot-alioth.img.
-- **Immediate next step (NO CI needed): boot the CPU-compat-fix image** (built 2026-10-22 evening,
-  see FREEZE FOUND above; user must first hard-reset the frozen phone - long-press power - then
-  `fastboot boot shim/out/shim-boot-alioth.img`). EXPECTED: `SWEET CPU: requested=1 selected=1
-  (limit=8)` shortly after the SWEET FB line, then the Apple copyright banner (bsd_init), then
-  `Waiting on <matching>` / `Still waiting for root device` every ~10 s, then the iOS rootless
-  panic `Failed to mount root device` after ~10 attempts. Reaching that panic = stage 2 fully
-  done. If instead no SWEET CPU line appears, the personality still is not matching - re-check
-  nub names (IOPlatformExpert publishes nubs from /cpus; IONameMatch may key on name or
-  compatible) before touching anything else.
-- **Next kernel patch batch (ONE CI run, when driver work is designed):** driver ports only -
-  0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 + FocalTech
-  FT3698 - not Goodix/I2C); 0062 touch power rail (L10C + GPIO69). NOT in the batch: 0010 (panel
-  is identical to sweet, retracted) and 0061 (canvas 1125x2436 over 1080x2400 = same as sweet).
-  Validate locally first with research/ci-buildtree + tools/xnu-cc.py (AGENTS: cheap beats CI).
+- ~~Immediate next step: boot the CPU-compat-fix image~~ DONE 2026-10-22 boot 3: SWEET CPU lines
+  + copyright + root-wait all confirmed (see STAGE 2 COMPLETE above). Stage 2 closed.
+- **Next concrete work: driver ports (ONE CI run):** 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) +
+  touch (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); 0062 touch power rail
+  (L10C + GPIO69). NOT in the batch: 0010 (panel identical to sweet, retracted) and 0061 (canvas
+  1125x2436 over 1080x2400 = same as sweet). Validate locally first with research/ci-buildtree +
+  tools/xnu-cc.py (AGENTS: cheap beats CI), then `gh workflow run xnu.yml -R nurako/ios-sweet`.
+  Note: these affect the lock screen/input (stage 4+), not the boot path - can proceed in
+  parallel with the stage-4 decision.
 - **Push/GitHub DONE 2026-10-22:** forked to nurako/ios-sweet, rebased onto upstream 067c9b3
   (MIT License; no patch changes), pushed main (4 commits). The push deliberately did NOT touch
   xnu/patches/** so no CI run fired. CI via `gh workflow run xnu.yml -R nurako/ios-sweet`
