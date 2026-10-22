@@ -9,12 +9,44 @@
 
 ### >>> UPDATE 2026-10-22 (alioth port, read first) <<<
 
-**STATE:** Board switch done for tools/mkadt.py + shim + build.sh. The shim BUILDS
-locally with the LLVM toolchain (clang+lld; the GNU aarch64-linux-gnu-gcc is not on this
-box but clang 23 + ld.lld + llvm-objcopy are). Produced shim/out/shim-boot.img for BOTH
-boards (verified: ANDROID! magic, embedded alioth live.dtb has "xiaomi alioth"+"focaltech",
-sweet image lacks the alioth IMEM immediate). NOT phone-tested (needs the physical device
-+ user). No kernel driver work done yet. Phone dump lives in ../phone/ (OUTSIDE the repo).
+**STATE (updated after the first phone boot):** Board switch done for tools/mkadt.py + shim +
+build.sh, AND **STAGE 1 + STAGE 3 ACHIEVED ON THE PHONE** (see BOOT RESULT below). The shim
+builds locally with the LLVM toolchain (clang+lld; the GNU aarch64-linux-gnu-gcc is not on this
+box but clang 23 + ld.lld + llvm-objcopy are). Per-board images now go to shim/out/shim-boot-$BOARD.img
+(+ copied to shim-boot.img) so sweet/alioth builds stop overwriting each other. Phone dump lives
+in ../phone/ (OUTSIDE the repo). No kernel driver / XNU work done yet.
+
+### >>> BOOT RESULT 2026-10-22 (stage 1+3 on alioth) <<<
+
+`fastboot boot shim/out/shim-boot-alioth.img` (header v2, embedded ../phone/live.dtb; NOTHING
+flashed) runs on the Mi 11X. Red diagnostic screen (photo, user):
+- `SHIM sweet milestone 4: xnu loader` -> shim running on SM8250; ABL accepted the header-v2
+  image over fastboot boot (v2-vs-v3 risk RESOLVED); framebuffer draws to the 1440x2880 panel
+  via 0x9c000000.
+- `INITRD lo=0xAFFFE000 hi=0xAFFFE061` (bootloader handed the ramdisk; the tiny 0x61 range is
+  unexplained - low priority), `LOADER no SWEETXNU payload` (expected: empty ramdisk, no kernel).
+- **UFS milestone 5 probe (read-only): ver=0x300, cap=0x1587031F (~172 GiB), UTRLBA=0x9B13F000,
+  TUR/CAP/READ rc=0 ocs=0, LUN0 lastlba=0x01D3AFFF blk=0x1000.** UFS host WORKS on alioth.
+- **GPT parsed: `EFI PART`, entries=0x40 @LBA2.** Partitions >=64MiB seen: persist(0xA0000,64M),
+  persistbak(0xE0000,64M), logdump(0x140000), minidump(0x1E0000), rawdump(0x260000),
+  exaid(0x3E0000), cust(ext4), super, rescue, userdata (fs_type "other" = f2fs, unrecognised).
+- `UFS probe done, reset in ~3 min` -> `RESET in 20s`.
+
+**TEST-DISCIPLINE SLIP (mine):** the FIRST boot used the SWEET-constants image - my sweet
+smoke-build had overwritten out/shim-boot.img after the alioth build, and I booted that. The
+board-independent hardware it showed (display/UFS/GIC) is still fully valid for alioth, but the
+alioth-specific constants did NOT run. Fixed build.sh to emit per-board names; rebuilt with
+-DALIOTH (disasm `movk w8,#0x146b,lsl #16` before the `0x77665500` RESTART_BOOTLOADER store =
+IMEM 0x146bf65c; image byte-differs from sweet; -dM gives VTIMER 27/PTIMER 30) and re-booted:
+same screen. Always boot shim/out/shim-boot-alioth.img explicitly.
+
+**OPEN (minor):** auto-reset goes to ANDROID, not fastboot, even with the correct IMEM address.
+Address VERIFIED correct from live.dts (`qcom,msm-imem@146bf000` + `restart_reason@65c` =
+0x146bf65c) and magic is the standard 0x77665500. GUESS: `reset()`'s `smc(PSCI_SYSTEM_RESET)` on
+alioth resets via a TZ path that bypasses/overrides the imem reason (on sweet PSCI likely fell
+through to the PSHOLD fallback, which honors imem). Does NOT block the port - diagnostic
+convenience only; user re-enters fastboot manually. To try later: make reset() PSHOLD-only (skip
+PSCI) or confirm PSCI returns on alioth.
 
 **Build the shim here without the GNU toolchain:** `BOARD=alioth CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm READELF=llvm-readelf ./build.sh`. Two fixes were needed for clang (both safe for GCC): (a) -fno-jump-tables in CFLAGS - without it clang turns the 4-way exception-name switch in shim.c into an absolute .rodata string-pointer array (R_AARCH64_ABS64), wrong because the image runs at an arbitrary load address with no relocation pass (the build's ABS64 gate rejects it); (b) ufs.c: replaced __builtin_strcmp with a tiny static name_is() - clang lowers __builtin_strcmp to a libc call (GCC inlines it) and this freestanding image has no libc. build.sh now takes CC/OBJCOPY/NM/READELF env overrides and auto-adds --target + -fuse-ld=lld for clang.
 
@@ -45,7 +77,7 @@ sweet image lacks the alioth IMEM immediate). NOT phone-tested (needs the physic
 - CPU: 8 cores, MPIDR = core<<8 (0x000..0x700). kryo480: 4x A55 (silver) + 3x A77 (gold) +
   1x A77 (prime). No >4G carve-outs in cpu nodes.
 
-**DONE this session (code only, compile/boot NOT verified):**
+**DONE this session (built + phone-boot verified; stage 1+3 pass):**
 1. tools/mkadt.py: added BOARDS dict + `--board sweet|alioth`. alioth sets PHYS_BASE 0xb4000000/
    MEM_SIZE 0x7000000 (low window above disp_rdump), HIGH 0x100000000/0x140000000 (5 GB, leaves
    headroom in the 6 GB high bank - GUESS, verify at boot), FB 1440x2880 stride 5760, VTIMER_INTID
@@ -64,17 +96,23 @@ sweet image lacks the alioth IMEM immediate). NOT phone-tested (needs the physic
    and ufs.c name_is() so the LLVM toolchain links (see STATE). Built alioth + sweet images here
    with clang/lld (see STATE).
 
+**STATUS vs the porting guide:**
+- ~~Stage 1 (shim text on screen)~~ DONE 2026-10-22 (see BOOT RESULT above). Header-v2 accepted
+  by alioth ABL; display + console + UFS + GPT all working. Reboot test: `fastboot boot
+  shim/out/shim-boot-alioth.img` (per-board file; never the shared shim-boot.img blindly).
+
 **UNFINISHED / NEXT (rough order):**
-- Stage 1 bring-up (guide): boot the alioth shim via `fastboot boot shim/out/shim-boot.img`
-  (NOTHING flashed) and see shim text on the phone screen. Requires the physical device + the
-  user doing the button sequence. NOTE untested risk: SM8250 is a GKI/v3-boot device; if alioth's
-  ABL rejects a header-v2 image over fastboot boot, rebuild with --header_version 3 (drop the
-  --dtb arg; the DTB lives in vendor_boot). The image embeds phone/live.dtb as the DTB.
-- Then ADT: mkadt --board alioth --highmem -> mkpayload -> build.sh with the payload as $1.
-- Driver ports (need full xnu tree + GitHub CI; research/ sandbox not present in this fresh
-  clone): patch 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 +
-  FocalTech FT3698); patch 0062 touch power rail (L10C + GPIO69); patch 0061 panel 1440x2880.
-  Patches 0010/0012 unchanged (FB base/size match).
+- **BLOCKER = XNU kernel for alioth (stage 2: kernel messages).** The full XNU source build tree
+  (research/btNN on the original machine) is NOT in this fresh clone - research/ is gitignored.
+  To build a kernel: need the Apple XNU tree + the 81 applied patches + GitHub Actions CI (user has
+  a GitHub account, will sign in for CI). This is the next major setup task and gates everything
+  after it. Local single-file syntax checks (tools/xnu-cc.py) need the tree too.
+- ADT: `mkadt.py --board alioth --highmem` -> mkpayload -> build.sh with the payload as $1. Do this
+  once an alioth XNU kernel exists; boot with `cpus=1 sweettouch=0 sweetkeys=0` first (guide).
+- Driver ports (need the xnu tree + CI): patch 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch
+  (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); patch 0062 touch power rail
+  (L10C + GPIO69); patch 0061 panel 1440x2880. Patches 0010/0012 unchanged (FB base/size match).
+- Minor: fix the auto-reset-to-fastboot (goes to Android; see OPEN hypothesis - try PSHOLD-only).
 - IPSW download + userdata-flash stages: ON HOLD - user is deciding ("Need to think about it").
   Do NOT plan flash steps yet.
 
