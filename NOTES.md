@@ -166,24 +166,69 @@ kernel start without a root, but sweet_log_thread only persists when `su.writabl
 mounted) => nothing was written for this boot; sweet-log-pull.sh would find nothing. The screen
 on the next boot (fixed ADT) is the only panic channel for now.
 
+### >>> FREEZE FOUND 2026-10-22 evening: SweetCPU never matched on alioth (boot 2 + fix) <<<
+
+**BOOT 2 (20:06, fixed-panel ADT, fastboot boot, nothing flashed):** OBSERVED (user photos): the
+console is FULLY READABLE end to end, no panic, no reset - screen unchanged for 25+ min. The
+boot-1 reset did NOT reproduce; boots 1 and 2 differed only in the sweet-fbcon ADT node (plus the
+per-run random seed).
+
+**Freeze point (OBSERVED):** newest line = `SWEET FB: AppleCLCD 1080x2400 stride 4320 at
+0x9c000000, default surface 1, presented as 1125x2436` (patch 0003 keeps the line after the
+cursor blank; user confirmed the blank line is right below it). Everything older sits above the
+fbcon wrap. Registered before it: AKS, WDT, SURF, HID buttons/touch, BATTERY - but NO `SWEET CPU:*
+lines ever appeared, and bsd_init()'s copyright banner (bsd_init.c:503, its first statement) was
+never printed => the startup thread never reached bsd_init().
+
+**Root cause (proven by code reading; confirmation = next boot):** SweetCPU's personality matches
+by NAME: `'IOProviderClass' = IOPlatformDevice; 'IONameMatch' = 'qcom,kryo470'`
+(iokit/KernelConfigTables.cpp:47 - the ONLY kryo reference in the entire kernel tree).
+- sweet: mkadt emitted cpu compatible qcom,kryo470 -> nubs match -> SweetCPU::start -> startAll
+  thread -> ml_set_max_cpus() (SweetCPU.cpp:175; only in-tree caller that fires on our platform;
+  AppleARMSMP/IOCPU paths never match) -> startup continues.
+- alioth: mkadt BOARDS['alioth'] emitted **qcom,kryo480** (d08a75a board switch) -> NO personality
+  matches the CPU nubs -> startAll never runs -> ml_set_max_cpus() never called -> the startup
+  thread sleeps forever in ml_wait_max_cpus() (osfmk/arm/machine_routines_common.c:1288, sleeps
+  THREAD_UNINT until MAX_CPUS_SET) which kperf_init_early() (osfmk/kperf/kperf.c:83) calls
+  UNCONDITIONALLY right after PE_lockdown_iokit/StartIOKitMatching and just before bsd_init() -
+  exactly the observed freeze (drivers registered on the matching thread, then silence, no
+  copyright, no panic, no reset).
+- Ruled out meanwhile: sweethidtest timer (boot-arg absent, fTest never armed), SweetBattery 30 s
+  timer, vsync timer 16667 us, serial KDP (kdp_init returned; its message predates the drivers),
+  CONFIG_XNUPOST (kernel_list_tests not in tree), root-wait (never reached).
+
+**FIX (committed): tools/mkadt.py BOARDS['alioth'] CPU_COMPAT = ('qcom,kryo470', 'ARM,v8')** with
+a comment. The cpu compatible is a synthetic match key, not hardware truth (sweet is really a
+Kryo 460; SweetCPU prints a hardcoded "Kryo 470" anyway) and ml_parse_cpu_topology never reads
+compatible => mkadt-only change, NO kernel patch, NO CI needed. Verified by dump: all 8 alioth
+cpu nodes now `compatible = 'qcom,kryo470|ARM,v8'`. Image rebuilt (same cmdline
+`debug=0xc serial=3 cpus=1 keepsyms=1 sweettouch=0 sweetkeys=0`, shim-boot-alioth.img
+17645568 B) - NOT YET BOOTED.
+
 **STATUS vs the porting guide:**
 - ~~Stage 1 (shim text on screen)~~ DONE 2026-10-22 (see BOOT RESULT above). Header-v2 accepted
   by alioth ABL; display + console + UFS + GPT all working. Reboot test: `fastboot boot
   shim/out/shim-boot-alioth.img` (per-board file; never the shared shim-boot.img blindly).
 - ~~Stage 2 (kernel messages scroll)~~ DONE 2026-10-22 (see STAGE 2 RESULT + PANEL CORRECTION
   above). Kernel reaches the kext phase on alioth; the first boot's scramble was our wrong
-  sweet-fbcon panel values (fixed in mkadt); the session's reset cause is still unknown and is
-  the thing the next (fully readable) boot is for.
+  sweet-fbcon panel values (fixed in mkadt); boot 2 with the fixed ADT was fully readable and
+  stable 25+ min (boot 1's reset did NOT reproduce - GUESS: it required the bad scramble-era
+  ADT, e.g. the sheared fbcon writes; unconfirmed).
 
 **UNFINISHED / NEXT (rough order):**
 - ~~BLOCKER = XNU kernel~~ RESOLVED 2026-10-22: kernel + build tree pulled from CI run #94 (see
   STAGE 2 RESULT). Kernel at xnu/out/kernel.development.sweet; tree at research/ci-buildtree/xnu.
   Pipeline proven end-to-end: mkadt --board alioth --highmem -> mkpayload -> build.sh <payload> ->
   fastboot boot shim/out/shim-boot-alioth.img.
-- **Immediate next step (NO CI needed):** regenerate the image with the fixed mkadt panel values
-  (`mkadt --board alioth --highmem` -> mkpayload -> build.sh -> fastboot boot) and boot: the
-  console should now be fully readable end to end; read the stage-2 reset cause off the screen
-  (panic dump), then push further (root-wait expected until a root exists).
+- **Immediate next step (NO CI needed): boot the CPU-compat-fix image** (built 2026-10-22 evening,
+  see FREEZE FOUND above; user must first hard-reset the frozen phone - long-press power - then
+  `fastboot boot shim/out/shim-boot-alioth.img`). EXPECTED: `SWEET CPU: requested=1 selected=1
+  (limit=8)` shortly after the SWEET FB line, then the Apple copyright banner (bsd_init), then
+  `Waiting on <matching>` / `Still waiting for root device` every ~10 s, then the iOS rootless
+  panic `Failed to mount root device` after ~10 attempts. Reaching that panic = stage 2 fully
+  done. If instead no SWEET CPU line appears, the personality still is not matching - re-check
+  nub names (IOPlatformExpert publishes nubs from /cpus; IONameMatch may key on name or
+  compatible) before touching anything else.
 - **Next kernel patch batch (ONE CI run, when driver work is designed):** driver ports only -
   0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 + FocalTech
   FT3698 - not Goodix/I2C); 0062 touch power rail (L10C + GPIO69). NOT in the batch: 0010 (panel

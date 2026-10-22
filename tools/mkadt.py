@@ -88,7 +88,10 @@ BOARDS = {
         TIMEBASE=19200000, VTIMER_INTID=27,
         COMPAT=('D22AP', 'iPhone10,3', 'xiaomi,alioth', 'xiaomi,sweet',
                 'qcom,sm8250', 'AppleARM'),
-        CPU_COMPAT=('qcom,kryo480', 'ARM,v8'),
+        # SweetCPU matches its IOKit personality on 'qcom,kryo470' (the only
+        # kernel consumer of the cpu compatible); keep the same match key as
+        # sweet or the CPU nubs never match and ml_wait_max_cpus() hangs.
+        CPU_COMPAT=('qcom,kryo470', 'ARM,v8'),
         FREQS=((7, 2841600000), (4, 2419200000), (0, 1804800000)),
     ),
 }
