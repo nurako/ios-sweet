@@ -9,9 +9,14 @@
 
 ### >>> UPDATE 2026-10-22 (alioth port, read first) <<<
 
-**STATE:** Board switch scaffolded for tools/mkadt.py + shim; NOT yet built (no
-aarch64-linux-gnu-gcc on this box) and NOT phone-tested. No kernel driver work done
-yet. Phone dump lives in ../phone/ (OUTSIDE the repo, keep it that way).
+**STATE:** Board switch done for tools/mkadt.py + shim + build.sh. The shim BUILDS
+locally with the LLVM toolchain (clang+lld; the GNU aarch64-linux-gnu-gcc is not on this
+box but clang 23 + ld.lld + llvm-objcopy are). Produced shim/out/shim-boot.img for BOTH
+boards (verified: ANDROID! magic, embedded alioth live.dtb has "xiaomi alioth"+"focaltech",
+sweet image lacks the alioth IMEM immediate). NOT phone-tested (needs the physical device
++ user). No kernel driver work done yet. Phone dump lives in ../phone/ (OUTSIDE the repo).
+
+**Build the shim here without the GNU toolchain:** `BOARD=alioth CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm READELF=llvm-readelf ./build.sh`. Two fixes were needed for clang (both safe for GCC): (a) -fno-jump-tables in CFLAGS - without it clang turns the 4-way exception-name switch in shim.c into an absolute .rodata string-pointer array (R_AARCH64_ABS64), wrong because the image runs at an arbitrary load address with no relocation pass (the build's ABS64 gate rejects it); (b) ufs.c: replaced __builtin_strcmp with a tiny static name_is() - clang lowers __builtin_strcmp to a libc call (GCC inlines it) and this freestanding image has no libc. build.sh now takes CC/OBJCOPY/NM/READELF env overrides and auto-adds --target + -fuse-ld=lld for clang.
 
 **Hardware facts (OBSERVED from ../phone/live.dts, the alioth live FDT):**
 - Root: model "Qualcomm ... xiaomi alioth", compatible "qcom,kona-mtp|qcom,kona|qcom,mtp".
@@ -54,14 +59,18 @@ yet. Phone dump lives in ../phone/ (OUTSIDE the repo, keep it that way).
    PTIMER_INTID 30 (sweet keeps 0x146aa65c/19/18). Verified via `gcc -E -dM` both ways: no
    redefinition, constants resolve correctly.
 3. shim/build.sh: `BOARD=sweet|alioth` env switch => -DALIOTH + DTB default ../dtb/... (sweet) or
-   ../../phone/live.dtb (alioth). mkbootimg still header v2.
+   ../../phone/live.dtb (alioth). mkbootimg still header v2. Toolchain now overridable
+   (CC/OBJCOPY/NM/READELF env; auto-adds clang --target + -fuse-ld=lld). Added -fno-jump-tables
+   and ufs.c name_is() so the LLVM toolchain links (see STATE). Built alioth + sweet images here
+   with clang/lld (see STATE).
 
 **UNFINISHED / NEXT (rough order):**
-- Install aarch64-linux-gnu-gcc (needs password sudo) and build the shim for alioth
-  (`BOARD=alioth ./build.sh`). Confirm mkbootimg header v2 is accepted by alioth ABL on
-  `fastboot boot` (SM8250 is a GKI/v3-boot device - may need --header_version 3; untested).
-- Stage 1 bring-up (guide): boot shim via `fastboot boot` (NOTHING flashed), see shim text on
-  screen. Then ADT via mkadt --board alioth --highmem.
+- Stage 1 bring-up (guide): boot the alioth shim via `fastboot boot shim/out/shim-boot.img`
+  (NOTHING flashed) and see shim text on the phone screen. Requires the physical device + the
+  user doing the button sequence. NOTE untested risk: SM8250 is a GKI/v3-boot device; if alioth's
+  ABL rejects a header-v2 image over fastboot boot, rebuild with --header_version 3 (drop the
+  --dtb arg; the DTB lives in vendor_boot). The image embeds phone/live.dtb as the DTB.
+- Then ADT: mkadt --board alioth --highmem -> mkpayload -> build.sh with the payload as $1.
 - Driver ports (need full xnu tree + GitHub CI; research/ sandbox not present in this fresh
   clone): patch 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 +
   FocalTech FT3698); patch 0062 touch power rail (L10C + GPIO69); patch 0061 panel 1440x2880.

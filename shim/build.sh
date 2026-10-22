@@ -7,9 +7,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 BOARD="${BOARD:-sweet}"
-CC=aarch64-linux-gnu-gcc
-OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+# Toolchain: default to the GNU aarch64 cross tools; override to build with the
+# LLVM toolchain, e.g.  CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm READELF=llvm-readelf LD=lld \
+#   BOARD=alioth ./build.sh  (clang needs --target=aarch64-linux-gnu, added below).
+CC="${CC:-aarch64-linux-gnu-gcc}"
+OBJCOPY="${OBJCOPY:-aarch64-linux-gnu-objcopy}"
+NM="${NM:-aarch64-linux-gnu-nm}"
+READELF="${READELF:-aarch64-linux-gnu-readelf}"
+[ "$CC" = clang ] && CC="clang --target=aarch64-linux-gnu" && LDFLAGS="-fuse-ld=lld"
+LDFLAGS="${LDFLAGS:-}"
+# --no-warn-rwx-segments is GNU-ld-only (this lld rejects it); it only silences a
+# warning, so drop it under lld.
+case "$LDFLAGS" in *lld*) NO_WARN_RWX="" ;; *) NO_WARN_RWX="-Wl,--no-warn-rwx-segments" ;; esac
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra"
+# -fno-jump-tables: without it clang turns the 4-way exception-name switch in
+# shim.c into an absolute .rodata string-pointer array (R_AARCH64_ABS64), which
+# is wrong because the image runs at an arbitrary load address with no relocation
+# pass - the build's ABS64 gate below rejects it. GCC is unaffected either way.
 case "$BOARD" in
 	sweet)  DTB="${DTB:-../dtb/boot_unpacked/dtb}" ;;
 	alioth) DTB="${DTB:-../../phone/live.dtb}"; CFLAGS="$CFLAGS -DALIOTH" ;;
@@ -21,13 +35,13 @@ for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+abs=$($READELF -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
-$CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
+$CC $CFLAGS $LDFLAGS -static -T shim.ld -Wl,--build-id=none $NO_WARN_RWX -Wl,-N \
 	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+size=$($NM out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
