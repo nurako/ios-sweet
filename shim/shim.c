@@ -12,7 +12,6 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
 
@@ -30,8 +29,19 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#ifdef ALIOTH
+/* alioth (SM8250): imem restart_reason@bf65c; DT wires CNTV to PPI 11 = INTID
+ * 27 and CNTP to PPI 14 = INTID 30 (see tools/mkadt.py BOARDS). GIC/FB/UFS are
+ * identical to sweet. */
+#define IMEM_RESTART_REASON	0x146bf65cUL
+#define VTIMER_INTID		27	/* DT: <GIC_PPI 11 ...> */
+#define PTIMER_INTID		30	/* DT: <GIC_PPI 14 ...> */
+#else
+/* sweet (SM7150): imem restart_reason@65c; CNTV wired to PPI 3 = INTID 19. */
+#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define VTIMER_INTID		19	/* sweet DT: <GIC_PPI 3 ...>, not the usual 27 */
+#define PTIMER_INTID		18	/* sweet DT: <GIC_PPI 2 ...> */
+#endif
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL

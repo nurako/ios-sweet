@@ -2,6 +2,75 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+# ===== ALIOTH PORT (Xiaomi Mi 11X, SM8250-AC "kona") - started 2026-10-22 =====
+# Separate device from sweet. Goal: run the same iOS 16.7 xnu on alioth, following
+# hackiosx.dev/porting.html. Strategy: keep sweet working, add a board switch so one
+# tree supports both. Non-destructive first (fastboot boot only; nothing flashed).
+
+### >>> UPDATE 2026-10-22 (alioth port, read first) <<<
+
+**STATE:** Board switch scaffolded for tools/mkadt.py + shim; NOT yet built (no
+aarch64-linux-gnu-gcc on this box) and NOT phone-tested. No kernel driver work done
+yet. Phone dump lives in ../phone/ (OUTSIDE the repo, keep it that way).
+
+**Hardware facts (OBSERVED from ../phone/live.dts, the alioth live FDT):**
+- Root: model "Qualcomm ... xiaomi alioth", compatible "qcom,kona-mtp|qcom,kona|qcom,mtp".
+- DRAM (memory reg, 3 banks): 0x80000000+0x3bb00000 (low, ends 0xbbb00000);
+  0xc0000000+0xc0000000 and 0x1_80000000+0x1_00000000 (=> contiguous 0xc0000000..0x2_80000000).
+  Net: low bank to 0xbbb00000 + a contiguous 7 GB region 0xc0000000..0x2_80000000 spanning the
+  4 GB line = ~8 GB. Highest fixed low-bank carve-out is disp_rdump @0xb0400000 (+0x1000000 =
+  0xb1400000), so the low kernel window must start >= 0xb1400000. No fixed carve-out above 4 GB
+  found (verify at boot). cont_splash @0x9c000000 size 0x2300000 (framebuffer).
+- GIC: GICD 0x17a00000/0x10000, GICR 0x17a60000/0x100000 - IDENTICAL to sweet.
+- Timer (arch_timer node): interrupts = PPIs 13,14,11,12. Linux enum order is
+  [secure, phys-nonsec, virt, hyp] => virt = PPI 11 = INTID **27**, phys-nonsec = PPI 14 = INTID
+  **30**. (sweet wires CNTV to PPI 3 = INTID 19, a qcom quirk; alioth uses the standard 27.)
+  clock-frequency 0x124f800 = 19.2 MHz (same TIMEBASE as sweet).
+- IMEM restart_reason @0x146bf65c (sweet: 0x146aa65c - MUST differ). PSHOLD 0xc264000 (same).
+- UFS 0x1d84000 (same). TLMM 0xf000000 size 0x1000000 (sweet keys driver uses 0x3900000 - differs).
+- Panel: 1440x2880 AMOLED (qcom,mdss-dsi-panel-width 0x5a0 / height 0xb40); stride 1440*4=5760.
+  cont_splash @0x9c000000 matches sweet FB base.
+- Touch: **FocalTech FT3698 ("focaltech,fts") over SPI** on QUP SE4 spi@990000 (0x990000), NOT
+  sweet's Goodix GT9896 over I2C SE7 (0xa84000). reset GPIO 33, IRQ GPIO 39, vdd=L10C(PM8150L),
+  vcc_i2c=L1C. touch_vddio fixed regulator on TLMM GPIO 69. => patch 0060 touch driver must be
+  REWRITTEN (SPI + FocalTech protocol), not just an address tweak.
+- Buttons: power+vol-down = PM8150 PON (base 0x800, PPID 0x008, status 0x810 - same as sweet).
+  vol-up = PM8150 GPIO6 (sweet uses PM6150L GPIO2: PPID 0x4c1/RT 0xc110 => alioth PPID 0x0c5/RT
+  0xc510). => patch 0060 keys driver GPIO reg changes.
+- CPU: 8 cores, MPIDR = core<<8 (0x000..0x700). kryo480: 4x A55 (silver) + 3x A77 (gold) +
+  1x A77 (prime). No >4G carve-outs in cpu nodes.
+
+**DONE this session (code only, compile/boot NOT verified):**
+1. tools/mkadt.py: added BOARDS dict + `--board sweet|alioth`. alioth sets PHYS_BASE 0xb4000000/
+   MEM_SIZE 0x7000000 (low window above disp_rdump), HIGH 0x100000000/0x140000000 (5 GB, leaves
+   headroom in the 6 GB high bank - GUESS, verify at boot), FB 1440x2880 stride 5760, VTIMER_INTID
+   27, synthetic ECID 0x414c494f54480001 ('ALIOTH'+1), root compatible
+   D22AP|iPhone10,3|xiaomi,alioth|xiaomi,sweet|qcom,sm8250|AppleARM (keeps 'xiaomi,sweet' so
+   SweetPlatformExpert still matches; drivers test for 'xiaomi,alioth'), cpu kryo480 tri-cluster
+   freqs (1804/2419/2841 MHz). GICD/GICR/UFS/FB-base/TIMEBASE unchanged. Verified: all 4 flag
+   combos build; sweet output byte-for-byte unchanged (10088 B); alioth dump correct (INTID 27,
+   1440x2880, canvas 1125x2436, dram-base 0xb4000000, kryo480).
+2. shim/shim.c: `#ifdef ALIOTH` switches IMEM_RESTART_REASON 0x146bf65c, VTIMER_INTID 27,
+   PTIMER_INTID 30 (sweet keeps 0x146aa65c/19/18). Verified via `gcc -E -dM` both ways: no
+   redefinition, constants resolve correctly.
+3. shim/build.sh: `BOARD=sweet|alioth` env switch => -DALIOTH + DTB default ../dtb/... (sweet) or
+   ../../phone/live.dtb (alioth). mkbootimg still header v2.
+
+**UNFINISHED / NEXT (rough order):**
+- Install aarch64-linux-gnu-gcc (needs password sudo) and build the shim for alioth
+  (`BOARD=alioth ./build.sh`). Confirm mkbootimg header v2 is accepted by alioth ABL on
+  `fastboot boot` (SM8250 is a GKI/v3-boot device - may need --header_version 3; untested).
+- Stage 1 bring-up (guide): boot shim via `fastboot boot` (NOTHING flashed), see shim text on
+  screen. Then ADT via mkadt --board alioth --highmem.
+- Driver ports (need full xnu tree + GitHub CI; research/ sandbox not present in this fresh
+  clone): patch 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) + touch (REWRITE: SPI SE4 0x990000 +
+  FocalTech FT3698); patch 0062 touch power rail (L10C + GPIO69); patch 0061 panel 1440x2880.
+  Patches 0010/0012 unchanged (FB base/size match).
+- IPSW download + userdata-flash stages: ON HOLD - user is deciding ("Need to think about it").
+  Do NOT plan flash steps yet.
+
+# ===== SWEET DEVICE (Redmi Note 10 Pro) below - unchanged =====
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**
