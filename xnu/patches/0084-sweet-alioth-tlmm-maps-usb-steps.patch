@@ -1,0 +1,133 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -30,8 +30,7 @@
+ 
+ #define TOUCH_SE_PA      0x00990000u /* qupv3 wrap0 SE4 (spi@990000, 16 KiB) */
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_TLMM_PA    0x0f000000u /* kona TLMM, 16 MiB window */
+-#define TOUCH_TLMM_SIZE  0x1000000u
++#define TOUCH_TLMM_PA    0x0f000000u /* kona TLMM, 16 MiB DT window */
+ 
+ /* kona GCC_QUPV3_WRAP_CLK_ENA = 0x52008 (lito's 0x5200c bit layout differs). */
+ #define TOUCH_GCC_VOTE   0x52008u
+@@ -74,16 +73,20 @@
+ /* M_CMD opcodes for SPI (spi-geni-qcom.c). */
+ #define SPI_FULL_DUPLEX  3u
+ 
+-/* kona TLMM: per-pin blocks of 0x1000 (cfg, io at +4) in bank regions. */
++/* kona TLMM (pinctrl-kona.c): per-pin blocks of 0x1000 (cfg, io at +4) in
++ * bank regions.  The DT window is 16 MiB, but ml_io_map cannot reserve that
++ * much io_submap VA: mapping it panicked kmem_alloc (KERN_NO_SPACE) on
++ * alioth 2026-10-24, so each used bank is mapped separately instead. */
+ #define TLMM_SOUTH       0x500000u /* reset 33, irq 39, vddio 69 */
+ #define TLMM_NORTH       0x900000u /* qup4 SPI pins 8..11 */
+-#define TOUCH_GPIO_CFG(bank, n) ((bank) + (uint32_t)(n) * 0x1000u)
+-#define TOUCH_GPIO_IO(bank, n)  (TOUCH_GPIO_CFG(bank, n) + 4u)
++#define TLMM_SOUTH_SIZE  0x50000u  /* pins 0..79 */
++#define TLMM_NORTH_SIZE  0x10000u  /* pins 0..15 */
++#define TOUCH_GPIO_PIN(n) ((uint32_t)(n) * 0x1000u)
+ 
+ #define TOUCH_MAX        10u
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio_s, gpio_n;
+ 	bool started, dead;
+ 	int irq_hint;
+ 	uint32_t irq_status, active;
+@@ -128,20 +131,27 @@
+ 	return false;
+ }
+ 
++static vm_offset_t
++touch_tlmm(uint32_t bank)
++{
++	return bank == TLMM_NORTH ? st.gpio_n : st.gpio_s;
++}
++
+ static void
+ touch_gpio(uint32_t bank, unsigned pin, unsigned mux, unsigned pull,
+     unsigned drive, bool out, bool high)
+ {
+-	uint32_t off = TOUCH_GPIO_CFG(bank, pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	vm_offset_t tl = touch_tlmm(bank);
++	uint32_t off = TOUCH_GPIO_PIN(pin);
++	uint32_t cfg = touch_rd(tl, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(bank, pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(bank, pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(tl, off + 4u,
++		    (touch_rd(tl, off + 4u) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(tl, off, cfg);
+ }
+ 
+ static bool
+@@ -438,9 +448,10 @@
+ 	touch_wait(delay_s * 1000u);
+ 	printf("ALIOTH TOUCH: mapping GCC/TLMM/SE4\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
++	st.gpio_s = ml_io_map(TOUCH_TLMM_PA + TLMM_SOUTH, TLMM_SOUTH_SIZE);
++	st.gpio_n = ml_io_map(TOUCH_TLMM_PA + TLMM_NORTH, TLMM_NORTH_SIZE);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
++	if (!st.gcc || !st.gpio_s || !st.gpio_n || !st.se) {
+ 		printf("ALIOTH TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+@@ -448,9 +459,9 @@
+ 		goto out;
+ 	}
+ 	printf("ALIOTH TOUCH: TLMM reset33=%#x irq39=%#x vddio69=%#x\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 33)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 39)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 69)));
++	    touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(33) + 4u),
++	    touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(39) + 4u),
++	    touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(69) + 4u));
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+ 	touch_gpio(TLMM_SOUTH, 39, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 	touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, false);  /* reset held low */
+@@ -487,7 +498,7 @@
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active ||
+-		    !(touch_rd(st.gpio, TOUCH_GPIO_IO(TLMM_SOUTH, 39)) & 1u) ||
++		    !(touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(39) + 4u) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+ 			int err = touch_focaltech();
+ 			if (err) {
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -883,12 +883,14 @@
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
++	printf("SWEET USB: event buffer at DMA 0x%llx\n", ud.dma_pa);
+ 
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
++	printf("SWEET USB: DCFG/DEVTEN set\n");
+ 
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+@@ -901,8 +903,10 @@
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
++	printf("SWEET USB: ep0 configured DALEPENA=0x%x\n", dwc_rd(DALEPENA));
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	printf("SWEET USB: qscratch map=%p\n", (void *)qs);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",

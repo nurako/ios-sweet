@@ -7,7 +7,83 @@
 # hackiosx.dev/porting.html. Strategy: keep sweet working, add a board switch so one
 # tree supports both. Non-destructive first (fastboot boot only; nothing flashed).
 
-### >>> UPDATE 2026-10-22 (alioth port, read first) <<<
+### >>> UPDATE 2026-10-24 (alioth, read first): PANIC ROOT FOUND = our TLMM 16 MiB
+###     ml_io_map; fix = patch 0084 (boots 4-10 history below) <<<
+
+**STATE:** stage 1+2+3 done; keys (0082) confirmed WORKING on the phone; touch (0083) never got
+past its first MMIO because it killed the kernel. The mystery "~65 s session resets" on boots
+7-10 were OUR OWN PANICS (not button resets, not USB): `alioth_touch.c` mapped the kona TLMM's
+full 16 MiB DT window via ml_io_map -> kmem_alloc(io_submap, 16 MB, KMA_NOFAIL) -> KERN_NO_SPACE
+-> panic at touch_thread wake. Fixed in **patch 0084** (this session, committed; CI to run).
+
+**BOOT HISTORY 2026-10-24 (boots 4-10, fastboot boot of 0083-kernel images, nothing flashed):**
+- Boot 4 (cmdline `... sweettouch=1 sweetkeys=1`): **ALIOTH KEYS runs clean** - sane SPMI reads
+  (PON apid 13, PM8150 GPIO6 apid 25; pon=0x4/1, gpio=0x1/1, en=0x80/1, subtype=0x11/1) = the
+  0082 keys driver is verified end to end on kona. Also added `rd=ufsroot0` to the cmdline: the
+  root-wait now loops `BSD root: ufsroot0` / `hfs_ValidateHFSPlusVolumeHeader: unknown Volume
+  Signature : da17` / `cannot mount root, errno = 19` (EXPECTED - userdata is f2fs, not HFS+).
+- Boots 7-9 (`sweettouch=1`): the session died ~65 s after boot and the phone came back in
+  Lineage (slot _b). **Hands-off experiment (nobody touched the phone) proved these are kernel
+  panics, ~"just over a minute" in - NOT force-resets.** The timing decomposes: driver probe at
+  ~+20 s + the 45 s `sweettouchdelay` + panic at touch_thread wake. Sessions WITHOUT drivers
+  (boots 3 and 6) were rock stable 25+ min.
+- Boot 10 (isolation: `sweetusb=1`, gadget start disabled): **same panic at the same point** ->
+  the USB/gadget code is EXONERATED as the reset cause. This time the panic screen STAYED UP
+  (boots 7-9 had auto-reset into Lineage) and was photographed (user).
+
+**PANIC DECODE (photos + local xnu-8796 source, all line-exact):**
+- Screen string `kmem_alloc(<map>, 16777216, 0x100021): failed with 3` =
+  osfmk/vm/vm_kern.c:177 `__kmem_failed_panic`, KMA_NOFAIL branch vm_kern.c:1002.
+  Flags 0x100021 decode from vm_kern.h: **KMA_NOFAIL|KMA_PAGEABLE|KMA_PERMANENT**; kr=3 =
+  KERN_NO_SPACE. `zone_fill_initially` ruled out (no callers in this config).
+- The ONLY (NOFAIL|PAGEABLE|PERMANENT) allocator in the tree is osfmk/arm/io_map.c:115-127:
+  `ml_io_map()` -> `kmem_alloc(io_submap, alloc_size, ...)` -> panics on failure. => the panic
+  IS an ml_io_map of 16 MB (16777216), and alioth_touch.c:33-34 is the only 16 MiB map:
+  `TOUCH_TLMM_PA 0x0f000000 / TOUCH_TLMM_SIZE 0x1000000` (the DT really is reg <0xf000000
+  0x1000000> - the window is real, the allocation just does not fit io_submap). Fires at
+  touch_thread wake: right after `ALIOTH TOUCH: mapping GCC/TLMM/SE4` (GCC 0x60000 map before
+  it succeeds - small maps are fine). Panicked task = kernel_task pid 0, tid 173.
+- The panic screen's `handshake structure not initialized` = osfmk/kdp/output_stages/
+  out_shmem.c:499, a SECONDARY log from the coredump output stage (no debugger attached).
+  Benign, not the cause.
+
+**KONA REGISTER MODEL VERIFIED against LineageOS android_kernel_xiaomi_sm8250 (lineage-21,
+fetched raw):** pinctrl-kona.c `NORTH 0x900000 / SOUTH 0x500000 / WEST 0x100000 / REG_SIZE
+0x1000`, PINGROUP: ctl = base+0x1000*id, io = ctl+4, intr_cfg +8, intr_status +0xc, mux_bit 2,
+pull_bit 0, drv_bit 6, oe_bit 9 - EXACTLY patch 0083's model. gpio8-11 = qup4 at mux index 1
+(matches our func_sel 1); gpio33/39/69 usable as GPIOs. dwc3-msm.c `QSCRATCH_REG_OFFSET
+0xF8800` -> our QSCRATCH_PA 0x0a6f8800 is correct on kona too.
+
+**USB OBSERVATION (secondary, separate bug):** sweet_usb_gadget_start never completes on
+alioth - it dies/hangs after `SWEET USB: soft reset done ...` and before the QSCRATCH print;
+DCTL_RUN_STOP is never set => no D+ pull-up => the host sees no device => sweet-usbnet.sh can
+never attach until this is fixed. Ep commands are bounded and print on failure, so the hang is
+between those prints; patch 0084 adds step prints (event buffer / DCFG+DEVTEN / ep0 / qscratch
+map) to localize it on the next boot. Also noted (unexplained, low priority): with the gadget
+disabled (boot 10) the QUSB2 PHY reads ALL ZEROS at 0x88e3000 and clkref CBCR 0x8c010 reads off.
+
+**PATCH 0084 (`0084-sweet-alioth-tlmm-maps-usb-steps.patch`, this session):**
+- alioth_touch.c: the 16 MiB TLMM map is split into two small per-bank maps - SOUTH
+  ml_io_map(0xf500000, 0x50000) (pins 0-79: reset 33 / irq 39 / vddio 69) and NORTH
+  ml_io_map(0xf900000, 0x10000) (qup4 SPI pins 8-11); `touch_tlmm(bank)` picks the base and
+  `TOUCH_GPIO_PIN(n) = n*0x1000` replaces the old absolute-offset macros; the map comment
+  records the panic so this is never regressed. No register-logic changes.
+- sweet_usb.c: diagnostic-only step prints in gadget_start (see USB OBSERVATION).
+- LOCAL VALIDATION: the pre-edit alioth_touch.c was reconstructed by reverse-applying the
+  edits and is byte-identical to patch 0083's added file content; `patch -p1` of 0084
+  reproduces the edited buildtree exactly; `tools/xnu-cc.py` (XNU_CC_CLANG=/usr/bin/clang,
+  CI log from run 39823118780) reports **0 of 2 files failed**.
+
+**NEXT (in order):** trigger CI (`gh workflow run xnu.yml -R nurako/ios-sweet`), pull the
+kernel, rebuild the image with **sweetusb=2 restored** (boot 10 had sweetusb=1 for isolation),
+boot via `fastboot boot shim/out/shim-boot-alioth.img`, and photograph: (a) the ALIOTH TOUCH
+probe block (`TLMM reset33=... irq39=... vddio69=...`, `gcc vote=...`, `probe err=... chip-id`
+- expect 0x54:0x52), (b) the full SWEET USB tail through the new step prints (localizes the
+gadget hang). Then write the follow-up fix for whichever fails. Stage 4 (iOS root flash) stays
+ON HOLD until the user confirms the destructive step. Phone state: serial 13e30f30,
+lineage_alioth slot _b, currently sitting at boot 10's panic screen.
+
+### >>> UPDATE 2026-10-22 (alioth port) <<<
 
 **STATE (updated after the first phone boot):** Board switch done for tools/mkadt.py + shim +
 build.sh, AND **STAGE 1 + STAGE 3 ACHIEVED ON THE PHONE** (see BOOT RESULT below). The shim
@@ -244,6 +320,48 @@ because there is no iOS root yet (stage 4, still ON HOLD).
   exists yet. Boot 1's scramble = our wrong sweet-fbcon panel values; boot 1's reset did NOT
   reproduce in boots 2/3 (GUESS: tied to the bad scramble-era ADT; unconfirmed, non-blocking).
 
+### >>> DRIVER PORTS 0082 + 0083 (2026-10-22, CI running) <<<
+
+**Patches written, validated locally, committed and pushed - ONE CI run for the batch:**
+- `0082-sweet-alioth-keys.patch` (commit 3fdf6de): `bsd/conf/files` entry, new `bsd/dev/alioth_keys.c`
+  (alioth_board() = SecureDTLookupEntry("/") + root "compatible" scan for "xiaomi,alioth", cached;
+  PON 0x008/0x0810 power+vol-down, vol-up = PM8150 GPIO6 PPID 0x0c5/RT 0xc510), sweet_ufs.c attach
+  gates `alioth_keys_init()` vs `sweet_keys_init()` on alioth_board().
+- `0083-sweet-alioth-touch-rail.patch` (commit 0c69026): new `bsd/dev/alioth_touch.c` (FT3698 over
+  SPI on QUP wrap0 SE4 0x990000; GCC WRAP_CLK_ENA 0x52008 bit 14; RCG 0x174d0; **TLMM 0x0f000000**
+  - first draft had 0x03f00000, fixed against live.dts `pinctrl@f000000` before generating the
+  patch; SOUTH bank reset 33/irq 39/vddio 69, NORTH bank qup4 pins 8-11; polled GENI FIFO duplex,
+  FTS read frame [addr_hi,addr_lo,len,0x0A] data at rx[4]; power = reset low -> GPIO69 high ->
+  `sweet_rpmh_vreg_enable("ldoc10",3000)` -> mux -> reset pulse -> probe 0xa3/0x9f (expect
+  0x54:0x52)) + sweet_ufs.c touch gate (sweet's lito-only touch must not run on kona) +
+  sweet_rpmh.c kona cmd-db fallback: sweet's locator 0x0c3f000c is `qcom,ddr-stats` on kona, so
+  alioth uses live.dts constants **0x80860000/0x20000**; RSC 0x18220000 / TCS 0x18220d00 / drv-id 2
+  / TCS geometry are IDENTICAL on kona (rpmh-rsc.c tcs-config: ACTIVE 2) and stay as they are.
+- Tool fix (commit f95f246): `tools/xnu-cc.py` now honours `XNU_CC_CLANG` (this box has no
+  ~/swift Apple-fork clang; used XNU_CC_CLANG=/usr/bin/clang, clang 23.1.3).
+- **LOCAL VALIDATION PASSED:** `patch -p1` of 0082+0083 onto a pristine pre-0082 copy of the
+  ci-buildtree reproduces the edited tree byte-for-byte; `tools/xnu-cc.py` (compile log =
+  `gh run view --log 39158169212 -R dipa-studio/ios-sweet`, the run our buildtree came from)
+  reports **0 of 1 files failed** for alioth_keys.c, alioth_touch.c, sweet_ufs.c, sweet_rpmh.c.
+  There is NO research/check-patch-order.py in this repo; CI copies xnu/patches/*.patch into
+  dxb/patches/ and applies them lexicographically (0082 < 0083, order correct).
+- **CI: run 39823118780 on nurako/ios-sweet — SUCCESS** (`gh workflow run xnu.yml -R nurako/ios-sweet`,
+  workflow_dispatch; push went to remote `fork` - origin still points at dipa-studio/ios-sweet and
+  is not writable by nurako). Kernel artifact pulled: xnu/out/kernel.development.sweet
+  (17222856 B, SHA256 a717a162...; `_alioth_board`/`_alioth_keys_init`/`_alioth_touch_init` present
+  in the symbol table, "ALIOTH KEYS: ..." strings in the binary - the patches really compiled in).
+- **BOOT 4 (2026-10-22 ~23:13, fastboot boot of the 0083 image, nothing flashed):** image
+  shim/out/shim-boot-alioth.img (17645568 B) = kernel 0083 + alioth.adt + cmdline
+  `debug=0xc serial=3 cpus=1 keepsyms=1 sweettouch=1 sweetkeys=1`. Sent + booted OK; the phone had
+  come out of the boot-3 root-wait freeze on its own (was in Android, `adb reboot bootloader` used).
+  AWAITING the user's screen photo / volume-button test - keys init at UFS attach, touch at +45 s
+  (sweettouchdelay default).
+- Boot-args for the first input test: `sweetkeys=1 sweettouch=1` (+ `sweettouchdelay=N`, default
+  45 s; `sweettouchirq=1` optional). Watch for `ALIOTH KEYS:` / `ALIOTH TOUCH:` lines (fw proto,
+  FIFO depths, GCC cfg/dfs, TLMM readbacks, chip-id actuals, first 63-B event).
+- For a later stage (userland): https://github.com/oosexgang/hackios-xnu-userland (xnu userland
+  repo provided by the user; not needed for the kernel-driver stage).
+
 **UNFINISHED / NEXT (rough order):**
 - ~~BLOCKER = XNU kernel~~ RESOLVED 2026-10-22: kernel + build tree pulled from CI run #94 (see
   STAGE 2 RESULT). Kernel at xnu/out/kernel.development.sweet; tree at research/ci-buildtree/xnu.
@@ -251,13 +369,10 @@ because there is no iOS root yet (stage 4, still ON HOLD).
   fastboot boot shim/out/shim-boot-alioth.img.
 - ~~Immediate next step: boot the CPU-compat-fix image~~ DONE 2026-10-22 boot 3: SWEET CPU lines
   + copyright + root-wait all confirmed (see STAGE 2 COMPLETE above). Stage 2 closed.
-- **Next concrete work: driver ports (ONE CI run):** 0060 keys (PM8150 GPIO6 PPID 0x0c5/0xc510) +
-  touch (REWRITE: SPI SE4 0x990000 + FocalTech FT3698 - not Goodix/I2C); 0062 touch power rail
-  (L10C + GPIO69). NOT in the batch: 0010 (panel identical to sweet, retracted) and 0061 (canvas
-  1125x2436 over 1080x2400 = same as sweet). Validate locally first with research/ci-buildtree +
-  tools/xnu-cc.py (AGENTS: cheap beats CI), then `gh workflow run xnu.yml -R nurako/ios-sweet`.
-  Note: these affect the lock screen/input (stage 4+), not the boot path - can proceed in
-  parallel with the stage-4 decision.
+- ~~Next concrete work: driver ports~~ DONE 2026-10-22: 0082 (keys) + 0083 (touch/rail) written,
+  locally validated and pushed - see DRIVER PORTS 0082 + 0083 above; CI run 39823118780 building.
+  Remaining: pull the kernel artifact, boot it and iterate on the `ALIOTH KEYS:`/`ALIOTH TOUCH:`
+  diagnostics. (0010 panel + 0061 canvas need no alioth change - see PANEL CORRECTION.)
 - **Push/GitHub DONE 2026-10-22:** forked to nurako/ios-sweet, rebased onto upstream 067c9b3
   (MIT License; no patch changes), pushed main (4 commits). The push deliberately did NOT touch
   xnu/patches/** so no CI run fired. CI via `gh workflow run xnu.yml -R nurako/ios-sweet`
