@@ -1,0 +1,53 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -131,6 +131,21 @@
+ 	return false;
+ }
+ 
++/*
++ * gcc-kona.c: wrap_0_s_ahb (halt 0x17008) has hardware clock gating
++ * (hwcg_reg 0x17008, hwcg_bit 1) and reads CLK_OFF whenever the wrapper
++ * sits idle.  Linux skips the halt poll in that mode
++ * (clk_branch_in_hwcg_mode); a plain poll never passes on it and wrongly
++ * aborts the probe - observed on alioth boot A 2026-10-25, where the
++ * vote (0x41043e8, bits 6/7/8/9/14) had taken effect but s_ahb still
++ * read halted.  Mirror that skip here.
++ */
++static bool
++touch_branch_hwcg(uint32_t off)
++{
++	return off == 0x17008u && (touch_rd(st.gcc, 0x17008u) & (1u << 1));
++}
++
+ static vm_offset_t
+ touch_tlmm(uint32_t bank)
+ {
+@@ -157,6 +172,10 @@
+ static bool
+ touch_clocks(void)
+ {
++	/* Pre-vote halt state of the four wrap0 branches, for diagnosis. */
++	printf("ALIOTH TOUCH: GCC pre m=%#x s=%#x core=%#x s4=%#x\n",
++	    touch_rd(st.gcc, 0x17004u), touch_rd(st.gcc, 0x17008u),
++	    touch_rd(st.gcc, 0x23000u), touch_rd(st.gcc, 0x174ccu));
+ 	/* Vote only wrapper0 SE4 and its wrapper; other users are untouched. */
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | TOUCH_GCC_MASK);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+@@ -182,12 +201,17 @@
+ 	}
+ 	const uint32_t branches[] = {0x17004, 0x17008, 0x23000, 0x174cc};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (touch_branch_hwcg(branches[i]))
++			continue;
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("ALIOTH TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+ 			return false;
+ 		}
+ 	}
++	printf("ALIOTH TOUCH: GCC post m=%#x s=%#x core=%#x s4=%#x\n",
++	    touch_rd(st.gcc, 0x17004u), touch_rd(st.gcc, 0x17008u),
++	    touch_rd(st.gcc, 0x23000u), touch_rd(st.gcc, 0x174ccu));
+ 	return true;
+ }
+ 
