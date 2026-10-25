@@ -1,0 +1,68 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -888,20 +888,57 @@
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+-	dwc_wr(DEVTEN, 0x7);
++	/*
++	 * DEVTEN gates only the dwc3 IRQ line; events reach the polled GEVNT
++	 * buffer regardless, and this driver never registers a handler (like
++	 * the UFS driver, it is thread-polled).  Enabling device events
++	 * (0x7) right after ABL's fastboot session froze the whole system on
++	 * alioth with no panic - boots 7/9 and 12 all end right after this
++	 * write, then a watchdog resets ~40 s later - so keep the line quiet.
++	 */
++	dwc_wr(DEVTEN, 0);
+ 	printf("SWEET USB: DCFG/DEVTEN set\n");
+ 
++	/*
++	 * Alioth 2026-10-25: the session died silently between this line and
++	 * "ep0 configured" (ud_epcmd always prints within ~1 ms, so nothing
++	 * printed = the register access itself stopped the CPU).  Probe the
++	 * boundary register-by-register: writes at 0xc720, then a read at
++	 * 0xc80c, then a print per DEP command.
++	 */
++	uint32_t dl = dwc_rd(DALEPENA);
++	dwc_wr(DALEPENA, dl);
++	printf("SWEET USB: DALEPENA %#x write-back reads %#x\n", dl, dwc_rd(DALEPENA));
++	printf("SWEET USB: DEPCMD0 read %#x (DEPCMD block probe)\n", dwc_rd(DEPCMD(0)));
++
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed at DEPSTARTCFG\n");
++		return;
++	}
++	printf("SWEET USB: ep cfg DEPSTARTCFG ok\n");
++	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0)) {
++		printf("SWEET USB: endpoint 0 setup failed at SETEPCONFIG0\n");
++		return;
++	}
++	printf("SWEET USB: ep cfg SETEPCONFIG0 ok\n");
++	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed at SETTRANSFRESOURCE0\n");
++		return;
++	}
++	printf("SWEET USB: ep cfg SETXFER0 ok\n");
++	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0)) {
++		printf("SWEET USB: endpoint 0 setup failed at SETEPCONFIG1\n");
++		return;
++	}
++	printf("SWEET USB: ep cfg SETEPCONFIG1 ok\n");
++	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed at SETTRANSFRESOURCE1\n");
+ 		return;
+ 	}
++	printf("SWEET USB: ep cfg SETXFER1 ok\n");
+ 	dwc_wr(DALEPENA, 0x3);
++	printf("SWEET USB: starting setup TRB\n");
+ 	ud_start_setup();
+ 	printf("SWEET USB: ep0 configured DALEPENA=0x%x\n", dwc_rd(DALEPENA));
+ 
