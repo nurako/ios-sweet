@@ -7,7 +7,52 @@
 # hackiosx.dev/porting.html. Strategy: keep sweet working, add a board switch so one
 # tree supports both. Non-destructive first (fastboot boot only; nothing flashed).
 
-### >>> UPDATE 2026-10-25 (alioth, read first): 0084 PANIC FIXED (verified), touch
+### >>> UPDATE 2026-10-25b (alioth, read first): RPMh WORKS; probe runs but frame
+###     was wrong -> patch 0089; CI is MANUAL from now on <<<
+
+**BOOT A'' (2026-10-25, kernel eb2202da = 0087+0088, Image A SHA 044cfffa4eda8fb6,
+`sweettouchdelay=0 sweetusb=1`)** - furthest reach yet, no panic, clean bail:
+- **RPMh both rails enable**: `SWEET RPMH: ldoc10 addr=0x412000 slave=4 ... TCS0 ACTIVE
+  3000 mV mode=7 enable=1 ... done=1 cmd-status=0x10101/0x10101/0x10101 ... rail ACTIVE
+  vote complete`, then `ldoc1 addr=0x42d00` at 1800 mV identically. 0087/0088 guards
+  passed; cmd-db lookups resolved; TCS transactions completed (actual PMIC voltage still
+  hardware-unverified - the prints say so).
+- **Probe ran**: `ALIOTH TOUCH: probe err=0/0 chip-id=00:00 irq=0x4c000001` ->
+  `FT3698 not confirmed (chip-id=00:00 dead=0); stopping`. GENI full-duplex transfer
+  completes cleanly (DONE, sent=got=n) - engine side is alive.
+- **Verified CORRECT this session** (observation against sources): TLMM banks from
+  pinctrl-kona.c (`NORTH 0x00900000` = pins 8..11, `SOUTH 0x00500000` = 33/39/69) match
+  the driver's offsets; qup4 mux matches live.dts (gpio8/9/10 qup4 6 mA, gpio11 CS qup4
+  16 mA pull-up); SE base 0x990000 = `qupv3_se4_spi` spi@990000 with focaltech@0 child
+  status ok; GENI semantics match spi-geni-qcom.c (CPOL=BIT(2), CPHA=BIT(0),
+  WORD_LEN=bits_per_word-4 so 4 = 8-bit, TX/RX_TRANS_LEN counted in words, CS_TOGGLE
+  cleared, M_CMD FULL_DUPLEX=3<<27); FTS_REG_CHIP_ID=0xA3, CHIP_ID2=0x9F.
+
+**ROOT CAUSE of chip-id 00:00 (patch 0089): our read frame is not the FTS frame.**
+Vendor `drivers/input/touchscreen/focaltech_3658u/focaltech_spi.c` (Lineage
+android_kernel_xiaomi_sm8250 lineage-20; `focaltech_spi/` is byte-identical, md5 match):
+`tx = [addr8, READ_CMD(0x80|0x20 = 0xa0), len_hi, len_lo, 3 dummy zeros, data x len,
+crc16 x 2]`; status at rx[3] must have `(st & 0xa0) == 0`; **data at rx[7]**; CRC16
+init 0xffff, poly 0x8408 reflected, over the data, appended little-endian; SPI_RETRY 3,
+CS_HIGH_DELAY 150 us. Our old frame `[addr_hi, addr_lo, len, 0x0a]` put the address where
+the command byte belongs: the IC parsed addr 0x00, cmd 0xa3 (invalid) and stayed silent,
+and MISO (pull-down in qupv3_se4_spi_active) read 00:00. 0089 rewrites touch_read to the
+vendor frame with status + CRC validation, 3 retries and `delay(150)` (delay(int) comes
+from kern/clock.h - do NOT redeclare it; a `delay(unsigned)` extern fails to compile).
+If MISO is still silent after 0089 the new prints tell us how: status 0 passes but
+zero-data CRC fails -> `crc=0xffff got=0x0 hdr=...`, i.e. frame OK, bus dead -> next
+suspect is the ldoc10 voltage (raw mode=7 vote unverified) or wiring.
+- **gpio69 downgrade**: live.dts uses gpio69 ONLY in `tsif0_signals_active` (tuner TS-IF);
+  the vendor fts driver requests no power GPIO (regulator_bulk only). The 0083-era
+  "GPIO69 = vddio enable" claim is NOT DT-supported - kept (drives an unused pin high,
+  harmless) but classed as unverified guess. Power = ldoc10 vdd + ldoc1 vcc_i2c only.
+- The old NOTES claim `FTS read frame [addr_hi,addr_lo,len,0x0A] ... rx[4]` (see the
+  0083 entry below) was WRONG; kept as history, superseded here.
+- **CI is MANUAL now** (2026-10-25, user request): the `push:` trigger was removed from
+  `.github/workflows/xnu.yml`; trigger with
+  `gh workflow run xnu.yml -R nurako/ios-sweet` only.
+
+### >>> UPDATE 2026-10-25 (alioth, superseded by 2026-10-25b above): 0084 PANIC FIXED (verified), touch
 ###     reaches SE4; blocked at RPMh ldoc10 guard -> patches 0087/0088 (boots 12/A/A'
 ###     history + USB DEVTEN theory below) <<<
 
@@ -51,8 +96,8 @@ Next boot after CI: same Image A cmdline; expect `TCS%u ACTIVE 3000 mV ...` RPMh
 then `probe err=?/? chip-id` (want 54:52). rh_send mode=7 (HPM raw) is unverified for
 L10C - if cmd-status errors, that is the next suspect; extensive TCS prints will show it.
 
-**NEXT ACTIONS:** (a) boot Image A'' after CI 0087/0088 -> get chip-id; (b) boot Image B
-(`sweetusb=2`, 0085 probes) to test DEVTEN=0 + ladder; (c) update this file with results.
+**NEXT ACTIONS:** (SUPERSEDED by 2026-10-25b above: 0087/0088 booted, chip-id 00:00
+root-caused to the SPI frame -> patch 0089; Image B (sweetusb=2, 0085 ladder) still untested.)
 
 ### >>> UPDATE 2026-10-24 (alioth, read first): PANIC ROOT FOUND = our TLMM 16 MiB
 ###     ml_io_map; fix = patch 0084 (boots 4-10 history below) <<<

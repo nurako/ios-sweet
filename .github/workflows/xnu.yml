@@ -15,11 +15,8 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-  push:
-    branches: [main]
-    paths:
-      - "xnu/patches/**"
-      - ".github/workflows/xnu.yml"
+  # no push trigger: run manually (`gh workflow run xnu.yml -R nurako/ios-sweet`)
+  # so every push does not burn a 100-minute macOS runner
 
 concurrency:
   group: xnu-${{ github.ref }}
