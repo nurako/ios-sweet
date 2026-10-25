@@ -1,11 +1,58 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-15, latest)
+## Agent handoff / active work (2026-10-25, latest)
 
 # ===== ALIOTH PORT (Xiaomi Mi 11X, SM8250-AC "kona") - started 2026-10-22 =====
 # Separate device from sweet. Goal: run the same iOS 16.7 xnu on alioth, following
 # hackiosx.dev/porting.html. Strategy: keep sweet working, add a board switch so one
 # tree supports both. Non-destructive first (fastboot boot only; nothing flashed).
+
+### >>> UPDATE 2026-10-25 (alioth, read first): 0084 PANIC FIXED (verified), touch
+###     reaches SE4; blocked at RPMh ldoc10 guard -> patches 0087/0088 (boots 12/A/A'
+###     history + USB DEVTEN theory below) <<<
+
+**STATE:** three blockers cleared in order today, each verified on hardware:
+1. **0084 validated (boot A):** `ALIOTH TOUCH: mapping GCC/TLMM/SE4` prints and the session
+   stays up past the old +65 s death - the 16 MiB kmem panic is GONE. Boots with
+   `sweettouchdelay=0 sweetusb=1` are stable (no reset, no panic, minutes of runtime).
+2. **USB freeze root-caused to DEVTEN=0x7 (guess, well-supported):** boot 12 (0084 + step
+   prints) ran ~60 s, NO panic, last line `DCFG/DEVTEN set`, then watchdog reset. Writes to
+   0xc000-0xcfff all share one mapped page (GEVNT/DCFG/DEVTEN writes succeeded post-reset),
+   so the freeze cannot be address-based; the driver never registers an interrupt handler
+   (grep: "thread (no interrupt)", GEVNTSIZ interrupt-masked) - DEVTEN=0x7 asserted an
+   unhandled dwc3 IRQ line (ABL left a pending fastboot event), freezing CPU0 (cpus=1) with
+   no panic. Fits boots 7/9 too (0083 had no prints between `soft reset done` and DEVTEN).
+   **Patch 0085** (commit 213c129, CI 40179478439): DEVTEN=0 (correct for a polled driver)
+   + per-DEPCMD probe ladder (DALEPENA write-back 0xc720, DEPCMD0 read 0xc80c, a print per
+   DEP command). **Image B (sweetusb=2) with this kernel is STILL UNBOOTED.**
+3. **Touch clock halt poll fixed (boot A -> A'):** boot A died at `GCC branch ... halted`.
+   Verified all four offsets against Lineage gcc-kona.c (lineage-20, fetched raw):
+   0x17004 wrap_0_m_ahb, 0x17008 wrap_0_s_ahb (**HWCG**: hwcg_reg 0x17008 hwcg_bit 1),
+   0x23000 wrap0_core, 0x174cc wrap0_s4, all enable_reg 0x52008 bits 6/7/8/14 (the vote
+   read back 0x41043e8 = correct). clk-branch.c skips the halt poll in HWCG mode
+   (clk_branch_in_hwcg_mode); our unconditional bit31 poll can never pass on idle s_ahb.
+   **Patch 0086** (commit 1b6900d, CI 40183327287): mirror the skip + GCC pre/post dumps.
+
+**BOOT A' (2026-10-25, 0086 kernel, `sweettouchdelay=0 sweetusb=1`):** `GCC pre m=0
+s=0x80000002 core=0x42200 s4=0x80004220` (s_ahb exactly the diagnosed HWCG state; skipped,
+no `halted` line) -> `se4 fw=0x101 proto=1 status=0 tx=0x20102064 rx=0x20104000 ios=0`
+(SE4 engine alive, firmware present) -> `TLMM reset33=0 irq39=0 vddio69=0` -> NEW BLOCKER:
+`SWEET RPMH: expected ldoc11 and 2950..3400 mV` / `L10C RPMh enable failed 22; probes
+skipped` (EINVAL - no chip-id line). Root cause: sweet_rpmh.c's guard hardcodes sweet's
+L11C rail but alioth_touch.c correctly calls `("ldoc10", 3000)` - **live.dts verified**:
+focaltech,fts vdd-supply = phandle 0x2e1 = pm8150a_l10 (resource `ldoc10`, 2950..3410 mV),
+vcc_i2c-supply = phandle 0x2d8 = pm8150a_l1 (resource `ldoc1`, fixed 1800 mV). The
+callers are alioth (ldoc10/3000) and sweet_touch.c (ldoc11/3200, must stay valid).
+
+**Patches 0087 (sweet_rpmh.c rails: ldoc10 2950..3410, ldoc11 2950..3400, ldoc1 1800;
+de-L11C the messages) + 0088 (alioth_touch.c also enables ldoc1 1800 mV as vcc_i2c,
+non-fatal)** - written, round-trip OK, xnu-cc 0 of 2 failed, CI pending this commit.
+Next boot after CI: same Image A cmdline; expect `TCS%u ACTIVE 3000 mV ...` RPMh prints
+then `probe err=?/? chip-id` (want 54:52). rh_send mode=7 (HPM raw) is unverified for
+L10C - if cmd-status errors, that is the next suspect; extensive TCS prints will show it.
+
+**NEXT ACTIONS:** (a) boot Image A'' after CI 0087/0088 -> get chip-id; (b) boot Image B
+(`sweetusb=2`, 0085 probes) to test DEVTEN=0 + ladder; (c) update this file with results.
 
 ### >>> UPDATE 2026-10-24 (alioth, read first): PANIC ROOT FOUND = our TLMM 16 MiB
 ###     ml_io_map; fix = patch 0084 (boots 4-10 history below) <<<

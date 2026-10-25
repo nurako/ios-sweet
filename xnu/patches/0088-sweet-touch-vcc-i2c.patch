@@ -1,0 +1,13 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -495,6 +495,10 @@
+ 		printf("ALIOTH TOUCH: L10C RPMh enable failed %d; probes skipped\n", power_error);
+ 		goto out;
+ 	}
++	/* live.dts: vcc_i2c-supply = pm8150a_l1 (ldoc1, 1.8 V). Non-fatal. */
++	if (sweet_rpmh_vreg_enable("ldoc1", 1800)) {
++		printf("ALIOTH TOUCH: L1C vcc_i2c enable failed; continuing\n");
++	}
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+ 	touch_gpio(TLMM_NORTH, 8, 1, 1, 2, false, false);  /* qup4 SPI pins, 6 mA */
+ 	touch_gpio(TLMM_NORTH, 9, 1, 1, 2, false, false);
