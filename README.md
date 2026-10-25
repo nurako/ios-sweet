@@ -1,3 +1,11 @@
+> [!WARNING]
+> **This project is incomplete, highly experimental, and can brick your device.**
+> It boots a modified Apple XNU kernel on hardware it was never meant for. Drivers are
+> half-ported, large parts of the system do not work, and a wrong flash can leave the phone
+> unbootable. Stage 4 additionally **erases all Android user data**. Only use devices with an
+> unlocked bootloader that you can afford to lose, keep partition backups, and expect nothing
+> here to be safe or finished. Everything you do with this software is at your own risk.
+
 # iOS 16 on the Xiaomi Mi 11X (alioth)
 
 **This is the Mi 11X fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)**
@@ -168,6 +176,19 @@ The full patch series (0001–0069) is inherited from upstream and documented in
 - IMEM restart reason register: `0x146bf65c`.
 
 More in [`NOTES.md`](NOTES.md).
+
+## AI disclosure
+
+This project is developed in close collaboration with AI coding agents (OpenCode running large
+language models). The kernel patch series for the alioth port, the shim/tool changes, the
+debugging analysis, and large parts of `NOTES.md` and this README were written or revised by AI,
+with a human maintainer directing the work, performing the hardware steps (flashing, booting,
+photographing console output) and reviewing the results. CI builds and on-device boots are used
+to verify the AI's reasoning against real hardware.
+
+Consequently, expect bugs and confidently-written but incorrect claims: analysis in `NOTES.md`
+is explicitly marked where it separates observations from guesses. Treat all of it as unverified
+until reproduced on hardware.
 
 ## Credits
 
