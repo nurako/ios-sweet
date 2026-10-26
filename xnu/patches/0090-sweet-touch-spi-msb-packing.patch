@@ -1,0 +1,114 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -45,7 +45,9 @@
+ #define SE_FW            0x068u
+ #define SE_CLK_SEL       0x07cu
+ #define SE_SPI_CPHA      0x224u
++#define SE_SPI_LOOPBACK  0x22cu  /* bit0..1 LOOPBACK_MSK */
+ #define SE_SPI_CPOL      0x230u
++#define SE_SPI_INV       0x24cu  /* SE_SPI_DEMUX_OUTPUT_INV */
+ #define SE_SPI_DEMUX     0x250u
+ #define SE_BYTE_GRAN     0x254u
+ #define SE_DMA           0x258u
+@@ -53,6 +55,14 @@
+ #define SE_SPI_WORD_LEN  0x268u
+ #define SE_SPI_TX_LEN    0x26cu
+ #define SE_SPI_RX_LEN    0x270u
++#define SE_SPI_DELAY     0x278u  /* SE_SPI_DELAY_COUNTERS */
++/*
++ * se_get_packing_config(bpw=8, pack_words=4, msb_to_lsb=true): cfg0/cfg1
++ * exactly as Linux computes them in spi_setup_word_len(), i.e. 8-bit words
++ * sent MSB-first on the wire.  Identical to sweet_touch.c.
++ */
++#define SE_PACK0         0x0007f8feu
++#define SE_PACK1         0x000ffefeu
+ #define SE_CMD           0x600u
+ #define SE_CTRL          0x604u
+ #define SE_IRQ           0x610u
+@@ -310,6 +320,21 @@
+ }
+ 
+ /*
++ * Full response trace for a failed read: rx[0..3] carry status/hdr, the
++ * remaining bytes show what the IC actually shifted out (capped so one
++ * fbcon line stays readable).
++ */
++static void
++touch_trace(const char *why, uint16_t reg, const uint8_t *rx, unsigned n)
++{
++	printf("ALIOTH TOUCH: fts reg %#x %s frame:", reg, why);
++	for (unsigned i = 0; i < n && i < 24u; ++i) {
++		printf(" %02x", rx[i]);
++	}
++	printf("\n");
++}
++
++/*
+  * Real FTS SPI frame, verified byte-for-byte against Lineage
+  * android_kernel_xiaomi_sm8250 drivers/input/touchscreen/focaltech_3658u/
+  * focaltech_spi.c (identical copy in focaltech_spi/):
+@@ -354,6 +379,7 @@
+ 		if (rx[3] & 0xa0) {
+ 			printf("ALIOTH TOUCH: fts reg %#x status=%#x hdr=%02x%02x%02x%02x\n",
+ 			    reg, rx[3], rx[0], rx[1], rx[2], rx[3]);
++			touch_trace("status", reg, rx, total);
+ 			continue;
+ 		}
+ 		uint16_t crc = 0xffff;
+@@ -371,6 +397,7 @@
+ 			    "hdr=%02x%02x%02x%02x body=%02x%02x%02x\n",
+ 			    reg, crc, got, rx[0], rx[1], rx[2], rx[3],
+ 			    rx[dp], rx[dp + 1], rx[dp + 2]);
++			touch_trace("crc", reg, rx, total);
+ 			continue;
+ 		}
+ 		for (unsigned i = 0; i < len; ++i) {
+@@ -477,19 +504,43 @@
+ 	touch_wr(st.se, SE_CLK_SEL, 0);
+ 	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+ 	/* SPI mode 0, CS demux output 0, CS auto-toggled per command. */
++	touch_wr(st.se, SE_SPI_LOOPBACK,
++	    touch_rd(st.se, SE_SPI_LOOPBACK) & ~3u);
+ 	touch_wr(st.se, SE_SPI_CPHA, touch_rd(st.se, SE_SPI_CPHA) & ~1u);
+ 	touch_wr(st.se, SE_SPI_CPOL, touch_rd(st.se, SE_SPI_CPOL) & ~4u);
+ 	touch_wr(st.se, SE_SPI_DEMUX, 0);
++	touch_wr(st.se, SE_SPI_INV, 0);
++	touch_wr(st.se, SE_SPI_DELAY, 0);
+ 	touch_wr(st.se, SE_SPI_TRANS_CFG,
+ 	    touch_rd(st.se, SE_SPI_TRANS_CFG) & ~1u);
+ 	touch_wr(st.se, SE_SPI_WORD_LEN,
+ 	    (touch_rd(st.se, SE_SPI_WORD_LEN) & ~0x3ffu) | 4u); /* 8-bit words */
+-	/* Four 8-bit bytes per 32-bit word, LSB byte first (Linux packing). */
++	/*
++	 * Four 8-bit SPI words per 32-bit FIFO word, MSB-first on the wire.
++	 * The previous hand-computed 0x0004380e/0x000c3e0e were
++	 * se_get_packing_config(bpw=8, pack_words=4, msb_to_lsb=false), so
++	 * every byte was bit-reversed in BOTH directions: the IC saw addr
++	 * 0xc5 / cmd 0x05 instead of 0xa3 / 0xa0 and answered with a status
++	 * pattern (boot A''' 2026-10-25: hdr constant 0x80 then 0x90 across
++	 * all four header bytes).  Linux spi_setup_word_len() computes
++	 * msb_to_lsb=true -> SE_PACK0/SE_PACK1 (as sweet_touch.c uses).
++	 */
+ 	touch_wr(st.se, SE_BYTE_GRAN, 0);
+-	touch_wr(st.se, 0x260, 0x0004380eu);
+-	touch_wr(st.se, 0x264, 0x000c3e0eu);
+-	touch_wr(st.se, 0x284, 0x0004380eu);
+-	touch_wr(st.se, 0x288, 0x000c3e0eu);
++	touch_wr(st.se, 0x260, SE_PACK0);
++	touch_wr(st.se, 0x264, SE_PACK1);
++	touch_wr(st.se, 0x284, SE_PACK0);
++	touch_wr(st.se, 0x288, SE_PACK1);
++	printf("ALIOTH TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
++	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
++	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288),
++	    touch_rd(st.se, SE_BYTE_GRAN));
++	if (touch_rd(st.se, 0x260) != SE_PACK0 ||
++	    touch_rd(st.se, 0x264) != SE_PACK1 ||
++	    touch_rd(st.se, 0x284) != SE_PACK0 ||
++	    touch_rd(st.se, 0x288) != SE_PACK1) {
++		printf("ALIOTH TOUCH: packing readback mismatch; probes skipped\n");
++		return false;
++	}
+ 	touch_wr(st.se, 0x80c, 1);
+ 	touch_wr(st.se, 0x810, 0);
+ 	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
