@@ -1,6 +1,85 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-25, latest)
+## Agent handoff / active work (2026-10-26, latest)
+
+### >>> UPDATE 2026-10-26 (alioth, read first): 0089 showed LIVE MISO; constant 0x80/0x90
+###     root-caused to LSB-first FIFO packing -> patch 0090, CI run 40358367056 building <<<
+
+**BOOT A''' (2026-10-25, kernel e2d7d8af = 0089, Image A SHA 5ba130c5372c7f1e,
+`sweettouchdelay=0 sweetusb=1`, user photo):** the vendor FTS frame moved MISO from
+silent 00:00 to LIVE non-zero data:
+- `fts reg 0xa3 status=0x80 hdr=80808080`, `status=0x90 hdr=90909090` x2, `fts reg 0x9f
+  status=0x90 hdr=90909090` x2, `probe err=5/5 chip-id=00:00 irq=0x4c000001` -> clean
+  stop, session stable. Per-transfer CONSTANT bytes that CHANGE between attempts
+  (0x80 -> 0x90): neither a floating line (would read 00/ff) nor loopback (would echo
+  a3 a0 00 01) can produce that - the bus carries real activity.
+- Buttons re-confirmed in the same session: `ALIOTH KEYS: arb=0x50010000 apids=512 ...`
+  on physical presses (user).
+
+**ROOT CAUSE of the constant bytes (code-verified 2026-10-26, patch 0090): our SE FIFO
+packing config was LSB-first.** alioth_touch.c hand-wrote SE_GENI_TX/RX_PACKING_CFG0/1
+(regs 0x260/0x264/0x284/0x288) = 0x0004380e/0x000c3e0e. Decoded field-by-field against
+Linux `se_get_packing_config()` (drivers/platform/msm/qcom-geni-se.c:605) that is exactly
+`(bpw=8, pack_words=4, msb_to_lsb=false)`: every entry has bit4=0, start bits 0/8/16/24.
+Linux calls it with `msb_first = !(mode & SPI_LSB_FIRST)` = true for mode 0
+(spi-geni-qcom.c spi_setup_word_len) => cfg0 = 0x0007f8fe, cfg1 = 0x000ffefe (start bits
+7/15/23/31, bit4=1) - computed by hand AND cross-checked against the WORKING sweet I2C
+driver sweet_touch.c, which already uses SE_PACK0/SE_PACK1 = 7f8fe/ffefe ("MSB on the
+wire"). Consequence: every byte was bit-reversed BOTH ways - the IC saw addr 0xc5 /
+cmd 0x05 (bitrev of 0xa3/0xa0) instead of the read command, so it never executed the
+read, and our rx[] bytes were reversed on the way in.
+- Ruled out meanwhile (verified against vendor sources this session): SPI mode
+  (fts-core.c forces `spi->mode = SPI_MODE_0`, bits_per_word 8 - we match), clock-div
+  format (SE_GENI_CLK_SEL 0x7c + GENI_SER_M_CLK_CFG 0x48, CLK_DIV_SHFT=4, SER_CLK_EN=
+  bit0: our `(7<<4)|1` is exactly spi_geni_clk_conf's format; SER ~2.74 MHz, SCK
+  ~1.4-2.7 MHz, under the child's 6 MHz cap), WORD_LEN = bits-4 = 4 (MIN_WORD_LEN=4),
+  BYTE_GRAN = bpw>>4 = 0, FIFO byte-lane order (both ours and vendor put byte0 in lane
+  0), MISO sampling delay (vendor gates it on DT property `qcom,set-miso-sampling`;
+  SE4 has neither that nor `qcom,change-sampling-rate` - only the disabled SE2 UART
+  node does), wrapper RCG = XO/1 19.2 MHz (DFS level0 check passed in boot A').
+  SE4 spi-max-frequency = 50 MHz parent, focaltech child = 6 MHz (0x5b8d80).
+
+**PATCH 0090 (`0090-sweet-touch-spi-msb-packing.patch`, commit b3b9270, pushed):**
+- packing writes -> SE_PACK0/SE_PACK1 (MSB-first) with the decode comment;
+  `ALIOTH TOUCH: packing tx=... rx=... gran=...` readback print + skip-probes guard on
+  mismatch (same guard pattern sweet_touch.c uses).
+- explicit vendor-faithful setup_fifo_params writes we never did: loopback clear
+  (0x22c &= ~3), CS-demux output invert 0 (0x24c), delay counters 0 (0x278); new
+  defines SE_SPI_LOOPBACK / SE_SPI_INV / SE_SPI_DELAY.
+- new `touch_trace()` dumps the FULL rx frame (up to 24 bytes) after every failed
+  status/CRC check, so the next boot shows all 10 bytes of a chip-id response, not
+  only the 4 hdr bytes.
+- VALIDATED: patch round-trips byte-exact both directions against the pre-0090 file;
+  `XNU_CC_CLANG=/usr/bin/clang tools/xnu-cc.py /tmp/opencode/ci40195127590.log
+  research/ci-buildtree bsd/dev/alioth_touch.c` -> **0 of 1 files failed**.
+- **CI: run 40358367056 (manual) FAILED WITHOUT RUNNING** - "The job was not acquired by
+  Runner of type hosted ... capacity constraints" (macOS arm64 runner shortage;
+  infrastructure, no build logs, NOT a code failure). Re-triggered manually as **run
+  40360955917 -> SUCCESS 2026-10-26 16:45Z (7m17s)**.
+- **KERNEL pulled**: xnu/out/kernel.development.sweet (17222856 B, sha256
+  7c43eb6940d8ffb1...); strings verified - `ALIOTH TOUCH: packing tx=%#x/%#x rx=...`,
+  `packing readback mismatch; probes skipped`, `ALIOTH TOUCH: fts reg %#x %s frame:`
+  all present (0089's `fts reg` strings also still there).
+- **IMAGE A⁗ READY TO BOOT**: `shim/out/shim-boot-alioth-A.img` (17645568 B, sha256
+  5d311409a111d7c8...), cmdline strings-verified as
+  `debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 sweettouch=1 sweettouchdelay=0
+  sweetkeys=1 sweetusb=1` (0 hits for sweetusb=2). Built with the standard pipeline:
+  mkadt --board alioth --highmem -> mkpayload -> shim BOARD=alioth build.sh.
+- **repo hygiene (user request 2026-10-26): `site/` deleted** - the hackiosx.dev static
+  docs (84 K, one old commit) is irrelevant to the port; removed in the next commit.
+
+**NEXT (in order):** **NOTIFY THE USER and WAIT for their "go" before `fastboot boot
+shim/out/shim-boot-alioth-A.img`** (standing rule; flow: `adb devices` -> `adb reboot
+bootloader` -> `fastboot devices` -> `fastboot boot`, phone serial 13e30f30, Lineage
+slot _b; user replugs if `fastboot devices` is empty). Read the new prints:
+- `chip-id=54:52` -> WIN, touch probe proceeds to event polling.
+- frame bytes VARY per position -> chip parses the frame; tune status/CRC/event parsing.
+- still constant per transfer -> electrical layer; next suspects: geni_se_io_init /
+  geni_se_io_set_mode (vendor runs them in geni_se_init, we skip), SE clock div vs
+  vendor's div for 6 MHz.
+- `packing readback mismatch` -> the guard tripped; use the printed values.
+Then: Image B (sweetusb=2, 0085 DEVTEN ladder) still UNBOOTED - after touch. Stage 4
+(iOS root flash) still ON HOLD pending explicit user confirmation.
 
 # ===== ALIOTH PORT (Xiaomi Mi 11X, SM8250-AC "kona") - started 2026-10-22 =====
 # Separate device from sweet. Goal: run the same iOS 16.7 xnu on alioth, following
