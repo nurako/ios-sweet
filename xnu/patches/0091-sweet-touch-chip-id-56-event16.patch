@@ -1,0 +1,109 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -5,10 +5,13 @@
+  * GENI FIFO transfers and a vendor event parser, all diagnostic-first. The
+  * board-specific parts: QUP wrap0 SE4 at 0x990000, kona TLMM banks (SOUTH
+  * holds reset 33 / irq 39 / vddio 69, NORTH holds the qup4 SPI pins 8-11),
+- * FTS SPI framing ([addr_hi,addr_lo,len,0x0A] full-duplex, data at rx[4]),
+- * and the L10C rail through sweet_rpmh.c. Probes read 0xa3/0x9f (expect
+- * 0x54:0x52) and the FT3698 event layout matches the FTS parser ported from
+- * sweet_touch.c (63 bytes from reg 0, 12-bit points, <=1079/<=2399).
++ * FTS SPI framing ([addr,0xa0,len-be,3 dummies,data,crc16] full-duplex,
++ * status at rx[3], data at rx[7] - vendor focaltech_spi.c), and the L10C
++ * rail through sweet_rpmh.c. Probes read 0xa3/0x9f (expect 0x56:0x52 per
++ * FTS_CHIP_TYPE_MAPPING in focaltech_common.h) and the event parser
++ * follows focaltech_core.h (63 bytes from reg 0; 16-bit points split
++ * x_h/x_m/x_l with the low nibbles in record byte 7, scaled x*10/16;
++ * <=1079/<=2399).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -103,6 +106,8 @@
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
++/* One-shot boot diagnostics: first finger frame, first parsed report. */
++static bool touch_evt_once, touch_rep_once;
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -411,6 +416,16 @@
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	if (mask && !touch_rep_once) {
++		touch_rep_once = true;
++		printf("ALIOTH TOUCH: first report mask=%#x", mask);
++		for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++			if (mask & (1u << id)) {
++				printf(" id%u=%d,%d", id, x[id], y[id]);
++			}
++		}
++		printf("\n");
++	}
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+@@ -440,6 +455,14 @@
+ 	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+ 		return EIO;
+ 	}
++	if (n && !touch_evt_once) {
++		touch_evt_once = true;
++		printf("ALIOTH TOUCH: first frame n=%u:", n);
++		for (unsigned k = 0; k < 16u; ++k) {
++			printf(" %02x", buf[k]);
++		}
++		printf("\n");
++	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+ 		const uint8_t *p = buf + 3u + 6u * i;
+ 		unsigned id = p[2] >> 4, event = p[0] >> 6;
+@@ -451,13 +474,26 @@
+ 		}
+ 		seen |= 1u << id;
+ 		if (event == 1u) {
+-			continue; /* UP record */
++			++active; /* UP record still counts toward n; no mask bit */
++			continue;
+ 		}
+ 		if (event == 3u) {
+ 			return EIO;
+ 		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		/*
++		 * focaltech_core.h layout: 16-bit x/y per record - x_h in
++		 * p[0]'s low nibble (bits 12..15), x_m = p[1] (bits 4..11),
++		 * x_l = p[4]'s high nibble (bits 0..3); y likewise with
++		 * p[2]/p[3]/p[4].low.  The FW reports in a 16/10 space
++		 * (vendor: x = x * 10 / 16, "fw report 16x, dts report 10x").
++		 * The old 12-bit decode put x_h at bits 8..11 and ignored
++		 * p[4], so every coordinate came out ~10x too small while
++		 * still passing the range check below.
++		 */
++		unsigned px = (((unsigned)(p[0] & 15u) << 12) |
++		    ((unsigned)p[1] << 4) | (p[4] >> 4)) * 10u / 16u;
++		unsigned py = (((unsigned)(p[2] & 15u) << 12) |
++		    ((unsigned)p[3] << 4) | (p[4] & 15u)) * 10u / 16u;
+ 		if (px > 1079 || py > 2399) {
+ 			return EIO;
+ 		}
+@@ -610,7 +646,16 @@
+ 	int fe2 = touch_read(0x9f, &fid2, 1);
+ 	printf("ALIOTH TOUCH: probe err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+ 	    fe1, fe2, fid1, fid2, st.irq_status);
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
++	/*
++	 * focaltech_common.h FTS_CHIP_TYPE_MAPPING - the ONLY entry, written
++	 * for this exact panel: {type 0x88, chip_idh 0x56, chip_idl 0x52,
++	 * rom 0x00:0x00, pb 0x00:0x00, bl 0x56:0xb2}; fts_get_chip_types()
++	 * matches id_h/id_l against it.  First boot of the 0090 kernel
++	 * (2026-10-27) read err=0/0 = 0x56:0x52 with valid status + CRC on
++	 * the first attempt - the chip identifies correctly; only our
++	 * 0083-era expectation of 0x54 was wrong (no source claimed it).
++	 */
++	bool fts = !fe1 && !fe2 && fid1 == 0x56 && fid2 == 0x52;
+ 	if (st.dead || !fts) {
+ 		printf("ALIOTH TOUCH: FT3698 not confirmed (chip-id=%02x:%02x dead=%d); stopping\n",
+ 		    fid1, fid2, st.dead);
