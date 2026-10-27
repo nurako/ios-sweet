@@ -1,0 +1,152 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -11,7 +11,9 @@
+  * FTS_CHIP_TYPE_MAPPING in focaltech_common.h) and the event parser
+  * follows focaltech_core.h (63 bytes from reg 0; 16-bit points split
+  * x_h/x_m/x_l with the low nibbles in record byte 7, scaled x*10/16;
+- * <=1079/<=2399).
++ * <=1079/<=2399).  Note reg 0 = FTS_REG_WORKMODE (0x00): the vendor's
++ * own buf[0] is the constant 0x01 it sets by hand before reading reg 1
++ * into buf[1..], so no validation of our buf[0] exists vendor-side.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -106,8 +108,14 @@
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
+-/* One-shot boot diagnostics: first finger frame, first parsed report. */
++/*
++ * One-shot boot diagnostics: frame0 = first frame of any kind (shows reg0
++ * WORKMODE + raw content even when idle), down dump = first frame with a
++ * finger down, reject = first parse rejection and why, report = first
++ * parsed report, irq = first observed GPIO39 assertion.
++ */
+ static bool touch_evt_once, touch_rep_once;
++static bool touch_down_once, touch_rej_once, touch_irq_once;
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -452,17 +460,50 @@
+ 		return err;
+ 	}
+ 	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	if (n && !touch_evt_once) {
++	/*
++	 * Dumps come BEFORE any validation so a rejected frame still leaves
++	 * its bytes on screen.  frame0 fires on the first successful read
++	 * (idle or not) and shows buf[0] = reg 0 = FTS_REG_WORKMODE.  The
++	 * vendor never validates this byte (its buf[0] is the constant
++	 * 0x01 it writes itself), so the sweet-ported
++	 * `buf[0] & 0x70` "work mode" check had no vendor counterpart and
++	 * rejected every frame before 0092 could show a single byte.
++	 */
++	if (!touch_evt_once) {
+ 		touch_evt_once = true;
++		printf("ALIOTH TOUCH: frame0 n=%u buf0=%02x:", n, buf[0]);
++		for (unsigned k = 0; k < 16u; ++k) {
++			printf(" %02x", buf[k]);
++		}
++		printf("\n");
++	}
++	if (n && !touch_down_once) {
++		touch_down_once = true;
+ 		printf("ALIOTH TOUCH: first frame n=%u:", n);
+ 		for (unsigned k = 0; k < 16u; ++k) {
+ 			printf(" %02x", buf[k]);
+ 		}
+ 		printf("\n");
+ 	}
++	if (n > TOUCH_MAX) {
++		/* Vendor: point_num > max_touch_number -> EIO. */
++		if (!touch_rej_once) {
++			touch_rej_once = true;
++			printf("ALIOTH TOUCH: reject n=%u buf0=%02x (bad point number)\n",
++			    n, buf[0]);
++		}
++		return EIO;
++	}
++	if (n == 0) {
++		/*
++		 * No fingers down.  The vendor is IRQ-driven and never parses
++		 * idle frames; we poll every 10ms, so treat "0 points" as a
++		 * clean release instead of the old active(1) != n(0) EIO that
++		 * flooded report err once per second.
++		 */
++		touch_report(0, x, y);
++		return 0;
++	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+ 		const uint8_t *p = buf + 3u + 6u * i;
+ 		unsigned id = p[2] >> 4, event = p[0] >> 6;
+@@ -470,6 +511,11 @@
+ 			break; /* vendor's unused-record sentinel */
+ 		}
+ 		if (seen & (1u << id)) {
++			if (!touch_rej_once) {
++				touch_rej_once = true;
++				printf("ALIOTH TOUCH: reject duplicate id=%u at rec=%u\n",
++				    id, i);
++			}
+ 			return EIO;
+ 		}
+ 		seen |= 1u << id;
+@@ -478,6 +524,11 @@
+ 			continue;
+ 		}
+ 		if (event == 3u) {
++			if (!touch_rej_once) {
++				touch_rej_once = true;
++				printf("ALIOTH TOUCH: reject event=3 id=%u rec=%u\n",
++				    id, i);
++			}
+ 			return EIO;
+ 		}
+ 		/*
+@@ -495,6 +546,11 @@
+ 		unsigned py = (((unsigned)(p[2] & 15u) << 12) |
+ 		    ((unsigned)p[3] << 4) | (p[4] & 15u)) * 10u / 16u;
+ 		if (px > 1079 || py > 2399) {
++			if (!touch_rej_once) {
++				touch_rej_once = true;
++				printf("ALIOTH TOUCH: reject range id=%u x=%u y=%u\n",
++				    id, px, py);
++			}
+ 			return EIO;
+ 		}
+ 		mask |= 1u << id;
+@@ -503,6 +559,11 @@
+ 		++active;
+ 	}
+ 	if (active != n) {
++		if (!touch_rej_once) {
++			touch_rej_once = true;
++			printf("ALIOTH TOUCH: reject count active=%u n=%u\n",
++			    active, n);
++		}
+ 		return EIO;
+ 	}
+ 	touch_report(mask, x, y);
+@@ -665,6 +726,19 @@
+ 	    st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
++		/*
++		 * Independent event evidence: GPIO39 is the panel's IRQ line
++		 * (active low, TLMM pull-up).  One-shot print on first
++		 * assertion - if this never appears the FW is not signalling
++		 * touches at all, no matter what frames read back.  Read here
++		 * unconditionally: the poll gate below only samples the line
++		 * when sweettouchirq=1.
++		 */
++		if (!touch_irq_once && !(touch_rd(touch_tlmm(TLMM_SOUTH),
++		    TOUCH_GPIO_PIN(39) + 4u) & 1u)) {
++			touch_irq_once = true;
++			printf("ALIOTH TOUCH: gpio39 low (irq asserted)\n");
++		}
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active ||
+ 		    !(touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(39) + 4u) & 1u) ||
