@@ -1,0 +1,128 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -116,6 +116,10 @@
+  */
+ static bool touch_evt_once, touch_rep_once;
+ static bool touch_down_once, touch_rej_once, touch_irq_once;
++static bool touch_irq_hi_once;
++/* 0093: frame-change tracking + vendor ESD-style liveness counters. */
++static unsigned touch_chg_prints, touch_fl_chgs, touch_in_chgs;
++static uint8_t prev_frame[63], fl_last, in_last;
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -476,6 +480,25 @@
+ 			printf(" %02x", buf[k]);
+ 		}
+ 		printf("\n");
++		for (unsigned k = 0; k < sizeof(buf); ++k) {
++			prev_frame[k] = buf[k];
++		}
++	} else if (memcmp(buf, prev_frame, sizeof(buf)) != 0) {
++		/*
++		 * 0092's one-shot could never show a buffer that updates
++		 * later: track CHANGES so we learn whether the FW rewrites
++		 * the event area at all (e.g. on touch).  First 3 printed.
++		 */
++		for (unsigned k = 0; k < sizeof(buf); ++k) {
++			prev_frame[k] = buf[k];
++		}
++		if (touch_chg_prints++ < 3u) {
++			printf("ALIOTH TOUCH: framechg n=%u:", n);
++			for (unsigned k = 0; k < 16u; ++k) {
++				printf(" %02x", buf[k]);
++			}
++			printf("\n");
++		}
+ 	}
+ 	if (n && !touch_down_once) {
+ 		touch_down_once = true;
+@@ -702,6 +725,47 @@
+ 	touch_wait(2);
+ 	touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, true);
+ 	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
++	/*
++	 * Vendor ESD liveness (focaltech_esdcheck.c get_flow_cnt): reg 0x91
++	 * (FLOW_WORK_CNT) must keep changing; holding its value across
++	 * samples means a hung FW, and the vendor's remedy is a hardware
++	 * reset.  Sample 400ms; if static, reset and re-test.  Also snapshot
++	 * the power mode register (0xA5; sleep would be 0x03).
++	 */
++	{
++		uint8_t fl_a = 0, fl_b = 0;
++		bool ticking = false;
++		(void)touch_read(0x91, &fl_a, 1);
++		for (unsigned k = 0; k < 4u && !ticking; ++k) {
++			touch_wait(100);
++			(void)touch_read(0x91, &fl_b, 1);
++			ticking = (fl_b != fl_a);
++		}
++		printf("ALIOTH TOUCH: flow0x91=%#x over 400ms %s\n", fl_a,
++		    ticking ? "ticking" : "STATIC");
++		if (!ticking) {
++			printf("ALIOTH TOUCH: vendor ESD remedy - panel reset\n");
++			touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, false);
++			touch_wait(2);
++			touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, true);
++			touch_wait(300);
++			(void)touch_read(0x91, &fl_a, 1);
++			ticking = false;
++			for (unsigned k = 0; k < 4u && !ticking; ++k) {
++				touch_wait(100);
++				(void)touch_read(0x91, &fl_b, 1);
++				ticking = (fl_b != fl_a);
++			}
++			printf("ALIOTH TOUCH: flow0x91=%#x after reset %s\n", fl_a,
++			    ticking ? "ticking" : "STATIC");
++		}
++		fl_last = fl_a;
++		{
++			uint8_t pw = 0;
++			(void)touch_read(0xa5, &pw, 1);
++			printf("ALIOTH TOUCH: power0xa5=%#x\n", pw);
++		}
++	}
+ 	uint8_t fid1 = 0, fid2 = 0;
+ 	int fe1 = touch_read(0xa3, &fid1, 1);
+ 	int fe2 = touch_read(0x9f, &fid2, 1);
+@@ -735,10 +799,37 @@
+ 		 * Read unconditionally: the poll gate below only samples the
+ 		 * line when sweettouchirq=1.
+ 		 */
+-		if (!touch_irq_once && !(touch_rd(touch_tlmm(TLMM_SOUTH),
++		if (!(touch_rd(touch_tlmm(TLMM_SOUTH),
+ 		    TOUCH_GPIO_PIN(39) + 4u) & 1u)) {
+-			touch_irq_once = true;
+-			printf("ALIOTH TOUCH: gpio39 low (irq asserted)\n");
++			if (!touch_irq_once) {
++				touch_irq_once = true;
++				printf("ALIOTH TOUCH: gpio39 low (irq asserted)\n");
++			}
++		} else if (touch_irq_once && !touch_irq_hi_once) {
++			touch_irq_hi_once = true;
++			printf("ALIOTH TOUCH: gpio39 high (irq released)\n");
++		}
++		/*
++		 * FW heartbeats: 0x91 flow counter = main loop alive,
++		 * 0x8F = interrupt/event counter = does the FW SEE touches.
++		 * First 3 changes of each printed.
++		 */
++		{
++			uint8_t v = 0;
++			if (!touch_read(0x91, &v, 1) && v != fl_last) {
++				if (touch_fl_chgs++ < 3u) {
++					printf("ALIOTH TOUCH: flow0x91 %#x -> %#x\n",
++					    fl_last, v);
++				}
++				fl_last = v;
++			}
++			if (!touch_read(0x8f, &v, 1) && v != in_last) {
++				if (touch_in_chgs++ < 3u) {
++					printf("ALIOTH TOUCH: int0x8f %#x -> %#x\n",
++					    in_last, v);
++				}
++				in_last = v;
++			}
+ 		}
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		if (!st.irq_hint || st.active ||
