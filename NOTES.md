@@ -2,6 +2,84 @@
 
 ## Agent handoff / active work (2026-10-27, latest)
 
+### >>> UPDATE 2026-10-27 #2 (alioth, read first): 0091 boot = probe PASSES, event loop
+###     rejects everything pre-dump; vendor buf[0] is a CONSTANT; 0092 = dumps+reasons <<<
+
+**BOOT of the 0091 kernel (2026-10-27, Image A sha 283730afb92a4d1f, user photo):**
+- `packing tx=0x7f8fe/0xffefe` OK, `probe err=0/0 chip-id=56:52` OK, and
+  **`selected FTS FT3698, 1080x2400, poll=10ms irq-hint=0`** printed - 0091's chip-id
+  accept worked and the event loop started (first time ever).
+- But then a constant `report err=5 irq=0x4c000001` flood (~1 line/sec = 100 errors at
+  the 10ms poll) and **NO `first frame` dump even while touching the screen**; no
+  `fts reg ... status=/crc=`, no `spi irq/timeout` lines either.
+- DIAGNOSIS (code paths, not guesswork): touch_spi/touch_read print on every failure
+  path and none appeared => reads SUCCEED; the parse rejects BEFORE its dump point
+  (dump was gated behind the header check and `n &&`), i.e. either
+  `(buf[0] & 0x70) || n > 10` or n==0 with the old `active(1) != n(0)` idle reject.
+- Buttons fine, session stable, usual benign root-wait below.
+
+**VENDOR RE-FETCH THIS SESSION (Lineage android_kernel_xiaomi_sm8250 lineage-20,
+local copies at /tmp/opencode/vendor - tmp-cleaned daily):**
+- `fts_read_touchdata()`: `buf[0] = 0x01` is set **BY HAND**, then
+  `fts_read(buf, 1, buf+1, size-1)` reads reg **0x01** into buf[1..]. The vendor never
+  reads reg 0 and never validates buf[0] - so the sweet-ported `buf[0] & 0x70` check
+  (reg 0 = `FTS_REG_WORKMODE`, factory=0x40) had **no vendor counterpart**.
+- Frame rejections vendor-side are only: `point_num > max_touch_number`, the all-0xFF
+  buffer case, `EVENT_DOWN && point_num==0`, `touch_point==0`. There is **no
+  active-vs-point_num comparison**; the loop is `i < max_touch_num` with
+  `pointid >= FTS_MAX_ID(0x0A)` break - same sentinel we use.
+- Vendor is **IRQ-driven** (reads only in the irq handler) => it never parses idle
+  frames; our poll hits idle zeros => old `active != n` => the 1/sec error flood.
+- Coordinate decode re-verified byte-exact: `FTS_TOUCH_X_H_POS=3, X_L=4, PRE=7,
+  Y_H=5, Y_L=6, EVENT=3, ID=5, POINT_NUM=2, ONE_TCH_LEN=6, MAX_ID=0x0A`;
+  x = (buf[3+6i]&0xF)<<12 | buf[4+6i]<<4 | (buf[7+6i]>>4), then *10/16 - **0091's
+  decode is correct**; EVENT_DOWN = flag 0 or 2, UP = 1.
+- Vendor probe: power -> `fts_reset_proc(200)` (GPIO33 low 1ms high) -> chip-id. We
+  already do the reset pulse (low 2ms, high, 300ms) before probes - matches.
+
+**PATCH 0092 (`0092-sweet-touch-frame-dumps-reject-reasons.patch`, commit 76fa2a6):**
+- `frame0 n=%u buf0=%02x: <16B>` on the FIRST successful read (before any validation -
+  shows WORKMODE byte + raw idle content), `first frame n=%u:` moved before validation
+  too (fires on first n>0 read).
+- Every reject path prints a ONE-SHOT reason with values: `reject n=.. buf0=..`,
+  `duplicate id=..`, `event=3 id=..`, `range id=.. x=.. y=..`, `count active=.. n=..`.
+- `buf[0] & 0x70` check DROPPED (no vendor counterpart); n==0 -> clean release
+  (kills the idle flood; vendor's IRQ model never sees idle frames).
+- One-shot `ALIOTH TOUCH: gpio39 low (irq asserted)` - GPIO39 is the panel IRQ line
+  (active low); independent evidence of whether the FW signals touches at all.
+- VALIDATION: pre-0092 snapshot in /tmp/opencode/pre0092, patch round-trips byte-exact
+  both ways, xnu-cc vs ci40360955917.log -> 0 of 1 failed.
+- **CI: runs 40527677128 + 40530283284 CANCELLED (runner capacity, "job was not
+  acquired by Runner of type hosted" - not code); retry loop succeeded: run
+  40535675620 (2026-10-27, SUCCESS)** -> kernel sha256 `db7cb4f890d31aee...`,
+  downloaded kernel verified to contain `frame0`/`reject`/`gpio39`/`first frame`/
+  `first report` strings BEFORE installing to xnu/out/.
+- **Image A (0092) rebuilt and verified**: `shim/out/shim-boot-alioth-A.img`,
+  17661952 B, sha256 `398a357237f9bd89...`; strings-verified cmdline (unchanged,
+  `... sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`, no `sweetusb=2`) and
+  the new markers.
+
+**REFERENCE (user-provided 2026-10-27): https://github.com/UniXNU/UniXNU** - 1.1k-star
+project running iOS/macOS on non-Apple ARM64 via UEFI (OpenCore-like loader + device
+repos: UniXNU-sm8550-common, UniXNU-sheng = Xiaomi Pad 6S Pro, uefi-sheng). Notable:
+**Adreno740 + AdrenoMetal GPU acceleration driver on sheng** (docs unixnu.com/drivers/
+adreno740), reusable `drivers/`, `kits/`, `profiles/`, `devices.toml` component
+catalog. Different boot model than ours (UEFI package vs our fastboot/shim), but the
+driver components, GPU work and porting docs are worth mining - especially once touch
+works and GPU/display become the next wall. Not explored yet.
+
+**NEXT (in order):** Image A (0092) built + verified (see above), user has given "go".
+Boot: `adb devices` -> `adb reboot bootloader` -> `fastboot devices` -> `fastboot boot
+shim/out/shim-boot-alioth-A.img`. Read the photo for: `frame0 n=.. buf0=..: <bytes>`
+(idle content: zeros? 0xff? workmode bits?); touch -> `first frame n=N: <bytes>` + `first report mask=.. id0=x,y` OR a
+`reject <reason>` line (tells exactly which check fails with values); `gpio39 low`
+prints if the panel IRQ ever asserts. Combinations:
+- frame0 all 0xff + reject n=15 -> FW returns empty buffer (no events generated).
+- frame0 zeros, no first frame, no gpio39 -> FW alive but not scanning/reporting.
+- gpio39 low but no first frame -> IRQ fires but frame content wrong -> dump decodes it.
+Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch. Stage 4 (iOS root
+flash) still ON HOLD pending explicit user confirmation.
+
 ### >>> UPDATE 2026-10-27 (alioth, read first): SPI WORKS - chip answers 0x56:0x52 (which
 ###     IS the vendor's id); 0090 validated on hardware; patch 0091 = accept id + 16-bit events <<<
 
