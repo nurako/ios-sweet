@@ -1,6 +1,77 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-26, latest)
+## Agent handoff / active work (2026-10-27, latest)
+
+### >>> UPDATE 2026-10-27 (alioth, read first): SPI WORKS - chip answers 0x56:0x52 (which
+###     IS the vendor's id); 0090 validated on hardware; patch 0091 = accept id + 16-bit events <<<
+
+**BOOT of the 0090 kernel (2026-10-27, Image A sha 5d311409a111d7c8, cmdline
+`... sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`, user photo) - THE SPI NOW
+WORKS END TO END:**
+- `ALIOTH TOUCH: packing tx=0x7f8fe/0xffefe rx=0x7f8fe/0xffefe gran=0` - 0090's MSB-first
+  packing landed and read back correct (the mismatch guard did not trip).
+- `ALIOTH TOUCH: probe err=0/0 chip-id=56:52 irq=0x4c000001` - BOTH 0xa3/0x9f reads
+  passed status + CRC16 ON THE FIRST ATTEMPT (zero `fts reg ... status=` retry lines on
+  screen). A valid CRC over the data byte proves the byte is exactly what the IC sent:
+  **hardware reg 0xa3 = 0x56, reg 0x9f = 0x52.**
+- It then stopped at `FT3698 not confirmed (chip-id=0x56:0x52 dead=0)` - only because our
+  driver demanded 0x54:0x52, a 0083-era constant with no source behind it.
+- Buttons healthy in the same session (`ALIOTH KEYS: arb=0x50010000 apids=512 ...`);
+  session stable; usual benign root-wait (`hfs_mountfs error=22`, errno 19) below.
+
+**0x56:0x52 IS THE VENDOR'S EXPECTED ID (ground truth):** Lineage
+`focaltech_3658u/focaltech_common.h` `FTS_CHIP_TYPE_MAPPING` - the ONLY entry for this
+panel: `{0x88, 0x56, 0x52, 0x00, 0x00, 0x00, 0x00, 0x56, 0xB2}` over
+`struct ft_chip_t { u64 type; u8 chip_idh; u8 chip_idl; u8 rom_idh; rom_idl; pb_idh;
+pb_idl; bl_idh; bl_idl; }` => type 0x88, **chip_idh 0x56, chip_idl 0x52**, rom/pb
+00:00, bl 0x56:0xb2. `fts_get_chip_types()` matches id_h/id_l against exactly this.
+Our read is correct; the expectation was wrong.
+
+**EVENT LAYOUT (also verified against vendor this session, fixed in 0091):** vendor
+`fts_read_touchdata()` puts reg-0x01 data at buf[1..], so with OUR reg-0 read both
+buffers are index-identical for k>=1 and the macros apply directly:
+- count `FTS_TOUCH_POINT_NUM=2` (buf[2]&0x0F, we had it), records at `3+6i`,
+  `FTS_TOUCH_EVENT_POS=3`, `FTS_TOUCH_ID_POS=5` (we had those) - but **coordinates are
+  16-bit split**: x = `(buf[3]&0xF)<<12 | buf[4]<<4 | (buf[7]>>4)`, y likewise with
+  buf[5]/buf[6]/buf[7]&0xF, then `x*10/16` ("fw report 16x, dts report 10x"). Our old
+  12-bit decode put x_h at bits 8..11 and ignored byte 7 => ~10x-too-small coordinates
+  that STILL passed the <=1079/<=2399 range check (silent wrongness).
+- vendor counts UP records toward point_num; our `active != n` check rejected any frame
+  containing a lift (EIO + forced-release churn) - 0091 counts them (no mask bit = the
+  finger is released, which is the correct semantics for mixed up/down frames).
+
+**PATCH 0091 (`0091-sweet-touch-chip-id-56-event16.patch`, commit c1dab08):**
+- chip-id accepts 0x56:0x52 with a comment citing FTS_CHIP_TYPE_MAPPING; header comment
+  refreshed (real 0089 frame, 0x56:0x52, 16-bit layout).
+- 16-bit coordinate decode + *10/16; UP records count toward n.
+- one-shot diagnostics: `first frame n=N: <16 raw bytes>` (first frame with a finger)
+  and `first report mask=... id0=x,y` (first parsed report).
+- VALIDATION: both pre-0090 /tmp/opencode copies had been tmp-cleaned; pre-0091 was
+  reconstructed by reverse-applying the exact 0091 edits (verified: 0090 markers present,
+  0091 markers absent), patch round-trips byte-exact both ways, xnu-cc vs refetched CI
+  log 40360955917 -> **0 of 1 failed**.
+- **CI: run 40485852515 (10:06Z) was a MISFIRE** - it built fork/main at b863ee9 (0090
+  tree) because 0091 was committed locally but not pushed before the workflow was
+  triggered (kernel had no `first frame`/`first report` strings; sha 37990094d2c7ee6a...).
+  0091 pushed (c1dab08) and **run 40486904418 (10:14Z, SUCCESS) is the real 0091 build**:
+  kernel sha256 `ae273504134fa8b0...` - downloaded kernel confirmed to contain
+  `first frame n=%u:` + `first report mask=%#x` before installing to xnu/out/.
+- **Image A (0091) rebuilt and verified**: `shim/out/shim-boot-alioth-A.img`,
+  17661952 B, sha256 `283730afb92a4d1f...`; strings-verified cmdline
+  (`... sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`, no `sweetusb=2`) and
+  the new one-shot markers.
+
+**NEXT (in order):** Image A (0091) is built and strings-verified (see above).
+**NOTIFY THE USER and WAIT for their "go" before `fastboot boot
+shim/out/shim-boot-alioth-A.img`**. Watch:
+- `selected FTS FT3698, 1080x2400, poll=10ms irq-hint=0` = probe confirmed, event loop.
+- touch the screen -> `first frame n=1: <bytes>` then `first report mask=0x1 id0=x,y`:
+  coordinates must be full-panel scale (NOT ~10x small) - sanity-check against where the
+  finger touched.
+- `report err=N irq=...` = read/parse failures (the raw dump + status/CRC lines localize
+  SPI vs parser).
+Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch. Stage 4 (iOS root
+flash) still ON HOLD pending explicit user confirmation.
 
 ### >>> UPDATE 2026-10-26 (alioth, read first): 0089 showed LIVE MISO; constant 0x80/0x90
 ###     root-caused to LSB-first FIFO packing -> patch 0090, CI run 40358367056 building <<<
