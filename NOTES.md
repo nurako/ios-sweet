@@ -2,6 +2,72 @@
 
 ## Agent handoff / active work (2026-10-27, latest)
 
+### >>> UPDATE 2026-10-27 #3 (alioth, read first): 0092 boot = idle flood GONE, frame0
+###     shows WORKMODE=00 + static idle bytes, irq asserted; 0093 = heartbeats+change-trk <<<
+
+**BOOT of the 0092 kernel (2026-10-27, Image A sha 398a357237f9bd89, user photo):**
+- Everything 0092 targeted worked mechanically: **ZERO `report err` lines** (idle frames
+  now succeed as clean releases), `frame0` + `gpio39 low` one-shots fired.
+- `ALIOTH TOUCH: frame0 n=0 buf0=00: 00 00 10 23 00 0a 00 00 00 02 00 00 00 3e 12 00`
+  (hex OCR-fuzzy) - first successful read ever: **buf0 = reg0 WORKMODE = 0x00 = work
+  mode**, so the dropped `buf[0]&0x70` check would NOT have rejected this frame anyway
+  (chip is in work mode). Raw bytes at mem[0..15] look like register content, not a
+  framed event; n = buf[2]&0xF = 0 (buf[2]=0x10 low nibble 0). Vendor with this data
+  would also parse point_num=0.
+- `ALIOTH TOUCH: gpio39 low (irq asserted)` - printed on the FIRST loop iteration:
+  panel IRQ line (active-low, our pull-up) reads LOW from boot = chip asserting.
+- **Touch produced no visible change** - BUT epistemic caveat: 0092's `first frame`
+  one-shot needs n>0 AND fires only once; if the buffer updated with n staying 0 (or
+  any bytes changed) nothing would print. Silent by construction - that's what 0093
+  fixes.
+- All reads succeed (no status/crc/spi prints, no report err) => every poll returned a
+  valid-CRC frame with n=0 the whole session.
+- Power re-verified against live.dts ground truth: focaltech `vdd-supply` phandle ->
+  **ldoc10 (pm8150a_l10)**, `vcc_i2c-supply` -> **ldoc1 (pm8150a_l1)** - exactly the
+  two rails we enable. reset-gpio 33 / irq-gpio 39 confirmed. No missing rail.
+
+**OPEN QUESTION:** FW answers SPI (id + CRC frames), sits in work mode, asserts IRQ -
+but the event area never showed a finger-down frame. Is the FW's main loop alive?
+Does it ever rewrite the buffer? Does it count events? 0093 answers with vendor-sourced
+signals.
+
+**PATCH 0093 (`0093-sweet-touch-flow-heartbeat-framechg.patch`, commit 7f9c053):**
+- **frame change-tracking**: memcmp each read vs previous 63B, print first 3 changes
+  (`framechg n=..: <bytes>`) - shows whether/when the FW rewrites the event area.
+- **Vendor ESD liveness**: reg 0x91 FLOW_WORK_CNT sampled over 400ms at probe; STATIC
+  = hung FW per focaltech_esdcheck.c `get_flow_cnt` -> apply the vendor's own remedy
+  (panel reset via GPIO33, 300ms) and re-test; both phases printed.
+  `flow0x91=.. over 400ms ticking|STATIC`.
+- **Loop heartbeats**: 0x91 (FW main loop alive) + 0x8F INT_CNT (event counter = does
+  the FW SEE touches), first 3 changes of each printed. Interpretation matrix:
+  - 0x91 static everywhere -> FW hung (even after remedy reset) -> deeper FW problem.
+  - 0x91 ticks, 0x8F never moves during touch -> FW alive but not SENSING (scan/
+    sensing problem: FW init or hardware).
+  - 0x8F moves but frame0/framechg never shows events -> event buffer address or
+    protocol wrong -> re-examine read path.
+- gpio39 prints assertion AND release (`gpio39 high (irq released)`) - if reading the
+  buffer never releases INT, we're reading the wrong address or need an ACK.
+- `power0xa5=` snapshot (sleep would be 0x03).
+- VALIDATION: pre-0093 reconstructed by reverse-applying the exact 0093 edits
+  (ci-buildtree file is NOT in git - `git show HEAD:` failed; reconstruct method is
+  the reliable one), round-trip byte-exact, xnu-cc -> 0 of 1 failed (memcmp OK).
+- **CI: BLOCKED on GitHub runner capacity (2026-10-27/28).** Run 40541330817 +
+  7 follow-up retries (40544041339, 40546657968, 40549255893, 40552065312, 40554543697,
+  40557050326, 40559584507) all CANCELLED with "job was not acquired by Runner of type
+  hosted" - macOS arm64 hosted capacity, not code. 2026-10-28: 40670748884,
+  40672941306, 40675067498 also failed capacity. **USER INSTRUCTION 2026-10-28: stop
+  retrying - do NOT auto-retrigger.** To resume: `gh workflow run xnu.yml -R
+  nurako/ios-sweet` once (capacity was fine earlier on 2026-10-27 daytime; failures
+  clustered 16:28Z onward), then continue the NEXT steps below. All 0093 code is pushed
+  (commit 7f9c053); the ONLY missing piece is a successful CI run.
+
+**NEXT (in order):** CI success -> download kernel, **verify 0093 markers (`framechg`,
+`flow0x91`, `int0x8f`, `gpio39 high`, `power0xa5`) exist before installing** -> rebuild
+Image A (cmdline unchanged) -> strings-verify -> NOTES commit -> **NOTIFY USER + WAIT
+for "go"** -> boot -> read photo per the interpretation matrix above.
+Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch. Stage 4 (iOS root
+flash) still ON HOLD pending explicit user confirmation.
+
 ### >>> UPDATE 2026-10-27 #2 (alioth, read first): 0091 boot = probe PASSES, event loop
 ###     rejects everything pre-dump; vendor buf[0] is a CONSTANT; 0092 = dumps+reasons <<<
 
