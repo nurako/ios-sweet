@@ -85,9 +85,21 @@
  	uint8_t fid1 = 0, fid2 = 0;
  	int fe1 = touch_read(0xa3, &fid1, 1);
  	int fe2 = touch_read(0x9f, &fid2, 1);
-@@ -735,10 +799,37 @@
- 		 * Read unconditionally: the poll gate below only samples the
- 		 * line when sweettouchirq=1.
+@@ -728,16 +792,44 @@
+ 	while (!st.dead) {
+ 		/*
+ 		 * Independent event evidence: GPIO39 is the panel's IRQ line
+-		 * (active low, TLMM pull-up).  One-shot print on first
+-		 * assertion - if this never appears the FW is not signalling
+-		 * touches at all, no matter what frames read back.  Read here
+-		 * unconditionally: the poll gate below only samples the line
+-		 * when sweettouchirq=1.
++		 * (active low, TLMM pull-up).  Print first assertion AND
++		 * first release - a line that never drops means the FW never
++		 * signals; a line that drops but never releases after reads
++		 * means reading our address does not clear the pending event.
++		 * Read unconditionally: the poll gate below only samples the
++		 * line when sweettouchirq=1.
  		 */
 -		if (!touch_irq_once && !(touch_rd(touch_tlmm(TLMM_SOUTH),
 +		if (!(touch_rd(touch_tlmm(TLMM_SOUTH),

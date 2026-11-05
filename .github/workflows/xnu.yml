@@ -69,7 +69,23 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        # keep a log so a skipped patch can be detected below (build.sh applies
+        # patches with `git apply`, which is zero-fuzz, and only WARNS on failure)
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      - name: Reject silently skipped patches
+        working-directory: dxb
+        run: |
+          # Do NOT let a mis-contexted patch pass as success: build.sh prints
+          # "Skipping patch ..." and carries on, producing an OLD kernel.
+          if grep -q "Skipping patch" build.log; then
+            grep "Skipping patch" build.log
+            echo "::error::A patch failed to apply - the kernel does not contain it."
+            exit 1
+          fi
+          echo "all patches applied"
 
       - name: Package build tree for local compiles
         if: always()

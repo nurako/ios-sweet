@@ -1,6 +1,11 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-10-27, latest)
+## Agent handoff / active work (2026-11-05, latest)
+
+### >>> UPDATE 2026-11-05 (alioth, read first): runner capacity is back, but CI built a
+###     0092 kernel because `git apply` silently skipped patch 0093; patch regenerated
+###     from the CI buildtree + a "reject skipped patches" guard added to the workflow <<<
+
 
 ### >>> UPDATE 2026-10-27 #3 (alioth, read first): 0092 boot = idle flood GONE, frame0
 ###     shows WORKMODE=00 + static idle bytes, irq asserted; 0093 = heartbeats+change-trk <<<
@@ -51,20 +56,38 @@ signals.
 - VALIDATION: pre-0093 reconstructed by reverse-applying the exact 0093 edits
   (ci-buildtree file is NOT in git - `git show HEAD:` failed; reconstruct method is
   the reliable one), round-trip byte-exact, xnu-cc -> 0 of 1 failed (memcmp OK).
-- **CI: BLOCKED on GitHub runner capacity (2026-10-27/28).** Run 40541330817 +
-  7 follow-up retries (40544041339, 40546657968, 40549255893, 40552065312, 40554543697,
-  40557050326, 40559584507) all CANCELLED with "job was not acquired by Runner of type
-  hosted" - macOS arm64 hosted capacity, not code. 2026-10-28: 40670748884,
-  40672941306, 40675067498 also failed capacity. **USER INSTRUCTION 2026-10-28: stop
-  retrying - do NOT auto-retrigger.** To resume: `gh workflow run xnu.yml -R
-  nurako/ios-sweet` once (capacity was fine earlier on 2026-10-27 daytime; failures
-  clustered 16:28Z onward), then continue the NEXT steps below. All 0093 code is pushed
-  (commit 7f9c053); the ONLY missing piece is a successful CI run.
+- **CI capacity outage resolved 2026-11-05; run 42041034521 SUCCEEDED in ~8 min - but the
+  kernel did NOT contain 0093.** Root cause found in the run log:
+  `[warning] Skipping patch .../0093-sweet-touch-flow-heartbeat-framechg.patch
+  (already upstream, previously applied, or malformed): error: patch failed:
+  bsd/dev/alioth_touch.c:735 ... patch does not apply`. build.sh applies patches with
+  `git apply` (ZERO fuzz) and **only warns on failure**, so the job compiled the 0092
+  driver and reported success (kernel sha `3473590a0d0776b8`, markers absent ->
+  post-CI verifier correctly refused to install it; Image A untouched at 0092
+  `398a3572`).
+  - Why: 0093's hunk contexts came from a reverse-applied reconstruction of the 0092
+    file which was off by one line in the gpio39/loop hunk (`patch` applied it with
+    fuzz 2, `git apply` refuses). The 0092-state reconstruction method is therefore
+    UNRELIABLE for patch generation - see the fixed method below.
+- **FIX (2026-11-05):** downloaded this run's `xnu-buildtree` artifact, extracted the
+  exact `xnu/bsd/dev/alioth_touch.c` the runner produced from patches 0001-0092, and
+  regenerated `0093-sweet-touch-flow-heartbeat-framechg.patch` as a diff FROM that file
+  TO our local 0093 file. Verified: `git apply --check` OK, forward result byte-identical
+  to our 0093 source, reverse byte-identical to the CI 0092 base, xnu-cc 0 of 1 failed.
+  **New rule: generate every new patch from the previous run's buildtree file (the
+  authoritative base), never from a reverse-applied reconstruction** - and always
+  validate with `git apply --check`, not just `patch`.
+- **Workflow hardened:** Build step now tees to `build.log` (with `pipefail`) and a new
+  step "Reject silently skipped patches" fails the job if `Skipping patch` appears, so
+  a mis-contexted patch can never again yield a green build with an old kernel.
+- USER INSTRUCTION 2026-10-28 stands: no automatic re-triggering of CI. The next
+  `gh workflow run` happens only after the user says so.
 
-**NEXT (in order):** CI success -> download kernel, **verify 0093 markers (`framechg`,
-`flow0x91`, `int0x8f`, `gpio39 high`, `power0xa5`) exist before installing** -> rebuild
-Image A (cmdline unchanged) -> strings-verify -> NOTES commit -> **NOTIFY USER + WAIT
-for "go"** -> boot -> read photo per the interpretation matrix above.
+**NEXT (in order):** one manual `gh workflow run xnu.yml -R nurako/ios-sweet` (patch
+0093 now applies cleanly; guard in place) -> download kernel, **verify 0093 markers
+(`framechg`, `flow0x91`, `int0x8f`, `gpio39 high`, `power0xa5`) exist before installing**
+-> rebuild Image A (cmdline unchanged) -> strings-verify -> NOTES commit -> **NOTIFY
+USER + WAIT for "go"** -> boot -> read photo per the interpretation matrix above.
 Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch. Stage 4 (iOS root
 flash) still ON HOLD pending explicit user confirmation.
 
