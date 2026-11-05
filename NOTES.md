@@ -82,14 +82,27 @@ signals.
   a mis-contexted patch can never again yield a green build with an old kernel.
 - USER INSTRUCTION 2026-10-28 stands: no automatic re-triggering of CI. The next
   `gh workflow run` happens only after the user says so.
+- **Run 42042781115 (2026-11-05, user approved one manual run): BUILD SUCCEEDED, patch
+  0093 APPLIED.** Verified from the run's buildtree artifact: `xnu/bsd/dev/alioth_touch.c`
+  sha `5ee0522ce4677d78` is byte-identical to our local source and contains all six 0093
+  markers. The job still shows `failure`, but ONLY because the new guard step matched
+  blacktop's own dxb patches (`TrustCache.patch`, `iobuffermemd_monterey.patch`,
+  `skywalk_sonoma.patch`, `syntax_checker_sonoma.patch`), which legitimately do not
+  apply to macOS 13.5; zero of OUR numbered patches skipped.
+  - Guard narrowed to `Skipping patch .*/patches/[0-9]{4}-` (our patches only).
+  - **Kernel is valid and was used**: `xnu-kernel` artifact,
+    sha256 `71d9f395a824c2605137c38d7b0726979a0aeda827cf8e5bcc7bff569582e6aa`
+    (markers verified: framechg, flow0x91(+after reset), int0x8f, gpio39 high,
+    power0xa5, vendor ESD remedy, frame0, first report).
+  - **Image A (0093) rebuilt and verified**: `shim/out/shim-boot-alioth-A.img`,
+    17678336 B, sha256 `4ecca7bbe8e140f2...`; cmdline unchanged
+    (`... sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`), no `sweetusb=2`.
 
-**NEXT (in order):** one manual `gh workflow run xnu.yml -R nurako/ios-sweet` (patch
-0093 now applies cleanly; guard in place) -> download kernel, **verify 0093 markers
-(`framechg`, `flow0x91`, `int0x8f`, `gpio39 high`, `power0xa5`) exist before installing**
--> rebuild Image A (cmdline unchanged) -> strings-verify -> NOTES commit -> **NOTIFY
-USER + WAIT for "go"** -> boot -> read photo per the interpretation matrix above.
-Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch. Stage 4 (iOS root
-flash) still ON HOLD pending explicit user confirmation.
+**NEXT (in order): NOTIFY USER + WAIT for "go"** -> boot
+`fastboot boot shim/out/shim-boot-alioth-A.img` -> read the photo per the interpretation
+matrix above (flow0x91 STATIC vs ticking; int0x8f movement; framechg; gpio39 high;
+power0xa5). Then: Image B (sweetusb=2, 0085 ladder) still UNBOOTED - after touch.
+Stage 4 (iOS root flash) still ON HOLD pending explicit user confirmation.
 
 ### >>> UPDATE 2026-10-27 #2 (alioth, read first): 0091 boot = probe PASSES, event loop
 ###     rejects everything pre-dump; vendor buf[0] is a CONSTANT; 0092 = dumps+reasons <<<

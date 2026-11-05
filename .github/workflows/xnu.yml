@@ -80,12 +80,14 @@ jobs:
         run: |
           # Do NOT let a mis-contexted patch pass as success: build.sh prints
           # "Skipping patch ..." and carries on, producing an OLD kernel.
-          if grep -q "Skipping patch" build.log; then
-            grep "Skipping patch" build.log
+          # Only our own numbered patches (0001-...) are policed: blacktop's
+          # dxb ships extra patches for newer macOS that legitimately do not
+          # apply to 13.5 (TrustCache.patch, skywalk_sonoma.patch, ...).
+          if grep -E "Skipping patch .*/patches/[0-9]{4}-" build.log; then
             echo "::error::A patch failed to apply - the kernel does not contain it."
             exit 1
           fi
-          echo "all patches applied"
+          echo "all ios-sweet patches applied"
 
       - name: Package build tree for local compiles
         if: always()
