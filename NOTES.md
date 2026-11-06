@@ -6,6 +6,56 @@
 ###     0092 kernel because `git apply` silently skipped patch 0093; patch regenerated
 ###     from the CI buildtree + a "reject skipped patches" guard added to the workflow <<<
 
+### >>> UPDATE 2026-11-05 #2 (alioth, read first): 0093 BOOT - FW IS ALIVE AND SEES
+###     TOUCHES (int0x8f counts, IRQ toggles), but polling the event buffer mid-update
+###     returns status 0xc1; 0094 = IRQ-gated vendor-exact reads (reg 0x01) <<<
+
+**BOOT of the 0093 kernel (2026-11-05, Image A sha 4ecca7bbe8e140f2, user photo):**
+- `flow0x91=0x52 over 400ms ticking` -> FW main loop is ALIVE (vendor ESD test passes).
+- `power0xa5=0` -> work mode.
+- `int0x8f 0 -> 1 -> 2 -> 5` -> **the IC's interrupt counter counts events**. This is the
+  first time the FW has ever shown that it sees input.
+- `gpio39 low (irq asserted)` ... `gpio39 high (irq released)` -> IRQ asserts and reading
+  the bus releases it; the line is not stuck.
+- `frame0 n=0 buf0=00: 00 00 10 23 00 0a 00 00 00 02 00 00 00 3e 12 00` (reg-0 read,
+  0092/0093 layout - idle register content, no event) then:
+  `fts reg 0 status=0xc1 hdr=c1c1c1c1` + a 16-byte `c1` frame -> reads started coming
+  back as ALL 0xc1, i.e. the status byte fails the vendor check `rx[3] & 0xa0`.
+- No `first frame`/`framechg`/`first report` were printed: the event buffer never
+  produced a point frame.
+
+**INTERPRETATION (observation vs guess):** observed - FW ticks, 0x8f increments, IRQ
+toggles. Guess (best supported): `0xc1` is the IC's "busy / not ready" answer because we
+poll the event buffer every 10ms regardless of IRQ, while the vendor only ever reads
+inside its IRQ handler. Also observed: we were reading register 0x00 (WORKMODE area) for
+the frame, while the vendor's `fts_read_touchdata()` writes `buf[0] = 0x01` itself and
+reads register **0x01**. Register 0 was never the vendor's frame read.
+
+**PATCH 0094 (`0094-sweet-touch-irq-gated-vendor-frame.patch`):**
+- **Vendor-exact frame read**: `buf[0] = 0x01; touch_read(0x01, buf + 1, 62)`.
+- **IRQ-gated reads**: read only while GPIO39 is low, while a finger is down (to catch
+  the release), plus a 1s keepalive so a dead IRQ cannot silence the driver. First five
+  low/high transitions printed (`gpio39 low #N` / `gpio39 high #N`).
+- **Full event dump**: when 0x8f moves, the next successful read dumps all 63 bytes on
+  two lines (`evt n=.. int=..:` + `evt cont:`), first 3 times - an event can be
+  anywhere in the buffer, the old 16-byte dumps could miss it.
+- **Throttled status dumps** (first 3 + every 1000th) so a 0xc1 repetition does not
+  flood fbcon; 0x91 sampled every 500ms, 0x8f every 50ms (first 5 changes each).
+- **Liveness fallback**: after 10 consecutive read failures, re-read chip-id (0xA3/0x9F)
+  + 0x91 and print `stuck err=.. id=.. flow=..`; if the IC no longer identifies, apply
+  the vendor ESD remedy once (`IC unresponsive; ESD reset`).
+- Handshake makes `sweettouchirq` irrelevant for correctness (the IRQ gate is always on).
+- VALIDATION: patch generated from run 42042781115's buildtree file (authoritative 0093
+  base), `git apply --check` OK, forward byte-exact, reverse byte-exact, xnu-cc 0 of 1
+  failed against the 42042781115 log.
+- **CI: not built yet** - needs a manual `gh workflow run` (user approval required).
+
+**NEXT:** CI -> verify 0094 markers (`evt n=`, `evt cont:`, `gpio39 low #`, `stuck err=`,
+`IC unresponsive`) -> rebuild Image A -> ask user -> boot -> touch. Expected if the
+busy-status theory is right: `gpio39 low` at touch, `int0x8f` moves, `evt n=1:` dump
+with real bytes, `first report mask=0x1 id0=x,y`. If `stuck err=`/`IC unresponsive`
+appears instead, the IC is dying under our reads and the next step is SPI timing/CS.
+
 
 ### >>> UPDATE 2026-10-27 #3 (alioth, read first): 0092 boot = idle flood GONE, frame0
 ###     shows WORKMODE=00 + static idle bytes, irq asserted; 0093 = heartbeats+change-trk <<<

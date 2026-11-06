@@ -1,0 +1,217 @@
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -116,10 +116,13 @@
+  */
+ static bool touch_evt_once, touch_rep_once;
+ static bool touch_down_once, touch_rej_once, touch_irq_once;
+-static bool touch_irq_hi_once;
+ /* 0093: frame-change tracking + vendor ESD-style liveness counters. */
+ static unsigned touch_chg_prints, touch_fl_chgs, touch_in_chgs;
+ static uint8_t prev_frame[63], fl_last, in_last;
++/* 0094: event-triggered dumps, status-failure/trace throttle, one ESD reset. */
++static bool touch_evt_seen;
++static unsigned touch_evt_dumps, touch_st_prints, touch_irq_lows, touch_irq_highs;
++static bool touch_esd_done;
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -394,9 +397,18 @@
+ 		}
+ 		delay(150); /* vendor CS_HIGH_DELAY: 150 us */
+ 		if (rx[3] & 0xa0) {
+-			printf("ALIOTH TOUCH: fts reg %#x status=%#x hdr=%02x%02x%02x%02x\n",
+-			    reg, rx[3], rx[0], rx[1], rx[2], rx[3]);
+-			touch_trace("status", reg, rx, total);
++			/*
++			 * 0094: only the first three status failures are dumped
++			 * in full (plus every 1000th), so a persistent 0xc1 does
++			 * not flood fbcon; the loop still counts errors and
++			 * probes IC liveness after ten consecutive failures.
++			 */
++			if (touch_st_prints < 3u || (touch_st_prints % 1000u) == 0) {
++				printf("ALIOTH TOUCH: fts reg %#x status=%#x hdr=%02x%02x%02x%02x\n",
++				    reg, rx[3], rx[0], rx[1], rx[2], rx[3]);
++				touch_trace("status", reg, rx, total);
++			}
++			touch_st_prints++;
+ 			continue;
+ 		}
+ 		uint16_t crc = 0xffff;
+@@ -459,7 +471,16 @@
+ 	uint8_t buf[63];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0, buf, sizeof(buf));
++	/*
++	 * 0094: vendor-exact touch-data read.  fts_read_touchdata() writes
++	 * buf[0] = 0x01 itself and reads register 0x01 into buf[1..];
++	 * register 0 is WORKMODE (FTS_REG_WORKMODE) and is never part of a
++	 * frame.  The parser indices (>= 2) map to the same IC registers
++	 * either way, but reading 0x00 with a 63-byte length is not
++	 * something the vendor ever does.
++	 */
++	buf[0] = 0x01;
++	int err = touch_read(0x01, buf + 1, sizeof(buf) - 1u);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -467,11 +488,11 @@
+ 	/*
+ 	 * Dumps come BEFORE any validation so a rejected frame still leaves
+ 	 * its bytes on screen.  frame0 fires on the first successful read
+-	 * (idle or not) and shows buf[0] = reg 0 = FTS_REG_WORKMODE.  The
+-	 * vendor never validates this byte (its buf[0] is the constant
+-	 * 0x01 it writes itself), so the sweet-ported
+-	 * `buf[0] & 0x70` "work mode" check had no vendor counterpart and
+-	 * rejected every frame before 0092 could show a single byte.
++	 * (idle or not).  Since 0094 buf[0] is the vendor's constant 0x01
++	 * and buf[1..] are registers 0x01.. as read from the IC; the vendor
++	 * never validates buf[0] and neither do we.  (0092/0093 read reg 0
++	 * instead, which only ever showed WORKMODE + the neighbouring
++	 * registers and was never the vendor's frame read.)
+ 	 */
+ 	if (!touch_evt_once) {
+ 		touch_evt_once = true;
+@@ -500,6 +521,27 @@
+ 			printf("\n");
+ 		}
+ 	}
++	/*
++	 * 0094: when the IC's interrupt counter (0x8f) moved, dump the FULL
++	 * 63-byte event buffer on the next successful read.  A finger event
++	 * can live anywhere in the buffer, so the previous 16-byte dumps
++	 * could miss it entirely.
++	 */
++	if (touch_evt_seen) {
++		touch_evt_seen = false;
++		if (touch_evt_dumps++ < 3u) {
++			printf("ALIOTH TOUCH: evt n=%u int=%#x:", n, in_last);
++			for (unsigned k = 0; k < 32u; ++k) {
++				printf(" %02x", buf[k]);
++			}
++			printf("\n");
++			printf("ALIOTH TOUCH: evt cont:");
++			for (unsigned k = 32u; k < sizeof(buf); ++k) {
++				printf(" %02x", buf[k]);
++			}
++			printf("\n");
++		}
++	}
+ 	if (n && !touch_down_once) {
+ 		touch_down_once = true;
+ 		printf("ALIOTH TOUCH: first frame n=%u:", n);
+@@ -790,58 +832,86 @@
+ 	    st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
++		++ticks;
+ 		/*
+-		 * Independent event evidence: GPIO39 is the panel's IRQ line
+-		 * (active low, TLMM pull-up).  Print first assertion AND
+-		 * first release - a line that never drops means the FW never
+-		 * signals; a line that drops but never releases after reads
+-		 * means reading our address does not clear the pending event.
+-		 * Read unconditionally: the poll gate below only samples the
+-		 * line when sweettouchirq=1.
++		 * GPIO39 is the panel's IRQ line (active low, TLMM pull-up).
++		 * 0094 gates frame reads on it, exactly like the vendor's
++		 * IRQ handler: polling the event buffer while the IC is
++		 * updating it returned status 0xc1 (all bytes c1) in the
++		 * 0093 boot.  First five assertions/releases are printed so
++		 * a line that never toggles is still visible.
+ 		 */
+-		if (!(touch_rd(touch_tlmm(TLMM_SOUTH),
+-		    TOUCH_GPIO_PIN(39) + 4u) & 1u)) {
+-			if (!touch_irq_once) {
+-				touch_irq_once = true;
+-				printf("ALIOTH TOUCH: gpio39 low (irq asserted)\n");
+-			}
+-		} else if (touch_irq_once && !touch_irq_hi_once) {
+-			touch_irq_hi_once = true;
+-			printf("ALIOTH TOUCH: gpio39 high (irq released)\n");
++		bool irq_low = !(touch_rd(touch_tlmm(TLMM_SOUTH),
++		    TOUCH_GPIO_PIN(39) + 4u) & 1u);
++		if (irq_low) {
++			if (touch_irq_lows++ < 5u) {
++				printf("ALIOTH TOUCH: gpio39 low #%u\n", touch_irq_lows);
++			}
++			touch_irq_once = true;
++		} else if (touch_irq_once && touch_irq_highs++ < 5u) {
++			printf("ALIOTH TOUCH: gpio39 high #%u\n", touch_irq_highs);
+ 		}
+ 		/*
+-		 * FW heartbeats: 0x91 flow counter = main loop alive,
+-		 * 0x8F = interrupt/event counter = does the FW SEE touches.
+-		 * First 3 changes of each printed.
++		 * FW heartbeats at vendor-ish cadence: 0x91 flow counter
++		 * (main loop alive) every 500ms, 0x8F interrupt counter
++		 * (does the FW SEE touches) every 50ms.  First five changes
++		 * of each printed; an 0x8F change arms the full event dump.
+ 		 */
+ 		{
+ 			uint8_t v = 0;
+-			if (!touch_read(0x91, &v, 1) && v != fl_last) {
+-				if (touch_fl_chgs++ < 3u) {
++			if ((ticks % 50u) == 0 && !touch_read(0x91, &v, 1) &&
++			    v != fl_last) {
++				if (touch_fl_chgs++ < 5u) {
+ 					printf("ALIOTH TOUCH: flow0x91 %#x -> %#x\n",
+ 					    fl_last, v);
+ 				}
+ 				fl_last = v;
+ 			}
+-			if (!touch_read(0x8f, &v, 1) && v != in_last) {
+-				if (touch_in_chgs++ < 3u) {
++			if ((ticks % 5u) == 0 && !touch_read(0x8f, &v, 1) &&
++			    v != in_last) {
++				if (touch_in_chgs++ < 5u) {
+ 					printf("ALIOTH TOUCH: int0x8f %#x -> %#x\n",
+ 					    in_last, v);
+ 				}
+ 				in_last = v;
++				touch_evt_seen = true;
+ 			}
+ 		}
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active ||
+-		    !(touch_rd(touch_tlmm(TLMM_SOUTH), TOUCH_GPIO_PIN(39) + 4u) & 1u) ||
+-		    (++ticks % 10u) == 0) {
++		/*
++		 * Read while the IC is signalling, while a finger is down
++		 * (to catch the release), and once per second as a keepalive
++		 * so an IRQ that never asserts cannot silence the driver.
++		 */
++		if (irq_low || st.active || (ticks % 100u) == 0) {
+ 			int err = touch_focaltech();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("ALIOTH TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+ 				}
+ 				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++					/*
++					 * Ten failed reads in a row: is the IC
++					 * still alive?  Re-read the chip id and
++					 * the flow counter; if the id no longer
++					 * answers, apply the vendor ESD remedy
++					 * once (hardware reset via GPIO33).
++					 */
++					uint8_t idh = 0, idl = 0, fl = 0;
++					int e1 = touch_read(0xa3, &idh, 1);
++					int e2 = touch_read(0x9f, &idl, 1);
++					(void)touch_read(0x91, &fl, 1);
++					printf("ALIOTH TOUCH: stuck err=%u id=%02x:%02x(%d/%d) flow=%#x\n",
++					    errors, idh, idl, e1, e2, fl);
++					touch_report(0, st.x, st.y); /* release */
++					if ((e1 || e2 || idh != 0x56 || idl != 0x52) &&
++					    !touch_esd_done) {
++						touch_esd_done = true;
++						printf("ALIOTH TOUCH: IC unresponsive; ESD reset\n");
++						touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, false);
++						touch_wait(2);
++						touch_gpio(TLMM_SOUTH, 33, 0, 3, 3, true, true);
++						touch_wait(300);
++					}
+ 				}
+ 			} else {
+ 				errors = 0;
