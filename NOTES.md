@@ -2,10 +2,39 @@
 
 ## Agent handoff / active work (2026-11-06, latest)
 
-### >>> UPDATE 2026-11-06 (alioth, read first): CI RUN 42175366402 CANCELLED IN 1 s by
-###     GitHub ("configuration 'macos-14-arm64-us-default' is not supported") - macOS 14
+### >>> UPDATE 2026-11-06 #2 (alioth, read first): macos-15 + 0095 WORKED - run
+###     42177798541 SUCCESS (7m49s, Xcode 16.0/iig 16), kernel has all 0094 markers,
+###     Image A rebuilt -> waiting for user "go" to `fastboot boot` <<<
+
+**CI RUN 42177798541 = SUCCESS** (commits 00f572c; single user-approved run).
+- Ran on `macos-15`, Xcode **16.0 (16A242d)**, `iig` from `/Applications/Xcode_16.app`.
+  So patch 0095 was genuinely exercised (Xcode 16 iig was the blocker) and the rest of
+  the tree compiles under Xcode 16 clang/SDK on the first try - no further source fixes.
+- `Skipping patch .../patches/[0-9]{4}-` matches: **0**; log shows
+  `Applying patch: .../0094-...patch` then `.../0095-...patch`.
+- `xnu-kernel` artifact downloaded to `/tmp/opencode/k0094/`; installed as
+  `xnu/out/kernel.development.sweet`, **sha256 `31c32d05cb403542c1155cc7c7abf6171e9b7d3ffd91873867d744932d698ee8`**
+  (was 0093 `71d9f395...`). Markers present: `evt n=`, `evt cont:`, `gpio39 low #`,
+  `stuck err=`, `IC unresponsive`, `framechg`, `first report`, `flow0x91`;
+  0093-only `fts reg 0 status=` count 0.
+- **IMAGE A (0094) rebuilt**: `shim/out/shim-boot-alioth-A.img`, 17645568 B,
+  **sha256 `d2c16816378174671a2c2654dadd1839e23de9cfdd5109ed38fa8c6bc82815d7`**.
+  Pipeline: `mkadt.py shim/out/alioth.adt --board alioth --highmem` (10104 B) ->
+  `mkpayload.py xnu/out/kernel.development.sweet ... shim/out/payload-A.bin --cmdline "$CMD"`
+  -> `BOARD=alioth CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm READELF=llvm-readelf ./build.sh`.
+  Verified: unpacked ramdisk `cmp`s identical to `payload-A.bin`; cmdline string
+  `debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`
+  (0 hits for `sweetusb=2`); 0094 marker strings present in the image.
+
+**NEXT (in order): NOTIFY USER + WAIT for "go"** -> boot
+`shim/out/shim-boot-alioth-A.img` -> read the photo per the 0094 expectation matrix
+(below / previous section): expect `gpio39 low #N` on touch, `int0x8f` moving,
+`evt n=1:` with real bytes, `first report mask=0x1 id0=x,y`.
+
+### >>> UPDATE 2026-11-06 (alioth): CI RUN 42175366402 CANCELLED IN 1 s by GitHub
+###     ("configuration 'macos-14-arm64-us-default' is not supported") - macOS 14
 ###     runner images were RETIRED 2026-11-02; fix = macos-15 + patch 0095
-###     (IORPC.kernelContent for Xcode 16 iig). Awaiting user approval for one new run <<<
+###     (IORPC.kernelContent for Xcode 16 iig) - superseded by 2026-11-06 #2 above <<<
 
 **WHAT FAILED (observation, not our code):** `gh run view 42175366402` shows the single
 build job `cancelled` after 1 s with annotation
@@ -37,9 +66,9 @@ RISK (guess): this is the first build with Xcode 16 clang/SDK; only the iig inco
 known from the earlier notes. If other Xcode-16 errors appear, read the log before
 changing anything else.
 
-**NEXT:** commit+push -> ask user -> one `gh workflow run xnu.yml` -> verify 0094 markers
-(`evt n=`, `evt cont:`, `gpio39 low #`) AND that 0095 is in the build log/artifact ->
-rebuild Image A -> ask user -> boot -> touch.
+**NEXT (original plan, superseded by 2026-11-06 #2):** commit+push -> ask user -> one
+`gh workflow run xnu.yml` -> verify 0094 markers (`evt n=`, `evt cont:`, `gpio39 low #`)
+AND that 0095 is in the build log/artifact -> rebuild Image A -> ask user -> boot -> touch.
 
 ### >>> UPDATE 2026-11-05 (alioth, read first): runner capacity is back, but CI built a
 ###     0092 kernel because `git apply` silently skipped patch 0093; patch regenerated
