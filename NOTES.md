@@ -2,9 +2,9 @@
 
 ## Agent handoff / active work (2026-11-06, latest)
 
-### >>> UPDATE 2026-11-06 #3 (alioth, read first): patch 0096 (focaltech_spi 15-bit
-###     coords, /8 scaling) validated locally. CI run 42208757059 failed to ACQUIRE
-###     a macOS runner (no logs; infra). 0096 is still UNBUILT - needs user "go". <<<
+### >>> UPDATE 2026-11-06 #3 (alioth, read first): 0096 BUILT by CI 42211217252
+###     (success, 7m33s) and baked into Image A. Next action: user "go" ->
+###     `fastboot boot shim/out/shim-boot-alioth-A.img` <<<
 
 **WHAT THE 0094 BOOT PHOTO SHOWED (observation):** real, moving frames, e.g.
 `01 00 01 00 f9 04 55 a0 30`, then `01 80 01 00 fb 04 4b 10 30` while the finger
@@ -46,9 +46,32 @@ user-approved run was queued ~14 min, then the build job failed after 15m1s with
 `The job was not acquired by Runner of type hosted even after multiple attempts`
 (annotation: "Due to capacity constraints, jobs targeting macOS arm64 runners may
 experience longer queue times"). **No step ever ran and there is no log**
-(`gh run view --log` -> "log not found"; `--log-failed` empty). So 0096 has NOT
-been compiled yet, and the previous 0094 kernel/Image A remain the current build.
-Per the standing rule this was not retried; a new attempt needs a fresh user "go".
+(`gh run view --log` -> "log not found"; `--log-failed` empty). Per the standing rule
+this was not retried at the time.
+
+**CI RUN 42211217252 (commit dd9c66d) = SUCCESS (7m33s, single user-approved retry).**
+- `Skipping patch .../patches/[0-9]{4}-` matches: **0**; log shows 0094, 0095 and
+  **0096 applied** (`Applying patch: .../0096-sweet-touch-focaltech-spi-15bit-coords.patch`).
+- Buildtree `xnu/bsd/dev/alioth_touch.c` (sha256
+  `9f8a65693941559cb7ba672101aa7b06255a943b6fce8557262431d7b19e6485`) is **byte-identical**
+  to the locally validated 0096 tree -> exactly the code we intended was compiled.
+- `xnu-kernel` artifact **sha256 `b8875425773444b4b71936f9c37ce2e35b20f0c6236445eaf26786548d06768c`**,
+  installed as `xnu/out/kernel.development.sweet` (0094 kept at `/tmp/opencode/kernel-0094.sweet`).
+  Markers: `FTS 0x5652` (2), `evt n=`, `stuck err=`, `first report`, `flow0x91`;
+  old `FT3698` count **0**.
+- **IMAGE A (0096) rebuilt**: `shim/out/shim-boot-alioth-A.img`, 17645568 B,
+  **sha256 `fd1b8b256e64e2fe05c2d94a6da66b416b856f20350cbbf4d1dce48f6baec122`**;
+  payload `shim/out/payload-A.bin` sha256 `17fbcc0e5117e7768b63d54a53ab0e147a9df896694e04415af8992380d8004a`,
+  byte-identical to the boot image's ramdisk; cmdline exactly
+  `debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=1`
+  (0 hits for `sweetusb=2`); image contains `selected FTS 0x5652` and no `FT3698`.
+
+**NEXT: notify user and wait for "go"**, then `adb reboot bootloader` -> `fastboot boot
+shim/out/shim-boot-alioth-A.img`. Expected photo: probe `chip-id=56:52`, `selected FTS 0x5652`,
+`gpio39 low #N`, moving `int0x8f`, frames such as `01 00 01 00 f9 04 55 a0 30`, and
+**`first report mask=0x1 id0=249,1109`** (subsequent frames ~251,1099 -> 253,1081 -> 255,1066
+as the finger moves). No `reject range`. If `stuck err=`/`IC unresponsive` appears, the
+frames are not decoding as expected and we investigate SPI timing/idle keepalive.
 
 ### >>> UPDATE 2026-11-06 #2 (alioth): macos-15 + 0095 WORKED - run
 ###     42177798541 SUCCESS (7m49s, Xcode 16.0/iig 16), kernel has all 0094 markers,
