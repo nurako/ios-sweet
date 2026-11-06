@@ -2,9 +2,48 @@
 
 ## Agent handoff / active work (2026-11-06, latest)
 
-### >>> UPDATE 2026-11-06 #2 (alioth, read first): macos-15 + 0095 WORKED - run
+### >>> UPDATE 2026-11-06 #3 (alioth, read first): patch 0096 (focaltech_spi 15-bit
+###     coords, /8 scaling) validated locally -> needs ONE user-approved CI run.
+###     0094 boot proved IRQ-gated frame reads work; old decode rejected them. <<<
+
+**WHAT THE 0094 BOOT PHOTO SHOWED (observation):** real, moving frames, e.g.
+`01 00 01 00 f9 04 55 a0 30`, then `01 80 01 00 fb 04 4b 10 30` while the finger
+moved; `gpio39 low #N`, `int0x8f` counting, probe `chip-id=56:52`, `flow0x91` ticking.
+So the SE4 FIFO/IRQ path is correct. The only failure was our parser: it produced
+`reject range id=0 x=2496 y=11090` from that frame.
+
+**ROOT CAUSE (confirmed against vendor source, not a guess):** alioth uses the
+`focaltech_spi` driver (`compatible = "focaltech,fts"`, Lineage
+`drivers/input/touchscreen/focaltech_spi/`), not the older `focaltech_core.c` whose
+16-bit split + `*10/16` patches 0091..0095 carried. `focaltech_spi` decodes **15-bit**
+coordinates and reports them in the DTS range
+`focaltech,display-coords = <0 0 0x21c0 0x4b00>` = **8640 x 19200** = exactly 8x the
+1080 x 2400 panel. Same layout independently confirmed by `MrMoxing/ios-alioth`'s
+`redwood_goodix.c` (same phone, `TOUCH_MAX_X 8640`).
+- `x = (p[0]&0xF)<<11 | p[1]<<3 | (p[4]&0xE0)>>5`, `y = (p[2]&0xF)<<11 | p[3]<<3 | (p[4]&0x1C)>>2`
+- `record[0]` bits 7..6 = event, `record[2]` bits 7..4 = finger id, `record[4]` bits 1..0 = pressure.
+- The 0094 frame decodes to x=1996 y=8872 -> **249,1109 px**, i.e. inside the panel.
+
+**PATCH 0096 (`xnu/patches/0096-sweet-touch-focaltech-spi-15bit-coords.patch`, 97 lines):**
+replaces the 16-bit split and `*10/16` with the 15-bit `focaltech_spi` decode and
+`raw * 1080/8640` (raw * 2400/19200) scaling; adds `TOUCH_RAW_MAX_X/Y` and
+`TOUCH_PANEL_W/H`; renames the diagnostic strings `FT3698` -> `FTS 0x5652`.
+Generated from the authoritative 0094 CI buildtree (`gh run download 42177798541`,
+`bsd/dev/alioth_touch.c` sha256 `2aec81d16d46f48cdca9e0ff063fab1c5230c13848fc2dcd56a54d063019f0f6`).
+Validation: `git apply --check` OK, forward byte-exact to the edited tree, reverse
+byte-exact to the 0094 original, and `xnu-cc.py` (Xcode 16 command line from
+`/tmp/opencode/ci42177798541.log`) reported **0 of 1 files failed**.
+
+**NEXT:** (1) this section is committed+pushed to `fork/main`; (2) ask the user for
+exactly **one** manual CI run (`gh workflow run xnu.yml -R nurako/ios-sweet`); if it
+fails, stop and report the log (standing rule: no retry). (3) On success download
+`xnu-kernel`, verify `FTS 0x5652` + `TOUCH_RAW_MAX` markers, install to
+`xnu/out/kernel.development.sweet`, rebuild Image A, then **notify + wait for "go"**
+before `fastboot boot`.
+
+### >>> UPDATE 2026-11-06 #2 (alioth): macos-15 + 0095 WORKED - run
 ###     42177798541 SUCCESS (7m49s, Xcode 16.0/iig 16), kernel has all 0094 markers,
-###     Image A rebuilt -> waiting for user "go" to `fastboot boot` <<<
+###     Image A rebuilt + booted (real touch frames) - superseded by #3 above <<<
 
 **CI RUN 42177798541 = SUCCESS** (commits 00f572c; single user-approved run).
 - Ran on `macos-15`, Xcode **16.0 (16A242d)**, `iig` from `/Applications/Xcode_16.app`.
@@ -30,6 +69,37 @@
 `shim/out/shim-boot-alioth-A.img` -> read the photo per the 0094 expectation matrix
 (below / previous section): expect `gpio39 low #N` on touch, `int0x8f` moving,
 `evt n=1:` with real bytes, `first report mask=0x1 id0=x,y`.
+
+## GPU acceleration references found 2026-11-06 (for after touch/USB)
+
+Researched per user request; all are XNU-on-Android ports with published source.
+Ranked by usefulness to alioth (SM8250-AC, Adreno 650, our same ios-sweet base):
+
+1. **`aTechGeekDev/ios-apollo`** (Mi 10T, SM8250 + Adreno 650) - **best match**.
+   Kernel patches `xnu/patches/0096..0186-apollo-gpu*`; `userland/mesa/` with
+   `patches/0001-freedreno-darwin.patch`, `sweet-drm/sweet_drm.c` (DRM shim),
+   `ca-bridge/sweet_gl_osmesa.c` (inject OpenGL ES into backboardd),
+   `userland/metal/` (HakiosMetal, a6xx + PM4), `userland/metal2/` (metal2vulkan +
+   Turnip), `tools/pull-gpu-fw.sh` (a650 firmware/PM4 tables). Boot args:
+   `sweetgpu=22 sweetgpukeep=1`, `sweetgpulevel=N`,
+   `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd`, `sweetgl=0`.
+2. **`MrMoxing/ios-alioth`** (Redmi K40/POCO F3 = **alioth itself**) - same device.
+   `xnu/files/bsd/dev/redwood_adreno.c` (A650 via `adreno_soc=a650`; steps 1-19 pass,
+   step 20 hung as of 2026-10-23), `redwood_input.c`/`rwtouch.c` (touch replay),
+   `RedwoodGPU.cpp`, Mesa freedreno + AIR, `docs/PROJECT-MAP.md`,
+   `docs/SESSION-HANDOFF.md`. Their `gpu=1` switch is buggy - use
+   `adreno=21 adreno_skip=0 adreno_keep=1`. It also confirms our FTS layout.
+3. **`NWylynko/ios-flame`** (SM8150 + Adreno 640) - `phone/gpu/gpu.c`,
+   `phone/metal/`, `phone/metal2/`, `phone/turnip/`, GPU patches 0095-0122;
+   `sweetmtl=2` = Metal-on-Turnip. Older SoC/GPU, but the metal2vulkan glue is
+   board-independent.
+4. **`UniXNU/UniXNU`** (general non-Apple ARM64 iOS/macOS boot stack) -
+   NativeAdreno / NativeMetal / AirNir, BSD-2-Clause-Patent, reusable patches.
+
+Two viable render paths: kernel Adreno driver + Mesa freedreno (OpenGL ES) feeding
+CoreAnimation, or metal2vulkan + Turnip for Metal. Software framebuffer fallback
+currently used is MiniIOMobileFramebuffer. Nothing GPU-related has been ported yet;
+touch is the gate.
 
 ### >>> UPDATE 2026-11-06 (alioth): CI RUN 42175366402 CANCELLED IN 1 s by GitHub
 ###     ("configuration 'macos-14-arm64-us-default' is not supported") - macOS 14

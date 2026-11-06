@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/alioth_touch.c b/bsd/dev/alioth_touch.c
+index 0bba139..170c96a 100644
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -1,5 +1,5 @@
+ /*
+- * ALIOTH SE4 FIFO SPI / FT3698 touch bring-up (kona).
++ * ALIOTH SE4 FIFO SPI / FTS 0x5652 touch bring-up (kona).
+  *
+  * Mirrors sweet_touch.c: one polled thread, GCC clock vote, TLMM pin setup,
+  * GENI FIFO transfers and a vendor event parser, all diagnostic-first. The
+@@ -9,9 +9,11 @@
+  * status at rx[3], data at rx[7] - vendor focaltech_spi.c), and the L10C
+  * rail through sweet_rpmh.c. Probes read 0xa3/0x9f (expect 0x56:0x52 per
+  * FTS_CHIP_TYPE_MAPPING in focaltech_common.h) and the event parser
+- * follows focaltech_core.h (63 bytes from reg 0; 16-bit points split
+- * x_h/x_m/x_l with the low nibbles in record byte 7, scaled x*10/16;
+- * <=1079/<=2399).  Note reg 0 = FTS_REG_WORKMODE (0x00): the vendor's
++ * follows focaltech_spi (alioth's actual driver): 15-bit points, x_h in
++ * record byte 0 bits 3..0, x_m in byte 1, x_l in byte 4 bits 7..5 (y
++ * likewise with bytes 0/2/3 and bits 4..2), scaled from the DTS
++ * display-coords 8640x19200 to 1080x2400 (divide by 8).
++ * Note reg 0 = FTS_REG_WORKMODE (0x00): the vendor's
+  * own buf[0] is the constant 0x01 it sets by hand before reading reg 1
+  * into buf[1..], so no validation of our buf[0] exists vendor-side.
+  */
+@@ -99,6 +101,16 @@ void alioth_touch_init(void);
+ #define TOUCH_GPIO_PIN(n) ((uint32_t)(n) * 0x1000u)
+ 
+ #define TOUCH_MAX        10u
++/*
++ * 0096: the alioth touch controller reports 15-bit "super-high-resolution"
++ * coordinates in the range declared by its device tree node,
++ * focaltech,display-coords = <0 0 0x21c0 0x4b00> (8640 x 19200) - exactly
++ * 8x the 1080 x 2400 framebuffer, so the pixel coordinate is raw / 8.
++ */
++#define TOUCH_RAW_MAX_X  8640u
++#define TOUCH_RAW_MAX_Y  19200u
++#define TOUCH_PANEL_W    1080u
++#define TOUCH_PANEL_H    2400u
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio_s, gpio_n;
+@@ -597,19 +609,27 @@ touch_focaltech(void)
+ 			return EIO;
+ 		}
+ 		/*
+-		 * focaltech_core.h layout: 16-bit x/y per record - x_h in
+-		 * p[0]'s low nibble (bits 12..15), x_m = p[1] (bits 4..11),
+-		 * x_l = p[4]'s high nibble (bits 0..3); y likewise with
+-		 * p[2]/p[3]/p[4].low.  The FW reports in a 16/10 space
+-		 * (vendor: x = x * 10 / 16, "fw report 16x, dts report 10x").
+-		 * The old 12-bit decode put x_h at bits 8..11 and ignored
+-		 * p[4], so every coordinate came out ~10x too small while
+-		 * still passing the range check below.
++		 * 0096: alioth uses the focaltech_spi driver (compatible
++		 * "focaltech,fts", drivers/input/touchscreen/focaltech_spi on
++		 * Lineage's sm8250 tree), not the older focaltech_core.c whose
++		 * 16-bit split and *10/16 scaling patches 0092..0095 carried.
++		 * focaltech_spi decodes 15-bit coordinates:
++		 *   p[0] bits 3..0 = x bits 14..11 (bits 7..6 = event)
++		 *   p[1]           = x bits 10..3
++		 *   p[2] bits 3..0 = y bits 14..11 (bits 7..4 = finger id)
++		 *   p[3]           = y bits 10..3
++		 *   p[4] bits 7..5 = x bits 2..0, bits 4..2 = y bits 2..0
++		 * The panel extent is the DTS display-coords above.  With the old
++		 * decode the 0094 frames (01 00 01 00 f9 04 55 a0 30) gave
++		 * x=2496 y=11090 and were rejected as out of range; the vendor
++		 * decode gives x=1996 y=8872 -> 249,1109 px.
+ 		 */
+-		unsigned px = (((unsigned)(p[0] & 15u) << 12) |
+-		    ((unsigned)p[1] << 4) | (p[4] >> 4)) * 10u / 16u;
+-		unsigned py = (((unsigned)(p[2] & 15u) << 12) |
+-		    ((unsigned)p[3] << 4) | (p[4] & 15u)) * 10u / 16u;
++		unsigned rx = (((unsigned)(p[0] & 15u) << 11) |
++		    ((unsigned)p[1] << 3) | ((p[4] & 0xe0u) >> 5));
++		unsigned ry = (((unsigned)(p[2] & 15u) << 11) |
++		    ((unsigned)p[3] << 3) | ((p[4] & 0x1cu) >> 2));
++		unsigned px = rx * TOUCH_PANEL_W / TOUCH_RAW_MAX_X;
++		unsigned py = ry * TOUCH_PANEL_H / TOUCH_RAW_MAX_Y;
+ 		if (px > 1079 || py > 2399) {
+ 			if (!touch_rej_once) {
+ 				touch_rej_once = true;
+@@ -824,11 +844,11 @@ touch_thread(void *arg, wait_result_t result)
+ 	 */
+ 	bool fts = !fe1 && !fe2 && fid1 == 0x56 && fid2 == 0x52;
+ 	if (st.dead || !fts) {
+-		printf("ALIOTH TOUCH: FT3698 not confirmed (chip-id=%02x:%02x dead=%d); stopping\n",
++		printf("ALIOTH TOUCH: FTS 0x5652 not confirmed (chip-id=%02x:%02x dead=%d); stopping\n",
+ 		    fid1, fid2, st.dead);
+ 		goto out;
+ 	}
+-	printf("ALIOTH TOUCH: selected FTS FT3698, 1080x2400, poll=10ms irq-hint=%d\n",
++	printf("ALIOTH TOUCH: selected FTS 0x5652, 1080x2400, poll=10ms irq-hint=%d\n",
+ 	    st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
