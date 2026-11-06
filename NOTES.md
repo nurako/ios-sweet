@@ -1,6 +1,45 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-11-05, latest)
+## Agent handoff / active work (2026-11-06, latest)
+
+### >>> UPDATE 2026-11-06 (alioth, read first): CI RUN 42175366402 CANCELLED IN 1 s by
+###     GitHub ("configuration 'macos-14-arm64-us-default' is not supported") - macOS 14
+###     runner images were RETIRED 2026-11-02; fix = macos-15 + patch 0095
+###     (IORPC.kernelContent for Xcode 16 iig). Awaiting user approval for one new run <<<
+
+**WHAT FAILED (observation, not our code):** `gh run view 42175366402` shows the single
+build job `cancelled` after 1 s with annotation
+`The configuration 'macos-14-arm64-us-default' is not supported`. No step ran, no log.
+`actions/runner-images` README (fetched 2026-11-06): *"All macOS 14 images retired from
+GitHub Actions on November 2, 2026"* (issue #15226). The last good build (42042781115,
+2026-11-05) ran on `Image: macos-14-arm64` with **Xcode 15.0.1 / iig DriverKit-286**;
+that image is now gone. Repo is public; GitHub status was operational (not an outage).
+Per the standing rule ("if CI fails this run, stop attempting") this was NOT retried.
+
+**FIX 1 - patch 0095 (`0095-xnu-iorpc-kernel-content-field.patch`):** Xcode 16's iig
+generates `.iig.cpp` code that stores/loads `IORPC.kernelContent` (a fast-path message
+pointer added to the struct in newer xnu). xnu-8796's `struct IORPC` has only
+message/reply/sendSize/replySize, so every generated DriverKit file fails to compile.
+Upstream xnu main has exactly `IORPCMessage * kernelContent;` guarded by `#ifdef KERNEL`;
+0095 adds those three lines to BOTH byte-identical copies (`iokit/IOKit/IORPC.h` and
+`iokit/DriverKit/IORPC.h`). Purely additive; we use no DriverKit RPC runtime.
+VALIDATED LOCALLY: an Xcode-15-generated `OSObject.iig.cpp` with a `.kernelContent`
+access fails `xnu-cc.py` with `error: no member named 'kernelContent' in 'IORPC'`
+(control), and passes 0 of 1 failed after applying 0095 to the source headers and the
+buildtree's `EXPORT_HDRS/iokit/{IOKit,DriverKit}/IORPC.h`. Patch itself: generated from
+the 0093 buildtree headers, `git apply --check` OK, forward and reverse byte-exact.
+
+**FIX 2 - workflow runner:** `runs-on: macos-14` -> `macos-15` (arm64, same
+architecture as the last working macos-14-arm64 image). The Deps step already selects
+the OLDEST installed Xcode (`sort -V | head -1`), which on macos-15 is Xcode 16.0.
+The KDK is 13.5 downloaded from dortania's KDKSupportPkg, independent of Xcode.
+RISK (guess): this is the first build with Xcode 16 clang/SDK; only the iig incompat was
+known from the earlier notes. If other Xcode-16 errors appear, read the log before
+changing anything else.
+
+**NEXT:** commit+push -> ask user -> one `gh workflow run xnu.yml` -> verify 0094 markers
+(`evt n=`, `evt cont:`, `gpio39 low #`) AND that 0095 is in the build log/artifact ->
+rebuild Image A -> ask user -> boot -> touch.
 
 ### >>> UPDATE 2026-11-05 (alioth, read first): runner capacity is back, but CI built a
 ###     0092 kernel because `git apply` silently skipped patch 0093; patch regenerated
@@ -48,7 +87,8 @@ reads register **0x01**. Register 0 was never the vendor's frame read.
 - VALIDATION: patch generated from run 42042781115's buildtree file (authoritative 0093
   base), `git apply --check` OK, forward byte-exact, reverse byte-exact, xnu-cc 0 of 1
   failed against the 42042781115 log.
-- **CI: not built yet** - needs a manual `gh workflow run` (user approval required).
+- **CI: NOT built yet** - the 2026-11-06 attempt was cancelled by GitHub (macOS 14
+  runners retired); see the 2026-11-06 section at the top for patch 0095 + macos-15.
 
 **NEXT:** CI -> verify 0094 markers (`evt n=`, `evt cont:`, `gpio39 low #`, `stuck err=`,
 `IC unresponsive`) -> rebuild Image A -> ask user -> boot -> touch. Expected if the
