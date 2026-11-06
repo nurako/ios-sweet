@@ -3,8 +3,8 @@
 ## Agent handoff / active work (2026-11-06, latest)
 
 ### >>> UPDATE 2026-11-06 #3 (alioth, read first): patch 0096 (focaltech_spi 15-bit
-###     coords, /8 scaling) validated locally -> needs ONE user-approved CI run.
-###     0094 boot proved IRQ-gated frame reads work; old decode rejected them. <<<
+###     coords, /8 scaling) validated locally. CI run 42208757059 failed to ACQUIRE
+###     a macOS runner (no logs; infra). 0096 is still UNBUILT - needs user "go". <<<
 
 **WHAT THE 0094 BOOT PHOTO SHOWED (observation):** real, moving frames, e.g.
 `01 00 01 00 f9 04 55 a0 30`, then `01 80 01 00 fb 04 4b 10 30` while the finger
@@ -40,6 +40,15 @@ fails, stop and report the log (standing rule: no retry). (3) On success downloa
 `xnu-kernel`, verify `FTS 0x5652` + `TOUCH_RAW_MAX` markers, install to
 `xnu/out/kernel.development.sweet`, rebuild Image A, then **notify + wait for "go"**
 before `fastboot boot`.
+
+**CI RUN 42208757059 (commit 94fa598) = FAILED, BUT NOT OUR CODE.** The single
+user-approved run was queued ~14 min, then the build job failed after 15m1s with
+`The job was not acquired by Runner of type hosted even after multiple attempts`
+(annotation: "Due to capacity constraints, jobs targeting macOS arm64 runners may
+experience longer queue times"). **No step ever ran and there is no log**
+(`gh run view --log` -> "log not found"; `--log-failed` empty). So 0096 has NOT
+been compiled yet, and the previous 0094 kernel/Image A remain the current build.
+Per the standing rule this was not retried; a new attempt needs a fresh user "go".
 
 ### >>> UPDATE 2026-11-06 #2 (alioth): macos-15 + 0095 WORKED - run
 ###     42177798541 SUCCESS (7m49s, Xcode 16.0/iig 16), kernel has all 0094 markers,
