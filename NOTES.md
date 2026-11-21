@@ -1,6 +1,64 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-11-06, latest)
+## Agent handoff / active work (2026-11-21, latest)
+
+### >>> UPDATE 2026-11-21: 0096 cross-validated against a WORKING alioth port; community
+###     code audit (touch + GPU). 0096 kernel/Image A are built; boot state unknown <<<
+
+**0096 STATUS:** CI run **42211217252 SUCCESS** (macos-15) built
+`0096-sweet-touch-focaltech-spi-15bit-coords.patch`; kernel installed
+`xnu/out/kernel.development.sweet` sha256 `b8875425...06768c` (17222376 B) and **Image A
+(0096) rebuilt** `shim/out/shim-boot-alioth-A.img` sha256 `fd1b8b25...baec122`
+(17645568 B). A `fastboot boot` was issued at the end of the 2026-11-06 session;
+the phone is NOT on adb/fastboot now, so the 0096 result is STILL UNOBSERVED. Check the
+phone screen and re-boot before drawing any conclusion.
+
+**INDEPENDENT CONFIRMATION of the 0096 decode (same phone, working touch):**
+`MrMoxing/ios-alioth` (Redmi K40/POCO F3 = alioth; XNU-8796 too) drives this exact panel
+from `src/hackios-xnu-kernel-main/xnu/files/bsd/dev/redwood_goodix.c` ("FocalTech"
+section). Their code is hardware-verified: `docs/SESSION-HANDOFF.md` records
+"real finger touch works 2026-10-22 23:30, `focaltech: finger 0 down/move ...` 240
+reports/s, 0 bad", root cause of their earlier failure = TLMM tile base (we fixed the
+same class of bug in 0084).
+- report read: reg **0x01**, 62 bytes, FTS frame `[addr,0xA0,lenH,lenL,3 dummy,data,crc16]`,
+  data at rx[7], status rx[3]&0xA0, CRC16 Kermit - IDENTICAL to our 0089/0094.
+- chip id: `FOCALTECH_ID_H 0x56` + `FOCALTECH_ID_L_ALSO 0x52` for alioth - our 0091 is right.
+- report layout (their `focaltech_report()`): `report[0]` gesture, `report[1]&0xF` count,
+  6-byte records at `report[2+6i]`; event `t[0]>>6`, id `t[2]>>4`;
+  `x = (t[0]&0xF)<<11 | t[1]<<3 | t[4]>>5`, `y = (t[2]&0xF)<<11 | t[3]<<3 | (t[4]&0x1C)>>2`
+  - EXACTLY patch 0096 (15-bit, not the 16-bit focaltech_core layout). Report space
+  `TOUCH_MAX_X 8640 / TOUCH_MAX_Y 19200` = DTS `focaltech,display-coords = <0 0 0x21c0 0x4b00>`
+  (1080x2400 panel at 8x). So the /8 scaling to panel px in 0096 is right.
+- they poll on IRQ like our 0094, track per-finger down state, and post UP for fingers
+  missing from the report - same semantics we adopted.
+
+**COMMUNITY CODE AUDIT (2026-11-21), most useful first:**
+1. `MrMoxing/ios-alioth` - SAME DEVICE. Working GL/GPU path (docs/evidence/
+   `2026-10-31-gpu-step20-passed.log`, `2026-10-31-gpu-step22-passed.log`,
+   `2026-10-31-gpu-home-gl.png`, `gpu-live-springboard.png`), WiFi join + page load
+   (2026-11-04 commits), APFS root with working /private/var. Driver set in
+   `xnu/files/bsd/dev/redwood_*.c` (adreno, focaltech fw header, wifi, audio, haptic...).
+   GPU: Adreno 650 via `redwood_adreno.c` (235794 B, the hardware-passing version).
+   Their earlier CP_SQE_CNTL reset was NOT "starting the CP is fatal": the baseline was
+   incomplete - adding `hwcg_table[49]`/`set_hwcg()` and `protect_table[39]`/
+   `set_cp_protect()` fixed it (`docs/unixnu-fft-gpu-ufs.md` section 1 + step 20 pass).
+   Boot args: `adreno_soc=a650 adreno=22` for the step ladder; `gpu=1` (= `adreno=21
+   adreno_keep=1`) keeps the GPU and starts `RedwoodGPU` for the window server.
+2. `aTechGeekDev/ios-apollo` (Mi 10T, SM8250 + A650) - a fork of **ios-sweet** like us,
+   so its patches drop into our series with the same numbering base (`xnu/patches/0001-...
+   0186`, and their 0167 is the same IORPC.kernelContent fix as our 0095). GPU stack:
+   0107-0113 (zap/SCM/frame), 0114 CA bridge, 0169-0186 (Turnip accelerator, display
+   copy, Metal options), plus `userland/mesa` (freedreno-darwin patch), `userland/metal`,
+   `userland/metal2`, `userland/ca-bridge/sweet_gl_osmesa.c`. WiFi/BT/audio too
+   (0126-0152). LOWEST-FRICTION GPU source for our tree.
+3. `NWylynko/ios-flame` (Pixel 4, A640) - `phone/gpu`, `phone/metal`, `phone/metal2`,
+   `phone/turnip`; `sweetmtl=2` Metal-on-Turnip.
+4. `UniXNU/UniXNU` - generic ARM64: NativeAdreno / NativeMetal / AirNir, BSD-2-Clause.
+   `MrMoxing/ios-alioth` has a per-item comparison in `docs/unixnu-fft-gpu-ufs.md`.
+
+**NEXT (in order):** confirm phone state -> boot Image A (0096) -> expect
+`selected FTS 0x5652, 1080x2400` and `first report mask=0x1 id0=249,1109`-style values with
+NO `reject range`; then Image B (sweetusb=2) USB ladder; then GPU planning from (1)/(2).
 
 ### >>> UPDATE 2026-11-06 #3 (alioth, read first): 0096 BUILT by CI 42211217252
 ###     (success, 7m33s) and baked into Image A. Next action: user "go" ->
