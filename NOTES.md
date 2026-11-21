@@ -1,6 +1,45 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-11-21, latest)
+## Agent handoff / active work (2026-11-22, latest)
+
+### >>> UPDATE 2026-11-22: TOUCH CONFIRMED WORKING ON THE PHONE (0096). USB gadget
+###     deferred: QUSB2 PHY is fully powered down after ABL handoff <<<
+
+**TOUCH (0096, Image A `fd1b8b25...`): CONFIRMED BY THE USER ON THE PHONE.** Probe passes
+(`chip-id=56:52`), the event loop runs, and touching the screen produces streaming reports
+with no `reject range` - i.e. the 15-bit decode + /8 scaling is correct. No photo was
+captured because the touch log floods fbcon within seconds (that is itself evidence the
+report path is busy). The driver side of the touch port is DONE; what remains for visible
+touch behaviour is an iOS userland that consumes HID events (stage 4).
+
+**USB live log (deferred at the user's request 2026-11-22):** `sweetusb=2` still kills the
+session on alioth. Evidence this round:
+- Image B (`e20df8db...`, kernel 0096 + `sweetusb=2`) reboots the phone; no USB device on
+  the PC (`lsusb` has no 1209, no 02:00:5e:77:ee:01 link).
+- The boot photo shows gadget_start DID run: `SWEET USB: ue0 192.168.7.2/24 up (err 0)`
+  (printed by ud_if_create, before the reset), but **no `soft reset ... done/STUCK` line
+  and none of the later stage prints** -> it dies in the DWC3 DCTL soft-reset
+  write/poll. The loop is bounded (500 ms) and always prints, so the CPU never got to
+  that print.
+- Image C (`e566058f...`, quiet: `sweettouch=0 sweetkeys=0 sweetusb=1`) is stable and
+  prints the PHY: **`SWEET USB: QUSB2 PLL_STATUS 0x00000000 PWR_CTRL1 0x00000000
+  PORT_TUNE1 0x00000000 TEST1 0x00000000`** - the QUSB2 PHY is fully powered down /
+  unclocked after ABL hands off (on sweet ABL left USB running, so the same code worked).
+  => a real USB fix needs the full QUSB2 PHY init sequence (clocks/reset/PLL lock) before
+  the DWC3 soft reset, not a one-line change. Not needed for kernel progress; parked.
+- Clock-print caveat found while checking: on kona, `0x8c010` is **gcc_usb3_SEC_clkref_en**
+  (secondary USB), not prim, and our `sleep`/`utmi` offsets (0xf014/0xf018) are shifted vs
+  gcc-kona.c (sleep 0xf018, mock_utmi 0xf01c). The per-clock "(on/off)" lines in the USB
+  probe are therefore not trustworthy; fix them when USB is picked up again.
+
+**IMAGES BUILT THIS ROUND (all from kernel 0096, sha256 `b8875425...06768c`):**
+- A `shim/out/shim-boot-alioth-A.img` `fd1b8b25...baec122` - touch verify (sweetusb=1)
+- B `shim/out/shim-boot-alioth-B.img` `e20df8db...0e0627` - USB attempt (sweetusb=2)
+- C `shim/out/shim-boot-alioth-C.img` `e566058f...60738801` - quiet USB/PHY probe
+
+**NEXT:** stage 4 (iOS root into `userdata`) is the only step that unlocks visible touch,
+SpringBoard and any GPU work. It is DESTRUCTIVE to Android user data and still needs the
+user's explicit go-ahead for the concrete flash.
 
 ### >>> UPDATE 2026-11-21: 0096 cross-validated against a WORKING alioth port; community
 ###     code audit (touch + GPU). 0096 kernel/Image A are built; boot state unknown <<<
