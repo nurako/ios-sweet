@@ -1,0 +1,124 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -28,6 +28,12 @@
+  *   6  read   the GMU (0x3d6a000, same layout as SM7325): reset, boot and HFI
+  *             state, plus its always-on counter, which counts the 19.2 MHz
+  *             crystal once the block is alive
++ *   7  read   the GMU's RPMh channel (RSCC 0x3de0000)
++ *   8  read   the GPU's SMMU (kgsl-smmu 0x3da0000, 64 KiB, MMU-500 answered
++ *             by the hypervisor): ID registers, stream match table, CBARs
++ *   9  read   SMMU translation context 0 (the GPU's own)
++ *  10  write  GMU held in reset, two words written into its data memory
++ *             (DTCM) and read back, then restored: can firmware be loaded?
+  * After step 4 or later the CX half is collapsed again before returning,
+  * unless boot-arg sweetgpukeep=1. The 3D core (GX) is never powered here.
+  *
+@@ -96,6 +102,32 @@
+ #define GMU_AO_HOST_IRQ_STATUS GMU_WORD(0x9305)
+ #define GMU_AO_GPU_CX_BUSY    GMU_WORD(0x930c)
+ #define GMU_AHB_FENCE_STATUS  GMU_WORD(0x9313)
++#define GMU_RSCC_CONTROL_ACK  GMU_WORD(0x9308)
++#define GMU_DTCM              GMU_WORD(0x1c00)
++
++#define RSCC_PA               0x03de0000u
++#define RSCC_SIZE             0x10000
++#define RSCC_DRV_CONFIG       0x00cu
++#define RSCC_RSC_STATUS0_DRV0 (4u * 0x004)
++#define RSCC_PDC_SLAVE_ID_DRV0 (4u * 0x00b)
++#define RSCC_SEQ_BUSY_DRV0    (4u * 0x101)
++#define RSCC_SEQ_MEM_0_DRV0   (4u * 0x180)
++#define RSCC_TCS0_DRV0_STATUS (4u * 0x346)
++
++#define SMMU_PA               0x03da0000u
++#define SMMU_SIZE             0x10000u    /* apollo DT: <0x3da0000 0x10000> */
++#define SMMU_SCR0             0x000u
++#define SMMU_IDR0             0x020u
++#define SMMU_IDR1             0x024u
++#define SMMU_IDR2             0x028u
++#define SMMU_IDR7             0x03cu
++#define SMMU_SGFSR            0x048u
++#define SMMU_SMR(n)           (0x800u + 4u * (n))
++#define SMMU_S2CR(n)          (0xc00u + 4u * (n))
++#define SMMU_CB_SCTLR         0x00u
++#define SMMU_CB_TTBR0         0x20u
++#define SMMU_CB_TCR           0x30u
++#define SMMU_CB_FSR           0x58u
+ 
+ static uint32_t
+ gpu_rd(vm_offset_t base, uint32_t off)
+@@ -300,6 +332,75 @@
+ 	    gpu_rd(gmu, GMU_AO_COUNTER_H), gpu_rd(gmu, GMU_AO_COUNTER_L), (unsigned long long)hz,
+ 	    (hz > 18000000ull && hz < 20500000ull) ? "the 19.2 MHz crystal, THE GPU BLOCK IS ALIVE" :
+ 	    "not 19.2 MHz (the counter may need GMU firmware)");
++	if (steps < 7)
++		goto collapse;
++
++	/* ---- step 7: the GMU's RPMh channel ---- */
++	vm_offset_t rscc = ml_io_map(RSCC_PA, RSCC_SIZE);
++	if (!rscc) {
++		printf("SWEET GPU: RSCC map failed\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 7: read RSCC %#x\n", RSCC_PA);
++	printf("SWEET GPU:   rscc drv_config=%#x rsc_status0=%#x pdc_slave_id=%#x seq_busy=%#x seq_mem0=%#x tcs0_status=%#x; gmu rscc_control_ack=%#x\n",
++	    gpu_rd(rscc, RSCC_DRV_CONFIG), gpu_rd(rscc, RSCC_RSC_STATUS0_DRV0),
++	    gpu_rd(rscc, RSCC_PDC_SLAVE_ID_DRV0), gpu_rd(rscc, RSCC_SEQ_BUSY_DRV0),
++	    gpu_rd(rscc, RSCC_SEQ_MEM_0_DRV0), gpu_rd(rscc, RSCC_TCS0_DRV0_STATUS),
++	    gpu_rd(gmu, GMU_RSCC_CONTROL_ACK));
++	if (steps < 8)
++		goto collapse;
++
++	/* ---- step 8: the SMMU's global registers (answered by the hypervisor) ---- */
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu) {
++		printf("SWEET GPU: SMMU map failed\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 8: read SMMU %#x ID registers\n", SMMU_PA);
++	uint32_t idr0 = gpu_rd(smmu, SMMU_IDR0), idr1 = gpu_rd(smmu, SMMU_IDR1);
++	uint32_t pg = (idr1 >> 31) ? 0x10000u : 0x1000u, npg = 2u << ((idr1 >> 28) & 7u);
++	uint32_t nctx = idr1 & 0xffu, nsmr = idr0 & 0xffu;
++	printf("SWEET GPU:   smmu idr0=%#x idr1=%#x idr2=%#x idr7=%#x scr0=%#x sgfsr=%#x: %u stream matches, %u contexts, %u pages of %#x\n",
++	    idr0, idr1, gpu_rd(smmu, SMMU_IDR2), gpu_rd(smmu, SMMU_IDR7), gpu_rd(smmu, SMMU_SCR0),
++	    gpu_rd(smmu, SMMU_SGFSR), nsmr, nctx, npg, pg);
++	if (2u * npg * pg != SMMU_SIZE) {
++		printf("SWEET GPU: step 8: that is %#x of registers, the DT says %#x: not reading further\n",
++		    2u * npg * pg, SMMU_SIZE);
++		goto collapse;
++	}
++	for (uint32_t i = 0; i < nsmr && i < 16; ++i)
++		printf("SWEET GPU:   smmu smr%u=%#010x s2cr%u=%#010x\n", i, gpu_rd(smmu, SMMU_SMR(i)),
++		    i, gpu_rd(smmu, SMMU_S2CR(i)));
++	for (uint32_t i = 0; i < nctx && i < 16; ++i)
++		printf("SWEET GPU:   smmu cbar%u=%#010x\n", i, gpu_rd(smmu, pg + 4u * i));
++	if (steps < 9)
++		goto collapse;
++
++	/* ---- step 9: translation context 0 ---- */
++	uint32_t cb0 = npg * pg;
++	printf("SWEET GPU: step 9: read SMMU context 0 at %#x\n", SMMU_PA + cb0);
++	printf("SWEET GPU:   cb0 sctlr=%#x ttbr0=%#x:%#x tcr=%#x fsr=%#x\n",
++	    gpu_rd(smmu, cb0 + SMMU_CB_SCTLR), gpu_rd(smmu, cb0 + SMMU_CB_TTBR0 + 4u),
++	    gpu_rd(smmu, cb0 + SMMU_CB_TTBR0), gpu_rd(smmu, cb0 + SMMU_CB_TCR), gpu_rd(smmu, cb0 + SMMU_CB_FSR));
++	if (steps < 10)
++		goto collapse;
++
++	/* ---- step 10: the GMU's data memory ---- */
++	if (gpu_rd(gmu, GMU_CM3_FW_INIT_RESULT) == 0xbabefaceu) {
++		printf("SWEET GPU: step 10: firmware is running in the GMU: memory left alone\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 10: GMU in reset; write two DTCM words (%#x), read back, restore\n", GMU_PA + GMU_DTCM);
++	gpu_wr(gmu, GMU_CM3_SYSRESET, 1);
++	uint32_t was0 = gpu_rd(gmu, GMU_DTCM), was1 = gpu_rd(gmu, GMU_DTCM + 4u);
++	gpu_wr(gmu, GMU_DTCM, 0x600d0001u);
++	gpu_wr(gmu, GMU_DTCM + 4u, 0x0a110002u);
++	uint32_t back0 = gpu_rd(gmu, GMU_DTCM), back1 = gpu_rd(gmu, GMU_DTCM + 4u);
++	gpu_wr(gmu, GMU_DTCM, was0);
++	gpu_wr(gmu, GMU_DTCM + 4u, was1);
++	printf("SWEET GPU: step 10: read back %#x %#x: %s\n", back0, back1,
++	    (back0 == 0x600d0001u && back1 == 0x0a110002u) ?
++	    "THE GMU'S MEMORY TAKES WHAT IS WRITTEN: its firmware can be loaded" : "memory does not hold what was written");
+ 
+ collapse:
+ 	{
