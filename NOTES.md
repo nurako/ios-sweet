@@ -143,6 +143,20 @@ SMMU context 0, then hold the GMU in reset and test-write two words of its DTCM.
 ships `sweet_cpufreq.c` in the same patch (EPSS LUT at 0x320/0x100, rows 4 bytes); we have
 no cpufreq driver yet and cores stay at the bootloader level - worth porting separately.
 
+**GPU STEP 7-8 READINGS + SMMU CBAR WALL (boot T, Image `45e31e15...`, `sweetgpu=10`):**
+- step 7 RSCC 0x3de0000: `drv_config 0x4000000a`, `rsc_status0 0`, `pdc_slave_id 0x1`,
+  `seq_busy 0`, `seq_mem0 0`, `tcs0_status 0x1`, `gmu rscc_control_ack 0`.
+- step 8 GPU SMMU 0x3da0000: `idr0 0x4c017e06 idr1 0x20000005 idr2 0x5511 idr7 0x24
+  scr0 0x250406 sgfsr 0` -> 6 stream matches, 5 contexts, 8 pages of 0x1000 (total 0x10000,
+  matches the DT). **All SMRs read 0** (no valid stream match) while S2CR0..5 hold values
+  (`0x0ffae0ff, 0x07bee9ff, 0x30a2bff, 0x09f6faff, 0x033feb0f, 0x3376ebff`).
+- **Then the boot froze** reading the CBAR array (`smmu cbar0`), before the DTCM test could
+  run: the GPU SMMU answers its global registers but not its context banks - the same
+  secure-ownership wall as the apps SMMU. With `wdt=-1` there is no automatic reboot, so it
+  sits there.
+- Patch 0106 reorders: **step 9 = GMU DTCM write/read test**, **step 10 = SMMU CBAR/context
+  reads** (last, opt-in, documented as freezing). Image U `0fcb540c...` is `sweetgpu=9`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
