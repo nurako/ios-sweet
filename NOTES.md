@@ -65,6 +65,19 @@ on. Also observed at mount:
 `hfs: mounted IOSRoot on device b(1, 0)`, `hfs: Removed 27 orphaned / unlinked files and 20
 directories` (journal replay after the hard resets), root unsealed, launchd loaded.
 
+**USB PHY ROOT CAUSE (2026-11-22): wrong PHY block.** live.dts `usb2_phy0: hsphy@88e3000`
+is a **Synopsys femto HS PHY** (`qcom,usb-hsphy-snps-femto`, regs 0x88e3000/0x110,
+`eud_enable_reg` 0x88e2000, reset `<&gcc 0x1b>`), NOT the QUSB2 v2 block the old probe
+read at 0x88e2000 - hence the all-zero "PLL_STATUS/PWR_CTRL1" and the DWC3 soft-reset
+death. Patch **0098-sweet-usb-femto-phy.patch** implements `msm_hsphy_init()` from Linux
+`drivers/usb/phy/phy-msm-snps-hs.c`: assert/deassert **GCC_QUSB2PHY_PRIM_BCR 0x12000**
+(gcc-kona.c reset map), then CFG0 override, POR, FSEL=0, PLLBTUNE, REFCLK_SEL=2,
+VBUSVLDEXTSEL0/VBUSVLDEXT0, DT `qcom,param-override-seq = <0xe5 0x6c 0xfa 0x70 0x2c
+0x74>` (value,offset pairs), VREGBYPASS, SUSPEND_N_SEL|SUSPEND_N, SLEEPM, POR off,
+SUSPEND_N_SEL off, override off - with before/after register dumps. Round-trip OK,
+xnu-cc 0 of 1 failed. Needs one CI run; if the PHY comes up, the existing gadget path
+(sweetusb=2) should finally enumerate.
+
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
 `redwood_adreno.c`), WiFi/BT (apollo 0126-0152), USB live log. Stage 4 destructive step is

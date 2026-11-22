@@ -1,0 +1,112 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 15:16:50.256765263 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-22 15:16:50.257305568 +0530
+@@ -64,6 +64,13 @@
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
++/* kona: the primary HS PHY is a Synopsys femto PHY (hsphy@88e3000,
++ * "qcom,usb-hsphy-snps-femto"), NOT the QUSB2 v2 block the old probe read. */
++#define QUSB2_FEMTO_PA          0x088e3000
++#define QUSB2_FEMTO_SIZE        0x00000110
++#define GCC_QUSB2PHY_PRIM_BCR   0x00012000   /* gcc-kona.c reset_map */
++
++static void sweet_usb_phy_init(vm_offset_t gcc);
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -73,6 +80,71 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++static void
++usb_set(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t val)
++{
++	usb_wr(base, off, (usb_rd(base, off) & ~mask) | (val & mask));
++}
++
++/*
++ * Bring up the Synopsys femto HS PHY. Linux phy-msm-snps-hs.c msm_hsphy_init()
++ * does: power, ref clock, PHY block reset, then the register sequence below.
++ * ABL leaves the PHY in reset/off after handing off (all its registers read 0),
++ * which is why the DWC3 soft reset used to kill the session. The regulator
++ * votes (vdd/vdda18/vdda33) are left as ABL set them; failure shows in the
++ * before/after dump.
++ */
++static void
++sweet_usb_phy_init(vm_offset_t gcc)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_FEMTO_PA, QUSB2_FEMTO_SIZE);
++	if (phy == 0) {
++		printf("SWEET USB: PHY map failed\n");
++		return;
++	}
++	printf("SWEET USB: PHY before 3c=%#x 40=%#x 50=%#x 54=%#x 58=%#x 60=%#x 64=%#x 94=%#x a0=%#x\n",
++	    usb_rd(phy, 0x3c), usb_rd(phy, 0x40), usb_rd(phy, 0x50), usb_rd(phy, 0x54),
++	    usb_rd(phy, 0x58), usb_rd(phy, 0x60), usb_rd(phy, 0x64), usb_rd(phy, 0x94),
++	    usb_rd(phy, 0xa0));
++	/* PHY block reset through GCC_QUSB2PHY_PRIM_BCR (assert, 100us, deassert). */
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 1);
++	delay(200);
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 0);
++	delay(200);
++	printf("SWEET USB: PHY BCR readback %#x\n", usb_rd(gcc, GCC_QUSB2PHY_PRIM_BCR));
++
++	usb_set(phy, 0x94, 0x2, 0x2);         /* CFG0: UTMI_PHY_CMN_CTRL_OVERRIDE_EN */
++	usb_set(phy, 0x50, 0x2, 0x2);         /* UTMI_CTRL5: POR */
++	usb_set(phy, 0x54, 0x70, 0);          /* COMMON0: FSEL = 0 */
++	usb_set(phy, 0x58, 0x20, 0x20);       /* COMMON1: PLLBTUNE */
++	usb_set(phy, 0xa0, 0x3, 0x2);         /* REFCLK_CTRL: REFCLK_SEL = 2 */
++	usb_set(phy, 0x58, 0x10, 0x10);       /* COMMON1: VBUSVLDEXTSEL0 */
++	usb_set(phy, 0x60, 0x1, 0x1);         /* HS_PHY_CTRL1: VBUSVLDEXT0 */
++	/* DT qcom,param-override-seq = <0xe5 0x6c 0xfa 0x70 0x2c 0x74>:
++	 * value, offset pairs (hsusb_phy_write_seq writes seq[i] to seq[i+1]). */
++	usb_wr(phy, 0x6c, 0xe5);
++	usb_wr(phy, 0x70, 0xfa);
++	usb_wr(phy, 0x74, 0x2c);
++	usb_set(phy, 0x5c, 0x1, 0x1);         /* COMMON2: VREGBYPASS */
++	usb_set(phy, 0x64, 0x0c, 0x0c);       /* CTRL2: SUSPEND_N_SEL | SUSPEND_N */
++	usb_set(phy, 0x3c, 0x1, 0x1);         /* UTMI_CTRL0: SLEEPM */
++	usb_set(phy, 0x50, 0x2, 0);           /* UTMI_CTRL5: POR off */
++	usb_set(phy, 0x64, 0x8, 0);           /* CTRL2: SUSPEND_N_SEL off */
++	usb_set(phy, 0x94, 0x2, 0);           /* CFG0: override off */
++	delay(1000);
++	printf("SWEET USB: PHY after  3c=%#x 40=%#x 50=%#x 54=%#x 58=%#x 60=%#x 64=%#x 94=%#x a0=%#x\n",
++	    usb_rd(phy, 0x3c), usb_rd(phy, 0x40), usb_rd(phy, 0x50), usb_rd(phy, 0x54),
++	    usb_rd(phy, 0x58), usb_rd(phy, 0x60), usb_rd(phy, 0x64), usb_rd(phy, 0x94),
++	    usb_rd(phy, 0xa0));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -116,22 +188,10 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	sweet_usb_phy_init(gcc);
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
