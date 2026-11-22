@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 19:37:53.628599630 +0530
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 19:37:53.629224314 +0530
+@@ -901,6 +901,20 @@
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	printf("SWEET LOGDUMP: end\n");
++	/*
++	 * The dump is many lines and scrolls away in under a second. With
++	 * sweetlogdumpwait=N the boot thread holds here for N seconds so the
++	 * block can be read or photographed on the console.
++	 */
++	int hold = 0;
++	PE_parse_boot_argn("sweetlogdumpwait", &hold, sizeof(hold));
++	if (hold > 0) {
++		if (hold > 600) {
++			hold = 600;
++		}
++		printf("SWEET LOGDUMP: holding %d s\n", hold);
++		delay(hold * 1000);
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
