@@ -2,6 +2,56 @@
 
 ## Agent handoff / active work (2026-11-22, latest)
 
+### >>> UPDATE 2026-11-22 #2 (alioth): **iOS 16.7.16 HOME SCREEN + TOUCH WORKING**.
+###     Root cause of the SpringBoard SIGABRT: our ADT had NO /product node <<<
+
+**MILESTONE (user photo `IMG_20261122_123020280.jpg`):** the iPhone X 16.7.16 home screen
+is on the Mi 11X - Settings, App Store, Photos, dock (Messages/Safari/Phone), widgets,
+home indicator. The user **interacted with touch and opened Settings**. Console text is
+still painted at the screen edges because Image G leaves the kernel console on.
+
+**Stage 4 sequence that got here (all today):**
+1. Built the root from the iPhone10,3 16.7.16 (20H392) IPSW: three DMGs (OS 087-86698-044,
+   SystemOS 087-86593-047, AppOS 087-86715-047; CRC-32 verified via `tools/remotezip.py`)
+   -> `tools/mkiosroot.sh` 16 GiB journaled case-sensitive HFS+ ->
+   `~/Documents/Workspace/hackiOS/ios-root/ios16-root-alioth.{img,simg}`.
+2. Flashed userdata (24 sparse chunks, ~286 s). Android internal storage is gone.
+3. First boot (Image D) reached launchd + daemons but **SpringBoard aborted**
+   (`CRASH SpringBoard reason ns 2 code 0x6` = OS_REASON_SIGNAL, SIGABRT) in
+   `SBStartupTransitionLockOut`; heap strings showed it already knew the display
+   (`375x812@3x 60Hz sRGB SDR`), version 20H392, and AKS worked.
+4. Applied `tools/sweet-root-tweaks.py` (Setup skipped, BKNoWatchdogs, migration,
+   containers, audio off) - still aborted.
+5. **ROOT CAUSE: the ADT had no `/product` node.** `tools/mkadt.py` copies it from
+   `research/ipsw-x/d22ap.adt`; that file was missing on this machine, so mkadt printed
+   `warning: ... no /product node` and MobileGestalt lacked the iPhone X product data.
+   Extracted `Firmware/all_flash/DeviceTree.d22ap.im4p` from the same IPSW, decompressed
+   the LZFSE (`bvx2`) payload (pyliblzfse in `/tmp/opencode/lzvenv`; 186084 B) to
+   `research/ipsw-x/d22ap.adt`, regenerated: **ADT 10104 -> 12788 B, product-name
+   "iPhone X"**. Image G with that ADT: **SpringBoard starts and the UI appears.**
+
+**IMAGES (all kernel 0096 + tweaked root in userdata):**
+- D `fe5f627a...` cpus=1, console on, first userland boot (SpringBoard SIGABRT)
+- F `c1c0142c...` cpus=4, console on (same SIGABRT, pre-/product)
+- **G `c8ff725b...` cpus=4, console on, /product ADT -> UI VISIBLE (the milestone image)**
+- **H `6ecfc7e6...` cpus=4, `sweetfb_noconsole=1 sweetfb_hz=30` - clean UI (built, NOT booted)**
+- Boot cmdline used: `debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0
+  unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1
+  launchd_unsecure_cache=1 wdt=-1 sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0`
+  (+ `sweetfb_noconsole=1 sweetfb_hz=30` for H).
+
+**LOGS:** the kernel console ring (patch 0047) is written to the **last 1025 blocks (4 MiB)
+of the userdata partition**, beyond our 16 GiB image, and survives reboots. Retrieval
+options: (a) boot a recovery with ADB and run `tools/sweet-log-pull.sh OUT.txt`;
+(b) add a `sweetlogdump=1` boot-arg so the next boot prints the previous ring to the
+console (needs one CI cycle); (c) the parked USB gadget (QUSB2 PHY is powered down after
+ABL, needs full PHY init).
+
+**NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
+try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
+`redwood_adreno.c`), WiFi/BT (apollo 0126-0152), USB live log. Stage 4 destructive step is
+DONE; returning to Android later needs only a recovery format-data or a fastboot ROM.
+
 ### >>> UPDATE 2026-11-22: TOUCH CONFIRMED WORKING ON THE PHONE (0096). USB gadget
 ###     deferred: QUSB2 PHY is fully powered down after ABL handoff <<<
 

@@ -16,18 +16,17 @@ SM8250-AC / Snapdragon 870). One tree supports both phones: the board is selecte
 defaults are untouched, so sweet keeps building and booting as before.
 
 On sweet, the unmodified iOS 16.7.16 (20H392) userland of the iPhone X runs: launchd, the system
-daemons, backboardd, SpringBoard and the stock apps, with touch and buttons. **On alioth the
-bring-up is at the kernel stage (stage 2 of the porting guide), reached 2026-10-22:** the shim,
-UFS storage driver and the XNU kernel all work, and the kernel boots end to end into the BSD root
-wait — it stops only because no iOS root has been flashed yet. The touch and button drivers are
-sweet-specific (Goodix/I²C, PMIC/SPMI) and are being re-ported for alioth's hardware
-(FocalTech FT3698 over SPI, PM8150 GPIO keys).
+daemons, backboardd, SpringBoard and the stock apps, with touch and buttons. **On alioth the same
+iOS root now boots from internal UFS**: the shim, UFS storage driver, XNU, the alioth touch/key
+drivers and the flashed userland all work, and the SpringBoard home screen renders (first reached
+2026-11-22). GPU acceleration, Wi-Fi and audio are still missing.
 
-> Experimental bring-up, not a usable phone OS. On alioth nothing is installed yet; the iOS root
-> (stage 4) flashes into the `userdata` partition and **erases Android's user data**. Everything
-> here runs with Apple's security model mostly switched off.
+> Experimental bring-up, not a usable phone OS. The iOS root lives in the `userdata` partition and
+> **erased Android's user data** when it was flashed (bootloader, boot, super/recovery, modem and
+> persist are untouched; a recovery format-data or a fastboot ROM returns the phone to Android).
+> Everything here runs with Apple's security model mostly switched off.
 
-## Current status on alioth (2026-10-22)
+## Current status on alioth (2026-11-22)
 
 | Area | State |
 | --- | --- |
@@ -37,8 +36,8 @@ sweet-specific (Goodix/I²C, PMIC/SPMI) and are being re-ported for alioth's har
 | Storage | Own UFS host driver; GPT of the internal UFS parsed. No root volume yet — the kernel waits at `Waiting on <IOMedia, Apple_HFS>` |
 | Kernel | XNU reaches `bsd_init`: AMFI/Sandbox policies, HFS driver, networking stubs all up |
 | Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services registered; panel 1080×2400 from the ABL splash; presented to iOS as an iPhone X panel (1125×2436) |
-| iOS userland | **Not yet** — needs the root image (stage 4, pending: it erases Android user data) |
-| Touch / buttons | **Not yet** — ports in progress: FocalTech FT3698 on QUP SPI SE4, keys on PM8150 GPIO6 |
+| iOS userland | **Running** — the iPhone X 16.7.16 root is flashed into `userdata`; launchd, backboardd, SpringBoard and Settings run, and the home screen renders (first reached 2026-11-22) |
+| Touch / buttons | **Working** — FocalTech FT3698 on QUP SPI SE4 (chip-id 0x5652, 15-bit reports scaled to 1080x2400) and the PM8150 keys driver, both verified on the phone |
 | Battery | Static fallback service (100 %, 4200 mV) registered |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`), same "Hactivation" path as sweet — prepared, untested without a root |
 
