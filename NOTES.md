@@ -56,8 +56,12 @@ in <1 s, so film the boot (video) rather than a single photo if more lines are n
 (c) the parked USB gadget (QUSB2 PHY is powered down after ABL, needs full PHY init).
 
 **SMP VERIFIED ON ALIOTH (2026-11-22, boot log):** `SWEET CPU: requested=4 selected=4
-(limit=8)`, `cpu=1/2/3 PSCI CPU_ON rc=0`, `4/4 CPUs initialized, SG1 verified`. So the
-`cpus=8` test is now low-risk and is the next performance knob. Also observed at mount:
+(limit=8)`, `cpu=1/2/3 PSCI CPU_ON rc=0`, `4/4 CPUs initialized, SG1 verified`. **Then
+`cpus=8` (Image J `cf21aab7...`, video `VID_20261122_150725728.mp4`): `requested=8
+selected=8`, `cpu=1..7 PSCI CPU_ON rc=0`, `8/8 CPUs initialized, SG1 verified`, and the
+iOS LOCK SCREEN renders (date/time + padlock, no console text left on screen). So all
+eight cores including the A77 cluster and prime come up via PSCI - use `cpus=8` from now
+on. Also observed at mount:
 `hfs: mounted IOSRoot on device b(1, 0)`, `hfs: Removed 27 orphaned / unlinked files and 20
 directories` (journal replay after the hard resets), root unsealed, launchd loaded.
 
