@@ -1,0 +1,74 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -31,9 +31,11 @@
+  *   7  read   the GMU's RPMh channel (RSCC 0x3de0000)
+  *   8  read   the GPU's SMMU (kgsl-smmu 0x3da0000, 64 KiB, MMU-500 answered
+  *             by the hypervisor): ID registers, stream match table, CBARs
+- *   9  read   SMMU translation context 0 (the GPU's own)
+- *  10  write  GMU held in reset, two words written into its data memory
++ *   9  write  GMU held in reset, two words written into its data memory
+  *             (DTCM) and read back, then restored: can firmware be loaded?
++ *  10  read   SMMU CBARs and translation context 0. On alioth this freezes
++ *             the bus (the SMMU answers SMR/S2CR but not its CBARs), so it
++ *             is last and opt-in.
+  * After step 4 or later the CX half is collapsed again before returning,
+  * unless boot-arg sweetgpukeep=1. The 3D core (GX) is never powered here.
+  *
+@@ -371,26 +373,15 @@
+ 	for (uint32_t i = 0; i < nsmr && i < 16; ++i)
+ 		printf("SWEET GPU:   smmu smr%u=%#010x s2cr%u=%#010x\n", i, gpu_rd(smmu, SMMU_SMR(i)),
+ 		    i, gpu_rd(smmu, SMMU_S2CR(i)));
+-	for (uint32_t i = 0; i < nctx && i < 16; ++i)
+-		printf("SWEET GPU:   smmu cbar%u=%#010x\n", i, gpu_rd(smmu, pg + 4u * i));
+ 	if (steps < 9)
+ 		goto collapse;
+ 
+-	/* ---- step 9: translation context 0 ---- */
+-	uint32_t cb0 = npg * pg;
+-	printf("SWEET GPU: step 9: read SMMU context 0 at %#x\n", SMMU_PA + cb0);
+-	printf("SWEET GPU:   cb0 sctlr=%#x ttbr0=%#x:%#x tcr=%#x fsr=%#x\n",
+-	    gpu_rd(smmu, cb0 + SMMU_CB_SCTLR), gpu_rd(smmu, cb0 + SMMU_CB_TTBR0 + 4u),
+-	    gpu_rd(smmu, cb0 + SMMU_CB_TTBR0), gpu_rd(smmu, cb0 + SMMU_CB_TCR), gpu_rd(smmu, cb0 + SMMU_CB_FSR));
+-	if (steps < 10)
+-		goto collapse;
+-
+-	/* ---- step 10: the GMU's data memory ---- */
++	/* ---- step 9: the GMU's data memory ---- */
+ 	if (gpu_rd(gmu, GMU_CM3_FW_INIT_RESULT) == 0xbabefaceu) {
+-		printf("SWEET GPU: step 10: firmware is running in the GMU: memory left alone\n");
++		printf("SWEET GPU: step 9: firmware is running in the GMU: memory left alone\n");
+ 		goto collapse;
+ 	}
+-	printf("SWEET GPU: step 10: GMU in reset; write two DTCM words (%#x), read back, restore\n", GMU_PA + GMU_DTCM);
++	printf("SWEET GPU: step 9: GMU in reset; write two DTCM words (%#x), read back, restore\n", GMU_PA + GMU_DTCM);
+ 	gpu_wr(gmu, GMU_CM3_SYSRESET, 1);
+ 	uint32_t was0 = gpu_rd(gmu, GMU_DTCM), was1 = gpu_rd(gmu, GMU_DTCM + 4u);
+ 	gpu_wr(gmu, GMU_DTCM, 0x600d0001u);
+@@ -398,9 +389,26 @@
+ 	uint32_t back0 = gpu_rd(gmu, GMU_DTCM), back1 = gpu_rd(gmu, GMU_DTCM + 4u);
+ 	gpu_wr(gmu, GMU_DTCM, was0);
+ 	gpu_wr(gmu, GMU_DTCM + 4u, was1);
+-	printf("SWEET GPU: step 10: read back %#x %#x: %s\n", back0, back1,
++	printf("SWEET GPU: step 9: read back %#x %#x: %s\n", back0, back1,
+ 	    (back0 == 0x600d0001u && back1 == 0x0a110002u) ?
+ 	    "THE GMU'S MEMORY TAKES WHAT IS WRITTEN: its firmware can be loaded" : "memory does not hold what was written");
++	if (steps < 10)
++		goto collapse;
++
++	/*
++	 * ---- step 10: the SMMU's context banks ----
++	 * ON ALIOTH THIS FREEZES THE BUS (boot T, 2026-11-22): the SMR/S2CR
++	 * tables read fine but the CBAR array does not answer, the same
++	 * secure-ownership wall as the apps SMMU. Kept last and opt-in so
++	 * steps 1-9 stay usable.
++	 */
++	printf("SWEET GPU: step 10: read SMMU CBARs and context 0 (this froze the bus before)\n");
++	for (uint32_t i = 0; i < nctx && i < 16; ++i)
++		printf("SWEET GPU:   smmu cbar%u=%#010x\n", i, gpu_rd(smmu, pg + 4u * i));
++	uint32_t cb0 = npg * pg;
++	printf("SWEET GPU:   cb0 sctlr=%#x ttbr0=%#x:%#x tcr=%#x fsr=%#x\n",
++	    gpu_rd(smmu, cb0 + SMMU_CB_SCTLR), gpu_rd(smmu, cb0 + SMMU_CB_TTBR0 + 4u),
++	    gpu_rd(smmu, cb0 + SMMU_CB_TTBR0), gpu_rd(smmu, cb0 + SMMU_CB_TCR), gpu_rd(smmu, cb0 + SMMU_CB_FSR));
+ 
+ collapse:
+ 	{
