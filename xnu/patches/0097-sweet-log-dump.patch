@@ -1,0 +1,110 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 12:37:30.264656501 +0530
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 12:37:30.265183364 +0530
+@@ -49,6 +49,7 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_log_dump(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+@@ -657,6 +658,7 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	sweet_log_dump();
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -816,6 +818,91 @@
+ 	}
+ }
+ 
++/*
++ * "sweetlogdump=N": print the last N bytes (max 4 MiB) of the console ring
++ * saved by the previous boot (0047/0069 wrote it to the last blocks of the
++ * partition) before this boot's own log starts. This is how a panic or a
++ * daemon crash from the last session can be read off the screen without a
++ * recovery. Output is sanitized: bytes outside printable ASCII are dropped
++ * (NUL padding) or shown as '.', and lines are re-terminated at 128 chars.
++ */
++static void
++sweet_log_dump(void)
++{
++	int want = 0;
++	PE_parse_boot_argn("sweetlogdump", &want, sizeof(want));
++	if (want <= 0) {
++		return;
++	}
++	if ((uint32_t)want > SWEET_LOG_SIZE) {
++		want = SWEET_LOG_SIZE;
++	}
++	if (!su.nblocks || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		printf("SWEET LOGDUMP: partition too small for a saved log\n");
++		return;
++	}
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	struct sweet_log_header h;
++	char line[129];
++	unsigned used = 0;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	if (ufs_read_blocks(base, 1) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("SWEET LOGDUMP: header read failed\n");
++		return;
++	}
++	memcpy(&h, bounce, sizeof(h));
++	if (memcmp(h.magic, "SWEETLOG", 8) != 0 || h.version != 1 ||
++	    h.size != SWEET_LOG_SIZE) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		printf("SWEET LOGDUMP: no saved log in the last blocks\n");
++		return;
++	}
++	uint64_t total = h.total;
++	uint64_t from = total > (uint64_t)want ? total - (uint64_t)want : 0;
++	printf("SWEET LOGDUMP: saved %llu bytes seq %llu, showing the last %llu\n",
++	    total, h.seq, total - from);
++	while (from < total) {
++		uint32_t off = (uint32_t)(from % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint32_t start = off % UFS_BLOCK;
++		uint64_t left = total - from;
++		uint32_t bytes = (uint32_t)MIN((uint64_t)(UFS_BLOCK - start), left);
++		if (ufs_read_blocks(base + 1 + blk, 1) != 0) {
++			printf("SWEET LOGDUMP: read failed at %llu\n", from);
++			break;
++		}
++		const char *p = (const char *)bounce + start;
++		for (uint32_t i = 0; i < bytes; ++i) {
++			char c = p[i];
++			if (c == '\n') {
++				line[used] = 0;
++				printf("%s\n", line);
++				used = 0;
++				continue;
++			}
++			if (c == '\r' || c == 0) {
++				continue;
++			}
++			line[used++] = (c >= 0x20 && c < 0x7f) ? c : '.';
++			if (used == sizeof(line) - 1) {
++				line[used] = 0;
++				printf("%s\n", line);
++				used = 0;
++			}
++		}
++		from += bytes;
++	}
++	if (used) {
++		line[used] = 0;
++		printf("%s\n", line);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET LOGDUMP: end\n");
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 

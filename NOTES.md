@@ -43,9 +43,11 @@ still painted at the screen edges because Image G leaves the kernel console on.
 **LOGS:** the kernel console ring (patch 0047) is written to the **last 1025 blocks (4 MiB)
 of the userdata partition**, beyond our 16 GiB image, and survives reboots. Retrieval
 options: (a) boot a recovery with ADB and run `tools/sweet-log-pull.sh OUT.txt`;
-(b) add a `sweetlogdump=1` boot-arg so the next boot prints the previous ring to the
-console (needs one CI cycle); (c) the parked USB gadget (QUSB2 PHY is powered down after
-ABL, needs full PHY init).
+(b) **patch 0097 `sweetlogdump=N`** - at the next boot the kernel prints the last N bytes
+(max 4 MiB) of the previous session's ring before starting its own log; add
+`sweetlogdump=8192` (or larger) to the cmdline. Sanitized output (printable ASCII, 128-col
+lines) so NUL padding and non-text bytes do not break printf; (c) the parked USB gadget
+(QUSB2 PHY is powered down after ABL, needs full PHY init).
 
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
