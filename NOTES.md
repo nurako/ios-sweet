@@ -48,10 +48,18 @@ options: (a) boot a recovery with ADB and run `tools/sweet-log-pull.sh OUT.txt`;
 `sweetlogdump=8192` (or larger) to the cmdline. Sanitized output (printable ASCII, 128-col
 lines) so NUL padding and non-text bytes do not break printf. **0097 built: CI run
 44996870649 SUCCESS, kernel sha256 `f2349325...e6f367`, Image I `f05a01ea...fb57f` = Image G
-+ `sweetlogdump=16384`.** Note: the dump prints before the UFS/keys/touch lines of the
-current boot, so only its last ~20 lines stay on a 55-line screen - raise the value and
-photograph quickly, or add a post-dump wait if more is needed; (c) the parked USB gadget
-(QUSB2 PHY is powered down after ABL, needs full PHY init).
++ `sweetlogdump=16384`.** VERIFIED ON DEVICE (2026-11-22, 4K video frames): the dump prints
+at UFS init and ends with `SWEET LOGDUMP: end`; the previous session's tail showed a HEALTHY
+SpringBoard (surfaces 1125x2436 created, `SWEET HID: touch 0 down at 784,2374`, AKS sel 17
+calls, `[SpringBoard] trying to set state of nil layer` spam) - no panic. The dump scrolls
+in <1 s, so film the boot (video) rather than a single photo if more lines are needed.
+(c) the parked USB gadget (QUSB2 PHY is powered down after ABL, needs full PHY init).
+
+**SMP VERIFIED ON ALIOTH (2026-11-22, boot log):** `SWEET CPU: requested=4 selected=4
+(limit=8)`, `cpu=1/2/3 PSCI CPU_ON rc=0`, `4/4 CPUs initialized, SG1 verified`. So the
+`cpus=8` test is now low-risk and is the next performance knob. Also observed at mount:
+`hfs: mounted IOSRoot on device b(1, 0)`, `hfs: Removed 27 orphaned / unlinked files and 20
+directories` (journal replay after the hard resets), root unsealed, launchd loaded.
 
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
