@@ -46,7 +46,11 @@ options: (a) boot a recovery with ADB and run `tools/sweet-log-pull.sh OUT.txt`;
 (b) **patch 0097 `sweetlogdump=N`** - at the next boot the kernel prints the last N bytes
 (max 4 MiB) of the previous session's ring before starting its own log; add
 `sweetlogdump=8192` (or larger) to the cmdline. Sanitized output (printable ASCII, 128-col
-lines) so NUL padding and non-text bytes do not break printf; (c) the parked USB gadget
+lines) so NUL padding and non-text bytes do not break printf. **0097 built: CI run
+44996870649 SUCCESS, kernel sha256 `f2349325...e6f367`, Image I `f05a01ea...fb57f` = Image G
++ `sweetlogdump=16384`.** Note: the dump prints before the UFS/keys/touch lines of the
+current boot, so only its last ~20 lines stay on a 55-line screen - raise the value and
+photograph quickly, or add a post-dump wait if more is needed; (c) the parked USB gadget
 (QUSB2 PHY is powered down after ABL, needs full PHY init).
 
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
