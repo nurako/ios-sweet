@@ -92,7 +92,11 @@ world / configured by ABL). live.dts `usb0: ssusb@a600000` has `iommus = <&apps_
 so the controller cannot fetch our physical TRB at 0x104ae5000. Getting the gadget working
 needs either a secure (SCM) SMMU setup like the GPU zap path, or DMA inside a mapping the
 secure side already installed. **Live USB console is therefore parked**; use patch 0097
-`sweetlogdump` (previous boot's ring, printed at UFS init) plus a pause (see next).
+`sweetlogdump` (previous boot's ring, printed at UFS init) plus **0102
+`sweetlogdumpwait=N`** which holds the boot thread on the dump for N seconds so it can be
+read/photographed (`sweetlogdump=8192 sweetlogdumpwait=120 ufslogsecs=1` is the usable
+combination: 1 s flush so the tail is complete). Image Q `a2ad091e...` is that
+configuration with the normal cpus=8/touch/keys setup and sweetusb=0.
 
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
