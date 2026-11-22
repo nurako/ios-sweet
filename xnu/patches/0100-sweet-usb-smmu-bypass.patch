@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 15:59:09.402054087 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-22 15:59:09.402569266 +0530
+@@ -70,6 +70,22 @@
+ #define QUSB2_FEMTO_SIZE        0x00000110
+ #define GCC_QUSB2PHY_PRIM_BCR   0x00012000   /* gcc-kona.c reset_map */
+ 
++/*
++ * The DWC3 node in live.dts carries iommus = <&apps_smmu 0x00 0x00>: on alioth
++ * the USB controller's DMA goes through the apps SMMU (StreamID 0), which is
++ * why STARTTRANSFER wedged with our physical TRB address (0x104ae5000) - the
++ * controller could not fetch it. Linux maps a pool at 0x90000000; we do not
++ * run an IOMMU driver, so put StreamID 0 into BYPASS (S2CR type 1) like UEFI
++ * does, and report the registers so a wrong guess is visible.
++ */
++#define APPS_SMMU_PA       0x15000000
++#define APPS_SMMU_SIZE     0x00100000
++#define SMMU_SCR0          0x0000
++#define SMMU_SMR(n)        (0x0800 + ((n) << 2))
++#define SMMU_S2CR(n)       (0x0c00 + ((n) << 2))
++#define S2CR_TYPE_BYPASS   (1u << 16)
++
++static void sweet_usb_smmu_bypass(void);
+ static void sweet_usb_phy_init(vm_offset_t gcc);
+ 
+ static uint32_t
+@@ -93,6 +109,30 @@
+ 	usb_wr(base, off, (usb_rd(base, off) & ~mask) | (val & mask));
+ }
+ 
++static void
++sweet_usb_smmu_bypass(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetusbsmmu", &on, sizeof(on));
++	if (!on) {
++		printf("SWEET USB: SMMU bypass disabled by boot-arg\n");
++		return;
++	}
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, APPS_SMMU_SIZE);
++	if (smmu == 0) {
++		printf("SWEET USB: SMMU map failed\n");
++		return;
++	}
++	uint32_t scr0 = usb_rd(smmu, SMMU_SCR0);
++	uint32_t smr0 = usb_rd(smmu, SMMU_SMR(0));
++	uint32_t s2cr0 = usb_rd(smmu, SMMU_S2CR(0));
++	printf("SWEET USB: SMMU sCR0=%#x SMR0=%#x S2CR0=%#x\n", scr0, smr0, s2cr0);
++	usb_wr(smmu, SMMU_S2CR(0), S2CR_TYPE_BYPASS);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET USB: SMMU S2CR0 now %#x (want %#x)\n",
++	    usb_rd(smmu, SMMU_S2CR(0)), S2CR_TYPE_BYPASS);
++}
++
+ /*
+  * Bring up the Synopsys femto HS PHY. Linux phy-msm-snps-hs.c msm_hsphy_init()
+  * does: power, ref clock, PHY block reset, then the register sequence below.
+@@ -188,6 +228,7 @@
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++	sweet_usb_smmu_bypass();
+ 	sweet_usb_phy_init(gcc);
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
