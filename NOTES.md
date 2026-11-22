@@ -78,6 +78,22 @@ SUSPEND_N_SEL off, override off - with before/after register dumps. Round-trip O
 xnu-cc 0 of 1 failed. Needs one CI run; if the PHY comes up, the existing gadget path
 (sweetusb=2) should finally enumerate.
 
+**USB: BLOCKED BY THE SECURE-OWNED APPS SMMU (2026-11-22, Image P log).** The femto PHY
+fix (0098) and the 64-bit PAR0/PAR1 fix (0099) both landed: the PHY now reads non-zero
+(`54=0x80800000 58=0x1b3b3b 60=0x1010101 64=0x60606`), the DWC3 soft reset completes, and
+ep0 config succeeds (`DALEPENA=0x3 DCTL=0x0 DSTS=0x2d2001`). It still wedges inside the
+first `DEPCMD_STARTTRANSFER` (no timeout print => the AHB access itself stalls). Patch 0101
+prints the SMMU right before it: `sCR0=0x240406 SMR0=0x800000e0 S2CR0=0x20000`. sCR0 bit0
+(CLIENTPD) is 0, so the SMMU is translating, and S2CR0 type = 2 = **FAULT** - and our 0100
+bypass write (`0x10000`) did **not** stick. Same behaviour UniXNU-alioth recorded for the
+GPU SMMU: writes from EL1 are accepted but have no effect (the SMMU is owned by the secure
+world / configured by ABL). live.dts `usb0: ssusb@a600000` has `iommus = <&apps_smmu 0x00
+0x00>`, `qcom,iommu-dma = "atomic"`, `qcom,iommu-dma-addr-pool = <0x90000000 0x60000000>`,
+so the controller cannot fetch our physical TRB at 0x104ae5000. Getting the gadget working
+needs either a secure (SCM) SMMU setup like the GPU zap path, or DMA inside a mapping the
+secure side already installed. **Live USB console is therefore parked**; use patch 0097
+`sweetlogdump` (previous boot's ring, printed at UFS init) plus a pause (see next).
+
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
 `redwood_adreno.c`), WiFi/BT (apollo 0126-0152), USB live log. Stage 4 destructive step is
