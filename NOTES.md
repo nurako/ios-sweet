@@ -123,6 +123,26 @@ is safe. Patch 0104 adds phase 2 (steps 4-6: clear CX collapse, GPLL0 votes + GP
 clocks + GMU 200 MHz + GPUCC branches, then read GMU and its always-on counter; CX is
 re-collapsed unless `sweetgpukeep=1`). Image S `c154b8fd...` is `sweetgpu=6`.
 
+**GPU CX/GMU ALIVE ON ALIOTH (2026-11-22, Image S `c154b8fd...`, `sweetgpu=6`, patch 0104).**
+The first GPU writes work and do not freeze the phone:
+- step 4: `cx gdsc 0x106c = 0xf0222000`, `cx hw ctrl = 0x00001fe0` -> **CX ON**
+- step 5: `gcc_gpu_memnoc_gfx` / `snoc_dvm_gfx` / `ddrss_gpu_axi` all **running**; GMU clock
+  source `0x00000001 -> 0x00000602` (200 MHz), `gpu_cc_cxo`, `ahb`, `cx_snoc_dvm`, `cx_gmu`
+  (`0x80004221`) and `hlos1_vote_smmu` (`0x1`) all **running** (`cx_apb` reads off, status not
+  reliable on this branch)
+- step 6: GMU readable: `cm3_sysreset 0x1`, `cm3_cfg 0x00004052`, `rpmh_power_state 0xf`,
+  `sptprac_pwr_clk_status 0xc0`, `ao_gpu_cx_busy 0x30000000`, and
+  **`GMU always-on counter 0x520ba counts 19198456 Hz` = the 19.2 MHz crystal, THE GPU BLOCK
+  IS ALIVE**. CX is then collapsed again (`0x00222001`), i.e. default is safe; use
+  `sweetgpukeep=1` to leave it on.
+
+**NEXT GPU STAGE (apollo 0098, steps 7-10, our next patch):** read the GMU's RPMh channel
+(RSCC 0x3de0000), read the GPU's own SMMU (kgsl-smmu 0x3da0000, MMU-500 "under the
+hypervisor" - note the apps-SMMU lesson above, but this one is a separate instance), read
+SMMU context 0, then hold the GMU in reset and test-write two words of its DTCM. Apollo also
+ships `sweet_cpufreq.c` in the same patch (EPSS LUT at 0x320/0x100, rows 4 bytes); we have
+no cpufreq driver yet and cores stay at the bootloader level - worth porting separately.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
