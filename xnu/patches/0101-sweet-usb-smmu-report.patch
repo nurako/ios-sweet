@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 16:27:01.980027520 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-22 16:27:01.980337574 +0530
+@@ -86,6 +86,7 @@
+ #define S2CR_TYPE_BYPASS   (1u << 16)
+ 
+ static void sweet_usb_smmu_bypass(void);
++static void sweet_usb_smmu_report(const char *tag);
+ static void sweet_usb_phy_init(vm_offset_t gcc);
+ 
+ static uint32_t
+@@ -110,6 +111,17 @@
+ }
+ 
+ static void
++sweet_usb_smmu_report(const char *tag)
++{
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, APPS_SMMU_SIZE);
++	if (smmu == 0) {
++		return;
++	}
++	printf("SWEET USB: SMMU %s sCR0=%#x SMR0=%#x S2CR0=%#x\n", tag,
++	    usb_rd(smmu, SMMU_SCR0), usb_rd(smmu, SMMU_SMR(0)), usb_rd(smmu, SMMU_S2CR(0)));
++}
++
++static void
+ sweet_usb_smmu_bypass(void)
+ {
+ 	int on = 1;
+@@ -1048,7 +1060,9 @@
+ 	}
+ 	printf("SWEET USB: ep cfg SETXFER1 ok\n");
+ 	dwc_wr(DALEPENA, 0x3);
+-	printf("SWEET USB: starting setup TRB\n");
++	printf("SWEET USB: starting setup TRB DALEPENA=0x%x DCTL=0x%x DSTS=0x%x DCFG=0x%x\n",
++	    dwc_rd(DALEPENA), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(DCFG));
++	sweet_usb_smmu_report("pre-SETUP");
+ 	ud_start_setup();
+ 	printf("SWEET USB: ep0 configured DALEPENA=0x%x\n", dwc_rd(DALEPENA));
+ 
