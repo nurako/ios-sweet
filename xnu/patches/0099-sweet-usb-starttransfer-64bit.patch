@@ -1,0 +1,20 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 15:38:54.786258541 +0530
++++ b/bsd/dev/sweet_usb.c	2026-11-22 15:38:54.786798690 +0530
+@@ -365,7 +365,16 @@
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	/*
++	 * PAR0 takes the LOW 32 bits of the TRB address and PAR1 the HIGH 32
++	 * (Linux dwc3: DEPCMDPAR0 = lower_32_bits(trb->dma), PAR1 = upper).
++	 * The old order (high first) only worked on sweet because its DMA
++	 * memory sits below 4 GiB, so high was 0; alioth's DMA is at
++	 * 0x104ae4000 and the swapped value made the controller fetch a wild
++	 * TRB address and wedge right after "starting setup TRB".
++	 */
++	printf("SWEET USB: STARTTRANSFER ep%u trb=0x%llx\n", ep, tpa);
++	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)tpa, (uint32_t)(tpa >> 32), 0);
+ }
+ 
+ static void
