@@ -110,6 +110,19 @@ identical to apollo). Round-trip OK; xnu-cc 0 of 1 failed. NOTE: the apps SMMU b
 secure-owned (above) is the same wall the GPU GMU/SMMU path hits in UniXNU's notes, so
 expect the GPU SMMU stage to need the secure route or a working bypass.
 
+**GPU PHASE 1 RESULT (alioth boot R, Image `f2eff179...`, `sweetgpu=3`):**
+`gcc_gpu_cfg_ahb 0x71004 = 0x80000001` (running/enabled, so step 2 wrote nothing),
+`gcc_gpu_memnoc_gfx 0x7100c = 0x80000021` off, `gcc_gpu_snoc_dvm_gfx 0x71018 = 0x80006681`
+off, `gcc_gpu_iref_en 0x8c014 = 0` off, `gcc vote 0x52000 = 0x01280d7f`. GPUCC reachable:
+PLL1 `0x00000000` (not locked), GMU RCG cmd `0x00000000` cfg `0x00000601`, `gpu_cc_ahb`
+and `gpu_cc_cxo` `0x80000001` (enabled, halted), `gpu_cc_cx_gmu 0x80004220` off,
+`gpu_cc_gx_gmu 0x80000000` off, `gpu_cc_cx_snoc_dvm 0x80000000` off,
+`gpu_cc_hlos1_vote_smmu 0`, `cx gdsc 0x00222001` (off, sw-collapse requested, NOT under
+hw control - same value apollo saw on boot 11), `gx domain 0x0003c001`. No freeze: phase 1
+is safe. Patch 0104 adds phase 2 (steps 4-6: clear CX collapse, GPLL0 votes + GPU bus
+clocks + GMU 200 MHz + GPUCC branches, then read GMU and its always-on counter; CX is
+re-collapsed unless `sweetgpukeep=1`). Image S `c154b8fd...` is `sweetgpu=6`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
