@@ -98,6 +98,21 @@ read/photographed (`sweetlogdump=8192 sweetlogdumpwait=120 ufslogsecs=1` is the 
 combination: 1 s flush so the tail is complete). Image Q `a2ad091e...` is that
 configuration with the normal cpus=8/touch/keys setup and sweetusb=0.
 
+**GPU PHASE 1 PORTED (2026-11-22):** `0103-sweet-gpu-phase1.patch` adds `bsd/dev/sweet_gpu.c`
+(adapted from aTechGeekDev/ios-apollo 0096, which descends from hackios-xnu-kernel's
+redwood_adreno.c) plus the `bsd/conf/files` entry and a `sweet_gpu_init()` call after
+`sweet_usb_probe()` in `sweet_ufs_init`. Read-only unless boot-arg `sweetgpu=N`:
+step 1 GCC GPU clocks (gcc_gpu_cfg_ahb 0x71004, memnoc 0x7100c, snoc 0x71018, iref 0x8c014,
+vote 0x52000), step 2 gate write, step 3 GPUCC 0x3d90000 (PLL1 0x100, GMU RCG 0x1120, CX
+GDSC 0x106c, GX domain 0x1508, CX HW ctrl 0x1540, SMMU vote 0x5000). Addresses verified
+against alioth live.dts (gpucc@3d90000, kgsl-3d0@3d00000, gmu@3d6a000, kgsl-smmu@3da0000 -
+identical to apollo). Round-trip OK; xnu-cc 0 of 1 failed. NOTE: the apps SMMU being
+secure-owned (above) is the same wall the GPU GMU/SMMU path hits in UniXNU's notes, so
+expect the GPU SMMU stage to need the secure route or a working bypass.
+
+**REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
+reports iOS 27 working; useful for userland/driver compatibility questions later.
+
 **NEXT IDEAS (in order):** boot H for a clean UI session and verify touch/keys in SpringBoard;
 try `cpus=8` (SMP only tested to 4); then GPU (ios-apollo patches 0107-0186 / ios-alioth
 `redwood_adreno.c`), WiFi/BT (apollo 0126-0152), USB live log. Stage 4 destructive step is
