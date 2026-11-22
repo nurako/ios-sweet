@@ -280,6 +280,16 @@ Ranked by usefulness to alioth (SM8250-AC, Adreno 650, our same ios-sweet base):
    board-independent.
 4. **`UniXNU/UniXNU`** (general non-Apple ARM64 iOS/macOS boot stack) -
    NativeAdreno / NativeMetal / AirNir, BSD-2-Clause-Patent, reusable patches.
+5. **`FFT-infra/UniXNU-alioth`** (Redmi K40 = **alioth**, same SM8250-AC) - the most
+   advanced GPU state on this exact board (user-provided 2026-11-22). UEFI + xnuloader,
+   donor iPad7,1 iPadOS 17.7.11. **Staged Metal accelerator works**: Adreno650 driver +
+   AdrenoMetal/Turnip render the desktop and the J120 wallpaper
+   (`SUPER sw=8/8/0 own=1`, `PANEL 916`, `GPUCLI clients=8`); widgets absent, no WiFi.
+   Reusable: `drivers/Adreno650`, `drivers/AdrenoMetal` (NativeTurnipSwapTest,
+   `scripts/metallib.py`), `package/GpuFirmwareA650.c`, `GpuPowerBoard.h`, `GpuProbe.cpp`,
+   `scripts/build-adreno*-plugin.py`, and `docs/evidence/*` with the A650 bring-up order
+   (GMEM colour-order test, SMMU slot, presentation fixes, GPU freq poll issue,
+   stale-Metal addon). `porting.toml` is their verified-status source.
 
 Two viable render paths: kernel Adreno driver + Mesa freedreno (OpenGL ES) feeding
 CoreAnimation, or metal2vulkan + Turnip for Metal. Software framebuffer fallback
