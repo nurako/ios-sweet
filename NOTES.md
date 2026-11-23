@@ -220,6 +220,21 @@ SWEET GPU: GMU held in reset again; RPMh channel asleep; stream and SMMU context
 So the whole GMU path works and tears down cleanly. Next: steps 15-17 (RPMh votes + 3D core
 power), 18-19 (SQE + CP), 20 (zap via SCM).
 
+**3D CORE POWERED ON ALIOTH (Image AA `ca2c7fc2...`, `sweetgpu=17`):**
+```
+step 15: cmd_db … gfx.lvl 11 levels 0 48 64 128 144 192 224 256 320 384 416;
+         cx.lvl 9 levels …; mx.lvl 9 levels …; bus MC0/SB0/ACV/CN0 at 0x58000/…/0x58074
+step 16: HFI tables accepted (GPU speeds, bus votes), core firmware start, start
+         → THE GMU HAS ITS TABLES AND IS STARTED
+step 17: ask 305 MHz (level 1) then the 3D core's power
+         after: gx gdsc 0xf8222800 (was 0x00222001), gx domain 0x3c0000,
+                pll0 0xd9000005 L=0x1f (595 MHz if locked), rpmh_power_state 0
+         rbbm_status 0x1, rbbm_int_0_status 0, rbbm_clock_cntl 0, cp_rb_base 0
+         → THE 3D CORE HAS POWER AND ANSWERS
+teardown: OOB clear, prepare slumber, GMU held in reset, RPMh asleep, stream/SMMU
+          context off, CX collapsed, done after step 17
+```
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
