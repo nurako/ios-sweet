@@ -1,0 +1,68 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -829,6 +829,30 @@
+  * recovery. Output is sanitized: bytes outside printable ASCII are dropped
+  * (NUL padding) or shown as '.', and lines are re-terminated at 128 chars.
+  */
++/*
++ * Optional line filter: "sweetloggrep=SWEET GPU" prints only the lines that
++ * contain the string. The ring's tail is dominated by userland spam (exec,
++ * AKS, the process sampler), so without a filter the interesting boot-time
++ * lines are megabytes back and can never be on screen at once.
++ */
++static const char *
++logdump_filter(void)
++{
++	static char pat[64];
++	if (pat[0] != '\0' || PE_parse_boot_argn("sweetloggrep", pat, sizeof(pat))) {
++		return pat[0] ? pat : NULL;
++	}
++	return NULL;
++}
++
++static void
++logdump_emit(const char *line, const char *pat)
++{
++	if (pat == NULL || strnstr(line, pat, strlen(line)) != NULL) {
++		printf("%s\n", line);
++	}
++}
++
+ static void
+ sweet_log_dump(void)
+ {
+@@ -849,6 +873,7 @@
+ 	struct sweet_log_header h;
+ 	char line[129];
+ 	unsigned used = 0;
++	const char *pat = logdump_filter();
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	if (ufs_read_blocks(base, 1) != 0) {
+@@ -882,7 +907,7 @@
+ 			char c = p[i];
+ 			if (c == '\n') {
+ 				line[used] = 0;
+-				printf("%s\n", line);
++				logdump_emit(line, pat);
+ 				used = 0;
+ 				continue;
+ 			}
+@@ -892,7 +917,7 @@
+ 			line[used++] = (c >= 0x20 && c < 0x7f) ? c : '.';
+ 			if (used == sizeof(line) - 1) {
+ 				line[used] = 0;
+-				printf("%s\n", line);
++				logdump_emit(line, pat);
+ 				used = 0;
+ 			}
+ 		}
+@@ -900,7 +925,7 @@
+ 	}
+ 	if (used) {
+ 		line[used] = 0;
+-		printf("%s\n", line);
++		logdump_emit(line, pat);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	printf("SWEET LOGDUMP: end\n");
