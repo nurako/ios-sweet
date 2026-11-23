@@ -41,7 +41,7 @@ and Metal are not there yet.
 | Touch | **Working** — FocalTech FT3698 on QUP SPI SE4 (`0x990000`), chip-id `0x5652`, MSB-first FIFO packing, 15-bit reports scaled from the 8640×19200 firmware space |
 | Buttons | **Working** — PM8150 GPIO6 (power) and volume keys, reported through the alioth keys driver |
 | Battery | Static fallback service (100 %, 4200 mV) |
-| GPU | **Staged bring-up, in progress**: GCC/GPUCC clocks, CX power on, GMU clocked at 200 MHz, `a650_gmu.bin` running (`fw_init_result 0x100`), HFI tables and start accepted, and **the 3D core powers on and answers** (`gx gdsc 0xf8222800`, `rbbm_status 0x1`). SQE/CP start and the zap shader are next; no Metal yet |
+| GPU | **Staged bring-up, in progress**: GCC/GPUCC clocks, CX power on, GMU clocked at 200 MHz, `a650_gmu.bin` running (`fw_init_result 0x100`), HFI tables and start accepted, and **the 3D core powers on and answers** (`gx gdsc 0xf8222800`, `rbbm_status 0x1`), the SQE microcode is loaded, the command processor starts and takes `CP_ME_INIT` ("the 3D core takes commands"). The zap shader (leaving secure mode) and Metal are next |
 | USB (gadget console) | **Blocked**: the femto HS PHY and DWC3 come up (`ep0` configured), but the apps SMMU translates StreamID 0 with a faulting S2CR and EL1 writes do not take, so the controller cannot fetch our DMA descriptors |
 | Wi-Fi / BT / cellular / audio / camera | Not working (no drivers) |
 | Logging | Kernel console ring persisted in the last 4 MiB of `userdata`, readable at the next boot with `sweetlogdump` / `sweetloggrep` (see below) |
@@ -214,10 +214,12 @@ about to touch. Verified on alioth so far:
 - steps 11–14: `a650_gmu.bin` loaded from the ADT, **GMU firmware running** (`fw_init_result
   0x100`), and the HFI message queues up;
 - steps 15–17: the RPMh command DB is read, the HFI speed/bus/start messages are accepted, and
-  the **3D core powers on**: `gx gdsc 0x00222001 → 0xf8222800`, `rbbm_status 0x1`.
+  the **3D core powers on**: `gx gdsc 0x00222001 → 0xf8222800`, `rbbm_status 0x1`;
+- steps 18–19: the ring and SQE microcode are mapped through SMMU context 0, the core's
+  `hw_init` registers are set, the command processor starts and takes `CP_ME_INIT` — "the 3D
+  core takes commands".
 
-Not yet: steps 18–19 (SQE microcode and the command processor) and 20 (the zap shader through
-TrustZone, `sweetgpuzap`).
+Not yet: step 20 (the zap shader through TrustZone, `sweetgpuzap`), then actual rendering/Metal.
 
 A lesson worth keeping: SMMU/GMU registers are emulated by the hypervisor and only plain,
 non-inlined single `ldr`/`str` accesses work — a C loop can compile to a post-indexed load and

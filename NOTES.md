@@ -235,6 +235,23 @@ teardown: OOB clear, prepare slumber, GMU held in reset, RPMh asleep, stream/SMM
           context off, CX collapsed, done after step 17
 ```
 
+**CP TAKES COMMANDS (Image AB `6c5d2b13...`, `sweetgpu=19`):**
+```
+step 18: SMMU context 0 <- tables 0x15be9000, stream 0 mask 0x401 via match 0;
+         read back smr0=0x04010000 s2cr0=0 cbar0=… sctlr=… ttbr0=… tcr=0x80351f fsr=0x400
+step 18: the core's ring and microcode mapped; rbbm_status 0x1
+step 18: a650_sqe.fw 31632 bytes, version word 0x…d03 (0xd03: older than Linux's
+         minimum 0x95 in their numbering; vendor kgsl runs it) - used for our own
+         commands only
+step 19: the core's registers (Linux a6xx hw_init, a650); after start:
+         status 0x1, int 0, cp_fault 0, sp_int 0, prot 0, rptr 0
+step 19: give it CP_ME_INIT (ring words 0..8): rptr 9 of 9, status 0x1, cp_fault 0
+step 19: THE 3D CORE TAKES COMMANDS
+teardown: core halted (gblf halt_ack 0x3), given back, slumber, GMU reset, CX collapsed
+```
+Next: step 20, the zap shader via TrustZone SCM (`sweetgpuzap=3` default), the last gate
+before leaving secure mode.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
