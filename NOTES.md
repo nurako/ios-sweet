@@ -208,6 +208,18 @@ So the earlier freezes were the hypervisor's trap limitation, not secure ownersh
 firmware can be loaded. Next: step 14 (GMU firmware from the ADT + HFI queues), then 17
 (3D core power), 19 (SQE + CP), 20 (zap via SCM). Image Z `10e8fb4d...` is `sweetgpu=14`.
 
+**GMU FIRMWARE RUNS ON ALIOTH (Image Z `10e8fb4d...`, `sweetgpu=14`):**
+```
+step 12: THE GPU'S FIRMWARE IS LOADED; versions core 0x2 … power 0x20100000 hfi 0x20000001
+step 13: RSCC program (a650 family), PDC enable (0x088); GMU configuration, chip 0x6050200
+step 13: fw_init_result 0x100 … THE GPU'S FIRMWARE RUNS
+step 14: hfi_ctrl_status 0x1 hfi_version 0x20000001 … THE GPU'S MESSAGE QUEUES ARE UP
+SWEET GPU: GMU held in reset again; RPMh channel asleep; stream and SMMU context off again;
+           CX collapsed again; done after step 14
+```
+So the whole GMU path works and tears down cleanly. Next: steps 15-17 (RPMh votes + 3D core
+power), 18-19 (SQE + CP), 20 (zap via SCM).
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
