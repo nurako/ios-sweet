@@ -178,6 +178,23 @@ boots 22-24 of that ladder "work" and leave secure mode by default.
 usable recipe is `sweetlogdump=4194304 sweetloggrep=GPU: sweetlogdumpwait=120 ufslogsecs=1`,
 and cap the previous session before userland fills the ring.
 
+**GPU: FULL STAGED BRING-UP ADOPTED (2026-11-23, patch 0109).** Our phase-1/2 file (0103-0106)
+is replaced by aTechGeekDev/ios-apollo's complete staged driver (`bsd/dev/sweet_gpu.c`,
+steps 1-21, ~1900 lines, attribution kept). Their header records the same CBAR freeze we hit
+on boot T and its real cause - **not** secure ownership: the hypervisor traps SMMU/GMU
+accesses and only handles plain single-register ldr/str, and a compiled post-indexed load
+froze the phone. Their accessors are `__attribute__((noinline))` single `ldr`/`str`, CBAR
+moved to step 9, and the probe runs on its own thread `sweetgpudelay` seconds (default 15)
+after the drivers start so the persistent log keeps everything.
+Steps: 1-10 GCC/GPUCC/CX/GMU/SMMU/DTCM probes, 11-14 GMU firmware from ADT + HFI start,
+15-17 RPMh cmd_db votes + 3D core power, 18-19 SQE microcode + CP start, **20 zap shader via
+TrustZone SCM** (PAS image 13, `sweetgpuzap` ladder, default 3), 21 leave secure mode.
+`tools/mkadt.py` now takes `--gmu-fw --sqe-fw --zap-mdt --zap-seg` and emits a `/sweet-gpu`
+node (alioth ADT grows 12788 -> 94744 bytes). Firmware came from FFT-infra/UniXNU-alioth's
+`package/GpuFirmwareA650.c` (gmu 41548, sqe 31632, zap.mdt 6860, zap.b02 1676) into
+`research/alioth-gpu/` (gitignored). Image Y `f3813ca0...` = kernel 0109 + fw ADT +
+`sweetgpu=10 sweetgpudelay=5`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
