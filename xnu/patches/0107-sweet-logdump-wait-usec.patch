@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -916,7 +916,8 @@
+ 			hold = 600;
+ 		}
+ 		printf("SWEET LOGDUMP: holding %d s\n", hold);
+-		delay(hold * 1000);
++		/* XNU delay() counts microseconds, not milliseconds. */
++		delay(hold * 1000000);
+ 	}
+ }
+ 
