@@ -143,7 +143,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, board='sweet'):
+def build(seed=None, qemu=False, highmem=False, board='sweet', gpu_props=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     PHYS_BASE, MEM_SIZE = b['PHYS_BASE'], b['MEM_SIZE']
@@ -310,6 +310,10 @@ def build(seed=None, qemu=False, highmem=False, board='sweet'):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # GPU firmware for bsd/dev/sweet_gpu.c: trust-zone-visible blobs live in
+    # the ADT as raw properties (SecureDTLookupEntry("/sweet-gpu")).
+    gpu = [node('sweet-gpu', [ph()] + list(gpu_props))] if gpu_props else []
+
     return node('device-tree', [
         ph(),
         ('compatible', b''.join(cstr(s) for s in COMPAT)),
@@ -319,7 +323,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet'):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + gpu + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
@@ -328,7 +332,16 @@ if __name__ == '__main__':
         board = sys.argv[sys.argv.index('--board') + 1]
         if board not in BOARDS:
             raise SystemExit(f'unknown board {board!r}; have {", ".join(BOARDS)}')
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board)
+    # GPU firmware blobs (Adreno 650): --gmu-fw, --sqe-fw, --zap-mdt, --zap-seg.
+    gpu_props = []
+    for opt, prop in (('--gmu-fw', 'gmu-firmware'), ('--sqe-fw', 'sqe-firmware'),
+                      ('--zap-mdt', 'zap-metadata'), ('--zap-seg', 'zap-segment')):
+        if opt in sys.argv:
+            data = open(sys.argv[sys.argv.index(opt) + 1], 'rb').read()
+            print(f'{opt}: {len(data)} bytes -> /sweet-gpu {prop}', file=sys.stderr)
+            gpu_props.append((prop, data))
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board,
+                 gpu_props=gpu_props)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
