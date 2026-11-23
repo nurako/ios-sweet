@@ -157,6 +157,27 @@ no cpufreq driver yet and cores stay at the bootloader level - worth porting sep
 - Patch 0106 reorders: **step 9 = GMU DTCM write/read test**, **step 10 = SMMU CBAR/context
   reads** (last, opt-in, documented as freezing). Image U `0fcb540c...` is `sweetgpu=9`.
 
+**GMU DTCM ACCESS FREEZES (2026-11-23, boot U dumped by Image X, `sweetloggrep=GPU:`):**
+the filtered dump ends at
+
+```
+SWEET GPU: step 9: GMU in reset; write two DTCM words (0x3d6bc00), read back, restore
+SWEET LOGDUMP: holding 120 s
+```
+
+i.e. the `read back` line never printed: the session froze on the GMU reset/DTCM access (with
+`wdt=-1` it never reboots). So the GMU registers are readable but its data memory is not
+reachable from EL1 - consistent with the SMMU walls. **GPU firmware cannot be booted from
+EL1.** aTechGeekDev/ios-apollo's later patches confirm the real route: the **zap shader via
+SCM/TrustZone** (`sweetgpuzap` ladder, 0105-0109: PAS_INIT_IMAGE authenticates `a650_zap.mdt`
+added to the ADT by `mkadt.py --zap-mdt --zap-seg`, then CP_SET_SECURE_MODE 0). They report
+boots 22-24 of that ladder "work" and leave secure mode by default.
+
+**LOG-DUMP TOOLING (now solid):** 0097 dump + 0102 `sweetlogdumpwait=N` + 0107 (seconds, XNU
+`delay()` is microseconds) + 0108 `sweetloggrep=STRING` (whole 4 MiB ring, filtered) - the
+usable recipe is `sweetlogdump=4194304 sweetloggrep=GPU: sweetlogdumpwait=120 ufslogsecs=1`,
+and cap the previous session before userland fills the ring.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
