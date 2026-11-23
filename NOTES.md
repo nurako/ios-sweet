@@ -195,6 +195,19 @@ node (alioth ADT grows 12788 -> 94744 bytes). Firmware came from FFT-infra/UniXN
 `research/alioth-gpu/` (gitignored). Image Y `f3813ca0...` = kernel 0109 + fw ADT +
 `sweetgpu=10 sweetgpudelay=5`.
 
+**SMMU/DTCM UNBLOCKED (Image Y `f3813ca0...`, `sweetgpu=10`):** with the `noinline`
+single-access helpers, step 9 (CBARs + context 0) and step 10 both complete on alioth:
+
+```
+SWEET GPU: step 10: read back 0x600d0001 0x0a110002:
+           THE GMU'S MEMORY TAKES WHAT IS WRITTEN: its firmware can be loaded
+SWEET GPU: done after step 10
+```
+
+So the earlier freezes were the hypervisor's trap limitation, not secure ownership, and GPU
+firmware can be loaded. Next: step 14 (GMU firmware from the ADT + HFI queues), then 17
+(3D core power), 19 (SQE + CP), 20 (zap via SCM). Image Z `10e8fb4d...` is `sweetgpu=14`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
