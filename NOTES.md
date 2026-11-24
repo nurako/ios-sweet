@@ -262,6 +262,13 @@ whatever shader it already has. The driver then commands `CP_SET_SECURE_MODE 0` 
 (`done after step 20`). Open question: whether the CP is really out of secure mode without an
 authenticated shader of our own, or whether TrustZone's retained shader is doing the work.
 
+**UI RE-VERIFIED + PosterBoard CRASH EXPLAINED (2026-11-24, Image AD `7569f43d...`):** home
+screen loads, touch and buttons work. The `CRASH PosterBoard … sig 5 code 0x60000001 … reason
+ns 2 code 0x5` line that appears once before the home screen is the lock-screen/wallpaper daemon
+aborting - it needs Metal/GPU rendering, which does not exist yet. It is not a regression and it
+does not loop. Also seen: `hfs_clonefile: cluster_write failed - 34` during userland writes
+(benign-looking; revisit if writes fail).
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
