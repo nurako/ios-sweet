@@ -252,6 +252,16 @@ teardown: core halted (gblf halt_ack 0x3), given back, slumber, GMU reset, CX co
 Next: step 20, the zap shader via TrustZone SCM (`sweetgpuzap=3` default), the last gate
 before leaving secure mode.
 
+**ZAP / SECURE MODE (Image AC `fac24bc3...`, `sweetgpu=20`):** TrustZone answers the whole
+safe-query ladder (`is-call-available` 0, signature call present, authenticate-and-reset present,
+audio/modem/video probes) and reads our zap metadata (3 ELF segments, hashes 6712, file 6860).
+The **signature call is refused**: `smc 0x42000001 args 0x02 (0xd, 0x10d2b4000, 0)` returns
+**-3145797**, answer 0 - "a kernel before this one may already hold one", so TrustZone keeps
+whatever shader it already has. The driver then commands `CP_SET_SECURE_MODE 0` (rptr 11 of 11,
+`cp_int 0x1`) and reports **THE 3D CORE IS OUT OF SECURE MODE**, then tears down cleanly
+(`done after step 20`). Open question: whether the CP is really out of secure mode without an
+authenticated shader of our own, or whether TrustZone's retained shader is doing the work.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
