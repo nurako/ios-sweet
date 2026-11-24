@@ -1,0 +1,49 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -759,6 +759,27 @@
+  * qcom_mdt_pas_init): a 32-bit ELF, program headers from byte 52, 32 bytes
+  * each, the hash segment's size the file size of program header 1.
+  */
++/*
++ * Same metadata, but placed in the GPU's reserved PIL region (0x8681a000, below
++ * 4 GiB) instead of a kernel page. TrustZone refused the kernel page on alioth
++ * (-3145797) even after a cold power cycle; the PIL region is the memory the
++ * PAS protocol expects TrustZone to touch.
++ */
++static bool
++gpu_zap_header_low(const uint8_t *mdt, unsigned int size, uint64_t *phys)
++{
++	if (size > 0x2000u)     /* the whole pil_gpu_region on alioth */
++		return false;
++	vm_offset_t at = ml_io_map_wcomb(ZAP_MEMORY_PA, round_page(size));
++	if (!at)
++		return false;
++	for (unsigned int i = 0; i < size; ++i)
++		((volatile uint8_t *)at)[i] = mdt[i];
++	__asm__ volatile("dsb sy" ::: "memory");
++	*phys = ZAP_MEMORY_PA;
++	return true;
++}
++
+ static bool
+ gpu_zap_header(const uint8_t *mdt, unsigned int size, uint64_t *phys)
+ {
+@@ -1837,6 +1858,18 @@
+ 	printf("SWEET GPU: step 20: hand TrustZone the zap shader's signature to check (image %u)\n", PAS_GPU);
+ 	sig = gpu_scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER,
+ 	    PAS_GPU, zap_header_pa, 0, &zap_answer);
++	if (sig != 0 || zap_answer != 0) {
++		uint64_t low_pa = 0;
++		if (gpu_zap_header_low(zap_mdt, zap_mdt_size, &low_pa)) {
++			printf("SWEET GPU: step 20: the kernel page at %#llx was refused; trying the PIL region at %#llx "
++			    "(below 4 GiB)\n", (unsigned long long)zap_header_pa, (unsigned long long)low_pa);
++			zap_answer = ~0ull;
++			sig = gpu_scm("to take the zap shader's signature from the PIL region",
++			    SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU, low_pa, 0, &zap_answer);
++			if (sig == 0 && zap_answer == 0)
++				zap_header_pa = low_pa;
++		}
++	}
+ 	if (sig == 0 && zap_answer == 0)
+ 		printf("SWEET GPU: step 20: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n");
+ 	else
