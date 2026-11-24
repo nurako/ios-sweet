@@ -295,6 +295,15 @@ that repo). So the refused signature is not a bad image; the leading hypothesis 
 address above 4 GiB** (our kernel page was at 0x160110000). Patch 0111 retries the signature with
 the header copied into the PIL region at 0x8681a000 (below 4 GiB). Image AF `ba5e2028...`.
 
+**ZAP ORDER + CI RUNNER (2026-11-24).** The low-address retry (0111, PIL region) also got
+`-3145797`, so it is not the address. hakios-alioth (working GPU on this phone) runs the zap
+ladder with the GPU still in reset - signature at their step 12, load at 19, before the command
+processor starts - while we (apollo's order) asked at step 20 with the GMU firmware running and
+CP_ME_INIT already accepted. Patch 0112 hoists the ladder (new `gpu_zap_ladder()`) to just
+before step 11, keeping the late attempt as a fallback. Image AG `f35acd0c...`.
+CI now runs on **macos-15-intel**: the arm64 `macos-15` pool failed to acquire a runner three
+times in a row (capacity), the Intel pool built in 15m28s.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
