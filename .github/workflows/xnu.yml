@@ -35,7 +35,7 @@ jobs:
     # Xcode 15 / iig 15 toolchain is gone.  macos-15 is arm64 (what the last
     # working macos-14-arm64 image was) but ships Xcode 16, whose iig emits
     # IORPC.kernelContent - added to both xnu IORPC.h copies by patch 0095.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
