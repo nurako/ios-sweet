@@ -280,6 +280,21 @@ never power-cycles the SoC, and TrustZone may still hold the shader it refused t
 (2) pull the phone's own `a650_zap.mdt/.b02` from `/vendor/firmware` instead of the UniXNU
 copies; (3) decode `-3145797`.
 
+**NEW REFERENCE: `xiongnemo/hakios-alioth` (2026-11-24).** A HakiOS port to the *same phone*
+(K40/POCO F3, alioth) that runs the stock iOS 16.5 userland with **real GPU acceleration**:
+OpenGL ES 1/2/3 games (Minecraft, Terraria, Sims 3) at 60 fps, Metal/SceneKit checks, all from a
+RAM boot with its own UEFI loader. Its `devices/redmi-k40/overlays/xnu/files/bsd/dev/hakios.adreno.c`
+(5350 lines) and `iokit/Kernel/hakios.gpu.cpp` are the reference for a working Adreno 650 driver
+on this exact board; GPU firmware is pulled from the phone's own `/vendor/firmware` into `fw-gpu/`.
+Its zap code (steps 11-12) is the same SCM ladder and the same call encoding we ported, and it
+requires the zap .mdt to fit one 16K page (ours does: 6860 bytes).
+
+Our firmware is genuine: `pico-phoenix-reimplementation/firmware` has the a650 set and the sizes
+match ours exactly (mdt 6860 = b00 148 + b01 6712, b02 1676, gmu 41548, sqe 31632-but-31920 in
+that repo). So the refused signature is not a bad image; the leading hypothesis is the **physical
+address above 4 GiB** (our kernel page was at 0x160110000). Patch 0111 retries the signature with
+the header copied into the PIL region at 0x8681a000 (below 4 GiB). Image AF `ba5e2028...`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
