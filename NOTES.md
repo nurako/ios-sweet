@@ -269,6 +269,17 @@ aborting - it needs Metal/GPU rendering, which does not exist yet. It is not a r
 does not loop. Also seen: `hfs_clonefile: cluster_write failed - 34` during userland writes
 (benign-looking; revisit if writes fail).
 
+**CP DOES NOT EXECUTE YET (Image AE `eb62d4db...`, `sweetgpu=22`):** steps 20 and 21 run, but
+after `CP_MEM_WRITE` the CP consumes the packets (`rptr 15 of 15`) and never goes idle
+(`rbbm_status` has GPU_BUSY set), so the test page is not written and step 21 reports "the
+command processor does not get through CP_MEM_WRITE"; step 22 (2D fill) therefore never paints
+the panel (screen showed no bands). Consistent with the CP still being in secure mode: the zap
+signature was refused (`-3145797`) and our `CP_SET_SECURE_MODE 0` was accepted only by the
+packet parser. Ideas, in order: (1) a **full power-off** before the next boot - `fastboot boot`
+never power-cycles the SoC, and TrustZone may still hold the shader it refused to replace;
+(2) pull the phone's own `a650_zap.mdt/.b02` from `/vendor/firmware` instead of the UniXNU
+copies; (3) decode `-3145797`.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
