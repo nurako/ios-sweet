@@ -1,0 +1,33 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1098,6 +1098,30 @@
+ 				zap_header_pa = low_pa;
+ 		}
+ 	}
++	/*
++	 * Still refused: hakios-alioth asks TrustZone to give up the shader "a
++	 * kernel before this one may have left" (PAS_SHUTDOWN) before loading its
++	 * own. A phone that booted Android has a zap shader loaded by that kernel's
++	 * driver; -3145797 looks like "one is already in use". Safe to ask: the
++	 * no-memory queries above already proved TrustZone answers this kernel.
++	 */
++	if (sig != 0 && zap_answer != 0) {
++		uint64_t sd_answer = ~0ull;
++		int32_t sd = gpu_scm("to give up a zap shader a kernel before may hold", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN,
++		    SCM_ONE_VALUE, PAS_GPU, 0, 0, &sd_answer);
++		printf("SWEET GPU: step 20: PAS_SHUTDOWN returns %d, answer %#llx; %s\n", sd,
++		    (unsigned long long)sd_answer, sd == 0 ? "trying the signature again" : "it is refused too");
++		if (sd == 0) {
++			uint64_t retry_pa = 0;
++			zap_answer = ~0ull;
++			if (gpu_zap_header_low(zap_mdt, zap_mdt_size, &retry_pa)) {
++				sig = gpu_scm("to take the zap shader's signature after the shutdown",
++				    SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU, retry_pa, 0, &zap_answer);
++				if (sig == 0 && zap_answer == 0)
++					zap_header_pa = retry_pa;
++			}
++		}
++	}
+ 	if (sig == 0 && zap_answer == 0)
+ 		printf("SWEET GPU: step 20: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n");
+ 	else
