@@ -241,14 +241,83 @@ What to look for (all lines start with `adreno:`):
 A failure prints `adreno: step N: FAILED; the steps after it are not attempted`
 and the next steps are skipped. The 2D-frame success criterion is the pixel
 readback (`the picture's first pixel is 00 80 ff ff ...`) plus the step-22
-line above. **Caveat:** the adapter's `MiniIOMobileFramebufferShow()` only logs
-the request, so the pixels are proven in GPU memory but are not yet copied to
-the panel; a screenshot will not show the bands until the display bridge is
-implemented. Read the log on the next boot with
+line above. `MiniIOMobileFramebufferShow()` now copies the frame into the
+console's existing framebuffer mapping (section 9), so the bands should also
+be visible. Read the log on the next boot with
 `sweetlogdump=262144 sweetloggrep=adreno sweetlogdumpwait=120 ufslogsecs=1`
 (and keep `sweetgpu=0`).
 
-## 8. Files added by this port
+## 8. Panel bridge and GIC SPI (2026-11-26)
+
+### Panel copy
+
+`MiniIOMobileFramebufferShow()` now copies the frame into the **kernel text
+console's existing mapping** of the boot framebuffer. `osfmk/console/video_console.c`
+maps it early with `ml_io_map_unmappable()` (outside the 8 MB io submap, so no
+`KERN_NO_SPACE` panic) and publishes the writable VA as the global
+`struct vc_info vinfo`; its `v_rowbytes` is the panel stride (4320). The adapter
+externs `vinfo`, copies `min(width, v_width) * 4` bytes per row for
+`min(height, v_height)` rows from the GPU's `row_bytes` pitch to `v_rowbytes`,
+then executes `dsb sy`. It does **not** call `ml_io_map` at all.
+
+Cmdline (panel test; same as before):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 sweetgpu=0 \
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
+adreno=22 adreno_keep=0 adreno_pause=0 adreno_watch=30 gpu_irq=0
+```
+
+Proof lines:
+
+* `HAKIOS GPU: panel copy 1080x2400 row 4352 -> 1080x2400 row 4320 via the console framebuffer mapping (vinfo ..., phys 0x9c000000)`
+* the driver's `adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top`
+
+The bands are written to the real panel memory; later kernel log lines still
+draw over the top of the image, so film the boot or use `sweetlogdump` to catch
+the moment. If the line begins `panel copy skipped`, `vinfo` had no framebuffer
+(console not initialised / no video).
+
+### GICv3 SPI 332
+
+The GPU's interrupt is SPI 300, INTID 332, level (`live.dts` kgsl-3d0:
+`interrupts = <0 0x12c 4>`). The adapter now owns a small SPI path: it maps the
+64 KiB GICD from `/arm-io/gic` (the tree's `pe_fiq.c` sets up the GIC and CPU
+interface but keeps its bases private), configures the SPI as Group 1 NS,
+priority 0xa0, level, routes it to the attaching processor's MPIDR, enables it,
+and installs one dispatcher with `ml_install_interrupt_handler()`.
+`sleh_irq()` continues to handle the virtual timer and SGIs itself and sends
+every other INTID to that dispatcher, which only looks up attached SPIs and
+otherwise does nothing; existing polling drivers are unchanged. It is opt-in:
+only `gpu_irq=1` calls `gic_v3_spi_attach()`.
+
+Cmdline (interrupt test; keeping the GPU starts HakiosGPU, which is the only
+path that calls `gpu_irq_on()`):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 sweetgpu=0 \
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
+adreno=22 adreno_keep=1 adreno_pause=0 gpu_irq=1
+```
+
+Proof lines:
+
+* `HAKIOS GPU: GIC SPI 332 level attached, routed to MPIDR 0x... (gpu_irq=1)`
+* `adreno: THE 3D CORE'S INTERRUPT (GIC 332, level) tells the waits of each submission's end (gpu_irq=1)`
+* and **not** `adreno: the 3D core's interrupt (GIC 332) is not taken ... the waits look for the fence as before`.
+
+The attach lines prove configuration; an interrupt actually arrives when a
+client submits work with `CP_EVENT_IRQ` (the service's normal fence wait), so
+delivery counters/fence waits show it after the surface/buffer path is used.
+Until then the GPU still draws (polling) and the panel test is independent.
+
+## 9. Files added by this port
 
 ```
 hakios-port/kernel/...                 reference sources, verbatim
