@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -408,7 +408,8 @@
+ #define FMT6_8_8_8_8_UNORM    0x30u
+ #define BLIT_SOLID_8888       ((1u << 7) | (FMT6_8_8_8_8_UNORM << 8) | (0xfu << 20) | (0x10u << 24))
+ #define DST_BGRA_LINEAR       (FMT6_8_8_8_8_UNORM | (1u << 10))   /* blue first in memory, as the panel's */
+-#define CCU_CNTL_BYPASS       0x18000000u   /* color offset = 3 CCUs x 64 KiB (Mesa a650 num_ccu 3), sysmem */
++#define CCU_CNTL_BYPASS       0x10000004u   /* hakios-alioth's value for this GPU drawing straight into memory
++                                             * (Mesa's fd6_blitter for a650); 0x18000000 was apollo's guess */
+ #define CORE_SCRATCH_VA       0x01200000u
+ #define CORE_TARGET_VA        0x10000000u
+ #define TARGET_W              1080u
+@@ -2131,6 +2132,19 @@
+ 		printf("SWEET GPU: step 22: the picture is not what the core was told to draw\n");
+ 		goto collapse;
+ 	}
++	/*
++	 * The panel copy needs the framebuffer mapped: 4320 x 2400 = 10.4 MB, but
++	 * io_map() allocates from an 8 MB io submap (IO_MAP_SIZE), so a single
++	 * mapping can never be made and each chunk stays mapped for good. Until the
++	 * picture is right, just say so; sweetgputofb=1 tries the mapping anyway.
++	 */
++	unsigned to_fb = 0;
++	(void)PE_parse_boot_argn("sweetgputofb", &to_fb, sizeof(to_fb));
++	if (!to_fb) {
++		printf("SWEET GPU: step 22: THE GPU HAS DRAWN A PICTURE (%d x %d); panel copy held back "
++		    "(sweetgputofb=1 maps the framebuffer, 10.4 MB > the 8 MB io submap)\n", TARGET_W, TARGET_H);
++		goto collapse;
++	}
+ 	printf("SWEET GPU: step 22: THE GPU HAS DRAWN A PICTURE; copying it to the panel (%#x)\n", FB_PA);
+ 	vm_offset_t fb_va = ml_io_map_wcomb(FB_PA, round_page(FB_ROW * TARGET_H));
+ 	if (!fb_va) {
