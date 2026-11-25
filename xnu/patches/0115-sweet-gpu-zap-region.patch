@@ -1,0 +1,37 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -364,7 +364,13 @@
+ #define SCM_INTERRUPTED       1             /* a preempted call says so, and is made again so */
+ #define PAS_GPU               13u           /* the GPU's image number (Linux qcom_scm: the zap shader) */
+ #define ZAP_MEMORY_PA         0x8681a000u   /* apollo live DT reserved-memory pil_gpu_mem (the zap image's place) */
+-#define ZAP_MEMORY_SIZE       0x1000u       /* the a650 zap shader's one loadable segment is under a page */
++/*
++ * The GPU's reserved zap region is 0x2000 (live.dts pil_gpu_mem at 0x8681a000);
++ * hakios-alioth's note from a K40 running HyperOS: a 0x1000 MEM_SETUP stalls the
++ * phone at the first read past the setup, and 0x2000 (the whole region, as
++ * Linux's qcom_mdt_pas_init gives it) has run ever since.
++ */
++#define ZAP_MEMORY_SIZE       0x2000u
+ #define CORE_STREAM          0u            /* apollo DT gfx3d_user iommus <0x0 0x401>: streams 0 and 1 */
+ #define CORE_STREAM_MASK      0x401u        /* boot 19: mask 0x400 read back 0; written as the DT has it */
+ #define CORE_MATCH            0u            /* match 1 is the GMU's */
+@@ -1083,6 +1089,19 @@
+ 	int32_t sig;
+ 	if (!gpu_zap_header(zap_mdt, zap_mdt_size, &zap_header_pa))
+ 		return;
++	/*
++	 * hakios-alioth asks TrustZone to give up the shader "a kernel before this
++	 * one may have left" before handing over its own: the phone booted Android,
++	 * whose driver loaded one. Asked here, after the safe queries, so it is not
++	 * the first call this kernel makes.
++	 */
++	{
++		uint64_t sd_answer = ~0ull;
++		int32_t sd = gpu_scm("to give up a zap shader a kernel before may hold", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN,
++		    SCM_ONE_VALUE, PAS_GPU, 0, 0, &sd_answer);
++		printf("SWEET GPU: step 20: PAS_SHUTDOWN returns %d, answer %#llx%s\n", sd,
++		    (unsigned long long)sd_answer, sd == 0 ? "" : " (it keeps what it has, as hakios allows)");
++	}
+ 	printf("SWEET GPU: step 20: hand TrustZone the zap shader's signature to check (image %u)\n", PAS_GPU);
+ 	sig = gpu_scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER,
+ 	    PAS_GPU, zap_header_pa, 0, &zap_answer);
