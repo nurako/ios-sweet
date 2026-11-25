@@ -1,0 +1,42 @@
+--- a/bsd/conf/files	2026-11-22 20:13:26.403582316 +0530
++++ b/bsd/conf/files	2026-11-25 23:22:01.386119613 +0530
+@@ -112,6 +112,9 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/hakios.board.c			standard
++bsd/dev/hakios.adreno.c			standard
++bsd/dev/hakios_gpu_adapter.c		standard
+ bsd/dev/alioth_keys.c			standard
+ bsd/dev/alioth_touch.c			standard
+ bsd/dev/mem.c				standard
+--- a/iokit/conf/files.arm64	2026-10-19 00:50:13.000000000 +0530
++++ b/iokit/conf/files.arm64	2026-11-25 23:22:20.792823587 +0530
+@@ -15,6 +15,8 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/hakios.gpu.cpp                                      optional iokitcpp
++iokit/Kernel/hakios_miniosurface_stub.cpp                        optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/bsd/dev/sweet_ufs.c	2026-11-23 12:34:43.019261585 +0530
++++ b/bsd/dev/sweet_ufs.c	2026-11-25 23:22:01.386231112 +0530
+@@ -55,6 +55,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
++extern void hakios_adreno_init(void);
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
+ extern bool alioth_board(void);
+@@ -676,6 +677,8 @@
+ 	sweet_usb_probe();
+ 	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
+ 	sweet_gpu_init();
++	/* xiongnemo/hakios-alioth Adreno stack (no-op without boot-arg adreno=N or gpu=1). */
++	hakios_adreno_init();
+ 	return 0;
+ }
+ 
