@@ -1,0 +1,55 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1397,20 +1397,6 @@
+ 	if (steps < 11 || back0 != 0x600d0001u || back1 != 0x0a110002u)
+ 		goto collapse;
+ 
+-	/* The zap ladder belongs before anything of the GPU is started (HackiOS
+-	 * order). Asking once the GMU runs and the CP has accepted CP_ME_INIT is
+-	 * what got -3145797 on alioth; try the early point first. */
+-	if (steps >= 20) {
+-		unsigned zs = 3;
+-		(void)PE_parse_boot_argn("sweetgpuzap", &zs, sizeof(zs));
+-		if (zs >= 2) {
+-			printf("SWEET GPU: step 20 early: the zap ladder, before the GPU is started\n");
+-			gpu_zap_ladder(zs);
+-			printf("SWEET GPU: step 20 early: %s\n", zap_loaded ? "the shader is loaded and running" :
+-			    "no shader (the lines above say why); carrying on");
+-		}
+-	}
+-
+ 	/* ---- step 11: memory for the GMU, SMMU context 1 ---- */
+ 	{
+ 		const void *prop = NULL;
+@@ -1804,6 +1790,22 @@
+ 	    gpu_rd(gpu, GPU_CP_RB_BASE));
+ 	printf("SWEET GPU: step 17: THE 3D CORE HAS POWER AND ANSWERS\n");
+ 	gpu_core = gpu;
++	if (steps >= 18)
++	{
++	/* The zap ladder belongs before anything of the GPU is started (HackiOS
++	 * order). Asking once the GMU runs and the CP has accepted CP_ME_INIT is
++	 * what got -3145797 on alioth; try the early point first. */
++	if (steps >= 20) {
++		unsigned zs = 3;
++		(void)PE_parse_boot_argn("sweetgpuzap", &zs, sizeof(zs));
++		if (zs >= 2) {
++			printf("SWEET GPU: step 20 early: the zap ladder, now the 3D core is powered (hakios step 19)\n");
++			gpu_zap_ladder(zs);
++			printf("SWEET GPU: step 20 early: %s\n", zap_loaded ? "the shader is loaded and running" :
++			    "no shader (the lines above say why); carrying on");
++		}
++	}
++	}
+ 	if (steps < 18)
+ 		goto collapse;
+ 
+@@ -1881,6 +1883,8 @@
+ 	gpu_wr(gpu, GPU_CP_ROQ_THRESHOLDS_1, 0x8040362cu);
+ 	gpu_wr(gpu, GPU_CP_MEM_POOL_SIZE, 128);
+ 	gpu_wr(gpu, GPU_PC_DBG_ECO_CNTL, 0x00300200u);
++	gpu_wr(gpu, GPU_WORD(0x8e04), 0x04100000u);          /* rb_dbg_eco_cntl (Mesa's value for this GPU) */
++	gpu_wr(gpu, GPU_WORD(0x0534), 1);                    /* rbbm_nc_mode_cntl */
+ 	gpu_wr(gpu, GPU_CP_AHB_CNTL, 1);
+ 	gpu_wr(gpu, GPU_RBBM_PERFCTR_CNTL, 1);
+ 	/* UBWC (a6xx_set_ubwc_config, a650: highest bank bit 16 as the DT says) */
