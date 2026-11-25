@@ -304,6 +304,16 @@ before step 11, keeping the late attempt as a fallback. Image AG `f35acd0c...`.
 CI now runs on **macos-15-intel**: the arm64 `macos-15` pool failed to acquire a runner three
 times in a row (capacity), the Intel pool built in 15m28s.
 
+**ROOT CAUSE FOUND: OUR zap.mdt WAS CORRUPT (2026-11-25).** The phone's own firmware came out
+of the LineageOS OTA's `vendor.img` (EROFS; `fsck.erofs --extract --path=/firmware`). Its
+`a650_gmu.bin`, `a650_sqe.fw` and `a650_zap.b02` are byte-identical to our copies, but
+`a650_zap.mdt` **differs in 6481 of 6860 bytes**: our copy (sliced out of UniXNU's
+`GpuFirmwareA650.c` array) is zeros after the ELF header - the hash/certificate block was missing.
+TrustZone was refusing a malformed image all along; the address (0111) and order (0112) theories
+were red herrings, and so was the "another kernel holds a shader" guess. `research/alioth-gpu/`
+now holds the phone's real blobs (mdt sha256 2458df52...). Image AI `4019d008...` = same 0113
+kernel with the corrected firmware.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
