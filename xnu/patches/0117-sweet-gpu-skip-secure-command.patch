@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2002,6 +2002,18 @@
+ 		printf("SWEET GPU: step 20: the ladder did not run before the GPU started; asking TrustZone now (late)\n");
+ 		gpu_zap_ladder((unsigned)zap_stage);
+ 	}
++	/*
++	 * When the shader was authenticated before the command processor started,
++	 * the core is already meant to be out of secure mode and CP_SET_SECURE_MODE
++	 * makes the CP wait for a zap shader that never ran on the GPU (boots with
++	 * the powered-point ladder confirm the wait: the next packet never
++	 * completes). So skip the command in that case and go straight on.
++	 */
++	if (zap_loaded) {
++		printf("SWEET GPU: step 20: the zap shader was authenticated before the CP started; "
++		    "not sending CP_SET_SECURE_MODE\n");
++		goto after_secure;
++	}
+ 	/* command the 3D core out of secure mode; the ring picks up after CP_ME_INIT (wptr 9 -> 11) */
+ 	printf("SWEET GPU: step 20: command the 3D core out of secure mode (CP_SET_SECURE_MODE 0)\n");
+ 	ring[at++] = (7u << 28) | 1u | (gpu_parity(1) << 15) | (CP_SET_SECURE_MODE << 16) | (gpu_parity(CP_SET_SECURE_MODE) << 23);
+@@ -2050,6 +2062,7 @@
+ 	if (steps < 21)
+ 		goto collapse;
+ 
++after_secure:;
+ 	/* ---- step 21: a word written to our memory on command ---- */
+ 	static struct gpu_block core_scratch, core_target;
+ 	printf("SWEET GPU: step 21: map a page for the core; have it write %#x there (CP_MEM_WRITE)\n", TEST_WORD);
