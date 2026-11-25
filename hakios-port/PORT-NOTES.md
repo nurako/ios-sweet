@@ -258,3 +258,28 @@ hakios-port/build-integration.patch    proposed bsd/iokit/start changes
 hakios-port/ORIGIN.md                  provenance + licenses
 hakios-port/PORT-NOTES.md              this file
 ```
+
+## 2026-11-25: first evaluation boot (Image HK1 `b0e2d767...`)
+
+Kernel from CI run 45670566657 on branch `hakios-gpu`; ADT regenerated with
+`/chosen hakios-board = "alioth"`; cmdline `sweetgpu=0 ... adreno=22 gpu_irq=0
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000`.
+
+Their driver ran the whole ladder without panic and iOS stayed interactive:
+
+```
+adreno: 20: THE 3D CORE TAKES COMMANDS
+adreno: 21: the 3D core has done it (ring read up to 11, status 0x1)      <- out of secure mode
+adreno: 21: the page reads 0x600dc0de: THE 3D CORE WRITES OUR MEMORY ON COMMAND
+adreno: 22: the 3D core has done it (ring read up to 123, status 0x1)
+adreno: 22: the picture's first pixel is 00 80 ff ff (told 00 80 ff ff),
+            middle ff ff ff ff, last row ff 80 00 ff
+adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue
+```
+So on OUR kernel and OUR ADT the Adreno 650 draws a correct frame in memory,
+and `CP_SET_SECURE_MODE` does not wedge their CP (the zap is authenticated with
+the core powered, which is what our own probe could not make work).
+
+Remaining to see it on the panel: `MiniIOMobileFramebufferShow()` is still an
+adapter log line; it must copy 1080x2400 rows (4352 bytes pitch) into the
+AppleCLCD framebuffer.
