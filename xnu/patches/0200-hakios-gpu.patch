@@ -5529,10 +5529,10 @@ index 0000000..cafdc46
 +    sysctl_developer_mode_status, "I", "iOS's developer mode, as the kernel has it");
 diff --git a/bsd/dev/hakios_gpu_adapter.c b/bsd/dev/hakios_gpu_adapter.c
 new file mode 100644
-index 0000000..8a13311
+index 0000000..110d1b5
 --- /dev/null
 +++ b/bsd/dev/hakios_gpu_adapter.c
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,396 @@
 +/*
 + * Adapter between xiongnemo/hakios-alioth's GPU stack and this tree.
 + *
@@ -5544,9 +5544,9 @@ index 0000000..8a13311
 + *                          mkadt.py --gmu-fw/--sqe-fw/--zap-mdt/--zap-seg
 + *                          already put next to the homegrown probe;
 + *   - announce()/hakios_tl()/loader_log_putc()  routed to printf;
-+ *   - gic_v3_spi_*()       stubbed (this tree has no GICv3 driver yet, so the
-+ *                          GPU interrupt falls back to the driver's polling
-+ *                          path; see PORT-NOTES.md);
++ *   - gic_v3_spi_*()       a small GICv3 SPI path of our own (the tree's
++ *                          pe_fiq.c already owns the GIC, but keeps its bases
++ *                          private), opt-in through the driver's gpu_irq=1;
 + *   - Misc. kernel-wide state the reference tree keeps in other drivers.
 + *
 + * Nothing here touches research/ci-buildtree: it is copied there only for a
@@ -5559,6 +5559,14 @@ index 0000000..8a13311
 +#include <mach/kern_return.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
++#include <pexpert/arm/protos.h>
++#include <console/video_console.h>
++#include <arm/machine_routines.h>
++#include <kern/simple_lock.h>
++#include <os/atomic_private.h>
++#include <IOKit/IOInterrupts.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +/* ---- the reference driver's logging and loader hooks -------------------- */
 +
@@ -5672,54 +5680,254 @@ index 0000000..8a13311
 +
 +/* ---- the panel copy the reference's 2D test asks for ------------------- */
 +
++/*
++ * The kernel text console already mapped the boot framebuffer with
++ * ml_io_map_unmappable() (osfmk/console/video_console.c, initialize_screen)
++ * and keeps the virtual address in the global `vinfo': 0x9c000000,
++ * 1080x2400, stride 4320. That mapping is WCOMB, lives outside the 8 MB io
++ * submap, and is writable here, so reuse it. Do NOT ml_io_map() the 10.4 MB
++ * framebuffer: io_map's submap is only 8 MB and the call fails with
++ * KERN_NO_SPACE (a panic on the way).
++ */
++extern struct vc_info vinfo;
++
 +void
 +MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes)
 +{
 +	static bool said;
++	uint8_t *dst = (uint8_t *)vinfo.v_baseaddr;
++	uint32_t dst_row = vinfo.v_rowbytes;
++	uint32_t src_row = row_bytes != 0 ? row_bytes : width * 4u;
++	uint32_t rows, bytes;
 +
++	if (pixels == NULL || dst == NULL || vinfo.v_width == 0 || vinfo.v_height == 0 ||
++	    dst_row == 0 || src_row == 0) {
++		if (!said) {
++			said = true;
++			printf("HAKIOS GPU: panel copy skipped: no writable console framebuffer "
++			    "(vinfo base %p, %ux%u stride %u)\n", (void *)vinfo.v_baseaddr,
++			    vinfo.v_width, vinfo.v_height, vinfo.v_rowbytes);
++		}
++		return;
++	}
++	rows = height < vinfo.v_height ? height : vinfo.v_height;
++	bytes = (width < vinfo.v_width ? width : vinfo.v_width) * 4u;
++	if (bytes > dst_row) {
++		bytes = dst_row;
++	}
++	if (bytes > src_row) {
++		bytes = src_row;
++	}
++	for (uint32_t y = 0; y < rows; y++) {
++		memcpy(dst + (size_t)y * dst_row, pixels + (size_t)y * src_row, bytes);
++	}
++	/* The mapping is write-combined: make sure the stores reach the panel. */
++	__asm__ volatile("dsb sy" ::: "memory");
 +	if (!said) {
 +		said = true;
-+		printf("HAKIOS GPU: show %ux%u (%u bytes a row) requested; the adapter has no "
-+		    "MiniIOMobileFramebuffer bridge yet (use a later patch to hand it to AppleCLCD)\n",
-+		    width, height, row_bytes);
++		printf("HAKIOS GPU: panel copy %ux%u row %u -> %ux%u row %u via the console "
++		    "framebuffer mapping (vinfo %p, phys %#llx)\n", width, height, src_row,
++		    vinfo.v_width, vinfo.v_height, dst_row, (void *)vinfo.v_baseaddr,
++		    (unsigned long long)vinfo.v_physaddr);
 +	}
-+	(void)pixels;
 +}
 +
 +/* ---- GICv3 shared peripheral interrupts -------------------------------- */
 +
 +/*
-+ * This tree has no gic_v3_irq.c: the reference adds one in xnu/hakios.patch and
-+ * drives the CPU interface through ICC_*_EL1 with a redistributor per CPU.
-+ * Until that is ported, the GPU's INTID 332 cannot be attached; the reference
-+ * driver sees the failure and keeps polling for its fence (hakios.adreno.c,
-+ * gpu_irq_on()), so the service still works without the interrupt.
++ * A small SPI path for the GPU's INTID 332 (alioth live.dts kgsl-3d0:
++ * interrupts = <0 0x12c 4>, SPI 300, level). This tree's pe_fiq.c already
++ * brings up the GICv3 CPU interface and GICD/GICR, but keeps those bases
++ * static. We map the 64 KiB distributor once (well inside the 8 MB io
++ * submap), configure and route the SPI to the processor that attaches it,
++ * and install one dispatcher through ml_install_interrupt_handler().
++ *
++ * sleh_irq() already handles the virtual timer and SGIs itself and sends
++ * every other INTID to that one handler; our dispatcher looks the INTID up
++ * in this table and otherwise does nothing, so existing polling drivers see
++ * exactly the behaviour they saw before. The path is opt-in: only
++ * hakios.adreno.c's gpu_irq=1 calls gic_v3_spi_attach().
 + */
++#define GICD_CTLR               0x0000
++#define GICD_CTLR_RWP           (1u << 31)
++#define GICD_IGROUPR(n)         (0x0080 + 4 * (n))
++#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
++#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
++#define GICD_ICPENDR(n)         (0x0280 + 4 * (n))
++#define GICD_ICACTIVER(n)       (0x0380 + 4 * (n))
++#define GICD_IPRIORITYR(n)      (0x0400 + (n))
++#define GICD_ICFGR(n)           (0x0c00 + 4 * (n))
++#define GICD_IGRPMODR(n)        (0x0d00 + 4 * (n))
++#define GICD_IROUTER(n)         (0x6000 + 8 * (n))
++#define GIC_INTID_SPI_MIN       32u
++#define GIC_INTID_SPURIOUS_MIN  1020u
++#define GIC_PRIORITY_DEFAULT    0xa0u
++#define GIC_SPI_MOST            8u
++
++struct sweet_gic_spi {
++	uint32_t intid;
++	void   (*handler)(void *context, uint32_t intid);
++	void    *context;
++	uint32_t busy;
++};
++
++static vm_offset_t sweet_gicd;
++static struct sweet_gic_spi sweet_gic_spi[GIC_SPI_MOST];
++static decl_simple_lock_data(, sweet_gic_spi_lock);
++static bool sweet_gic_spi_lock_ready;
++static bool sweet_gic_handler_installed;
++
++static inline uint32_t
++sweet_gic_read32(vm_offset_t at)
++{
++	return *(volatile uint32_t *)at;
++}
++
++static inline void
++sweet_gic_write32(vm_offset_t at, uint32_t value)
++{
++	*(volatile uint32_t *)at = value;
++}
++
++static void
++sweet_gic_settle(void)
++{
++	while (sweet_gic_read32(sweet_gicd + GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++}
++
++static bool
++sweet_gic_map(void)
++{
++	DTEntry entry;
++	const void *prop;
++	unsigned int size;
++	uint64_t reg[4];
++
++	if (sweet_gicd != 0) {
++		return true;
++	}
++	if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", &prop, &size) != kSuccess ||
++	    size < sizeof(reg)) {
++		return false;
++	}
++	memcpy(reg, prop, sizeof(reg));
++	sweet_gicd = ml_io_map(pe_arm_get_soc_base_phys() + reg[0], (vm_size_t)reg[1]);
++	return sweet_gicd != 0;
++}
++
++/* sleh_irq()'s OTHER-interrupt callback: the GPU's SPI, if it is ours. */
++static void
++sweet_gic_spi_interrupt(__unused void *target, __unused void *refCon, __unused void *nub, int source)
++{
++	uint32_t intid = (uint32_t)source;
++
++	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
++		struct sweet_gic_spi *spi = &sweet_gic_spi[i];
++
++		if (os_atomic_load(&spi->intid, acquire) == intid) {
++			os_atomic_inc(&spi->busy, relaxed);
++			if (os_atomic_load(&spi->intid, relaxed) == intid && spi->handler != NULL) {
++				spi->handler(spi->context, intid);
++			}
++			os_atomic_dec(&spi->busy, release);
++			return;
++		}
++	}
++	/* Not an SPI of ours: sleh_irq() ends it exactly as it did before. */
++}
++
 +kern_return_t
 +gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context)
 +{
-+	static bool said;
++	struct sweet_gic_spi *slot = NULL;
++	uint64_t mpidr;
++	uint32_t config;
 +
-+	if (!said) {
-+		said = true;
-+		printf("HAKIOS GPU: GICv3 SPI %u (%s) not attached: no GICv3 driver in this tree yet; "
-+		    "the GPU will poll for its fence\n", intid, edge ? "edge" : "level");
++	if (intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS_MIN || handler == NULL) {
++		return KERN_INVALID_ARGUMENT;
 +	}
-+	(void)handler;
-+	(void)context;
-+	return KERN_FAILURE;
++	if (!sweet_gic_map()) {
++		printf("HAKIOS GPU: GICD map failed: SPI %u cannot be attached\n", intid);
++		return KERN_RESOURCE_SHORTAGE;
++	}
++	if (!sweet_gic_spi_lock_ready) {
++		simple_lock_init(&sweet_gic_spi_lock, 0);
++		sweet_gic_spi_lock_ready = true;
++	}
++	simple_lock(&sweet_gic_spi_lock, LCK_GRP_NULL);
++	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
++		if (sweet_gic_spi[i].intid == intid) {
++			simple_unlock(&sweet_gic_spi_lock);
++			return KERN_NAME_EXISTS;
++		}
++		if (slot == NULL && sweet_gic_spi[i].intid == 0 && sweet_gic_spi[i].busy == 0) {
++			slot = &sweet_gic_spi[i];
++		}
++	}
++	if (slot == NULL) {
++		simple_unlock(&sweet_gic_spi_lock);
++		return KERN_RESOURCE_SHORTAGE;
++	}
++	slot->handler = handler;
++	slot->context = context;
++	os_atomic_store(&slot->intid, intid, release);
++	simple_unlock(&sweet_gic_spi_lock);
++
++	if (!sweet_gic_handler_installed) {
++		ml_install_interrupt_handler(NULL, 0, NULL, sweet_gic_spi_interrupt, NULL);
++		sweet_gic_handler_installed = true;
++	}
++
++	/* Disabled while it is configured; nothing stale pending or active. */
++	sweet_gic_write32(sweet_gicd + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
++	sweet_gic_write32(sweet_gicd + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
++	sweet_gic_write32(sweet_gicd + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
++	sweet_gic_write32(sweet_gicd + GICD_IGROUPR(intid / 32),
++	    sweet_gic_read32(sweet_gicd + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
++	sweet_gic_write32(sweet_gicd + GICD_IGRPMODR(intid / 32),
++	    sweet_gic_read32(sweet_gicd + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	*(volatile uint8_t *)(sweet_gicd + GICD_IPRIORITYR(intid)) = GIC_PRIORITY_DEFAULT;
++	config = sweet_gic_read32(sweet_gicd + GICD_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
++	sweet_gic_write32(sweet_gicd + GICD_ICFGR(intid / 16),
++	    config | (edge ? 2u : 0u) << (intid % 16 * 2));
++	mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	*(volatile uint64_t *)(sweet_gicd + GICD_IROUTER(intid)) =
++	    (mpidr & 0xff00000000ull) | (mpidr & 0xffffffull);
++	sweet_gic_settle();
++	sweet_gic_write32(sweet_gicd + GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	printf("HAKIOS GPU: GIC SPI %u %s attached, routed to MPIDR %#llx (gpu_irq=1)\n",
++	    intid, edge ? "edge" : "level", (unsigned long long)mpidr);
++	return KERN_SUCCESS;
 +}
 +
 +void
 +gic_v3_spi_mask(uint32_t intid)
 +{
-+	(void)intid;
++	if (sweet_gicd != 0 && intid >= GIC_INTID_SPI_MIN && intid < GIC_INTID_SPURIOUS_MIN) {
++		sweet_gic_write32(sweet_gicd + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
++		sweet_gic_settle();
++	}
 +}
 +
 +void
 +gic_v3_spi_detach(uint32_t intid)
 +{
-+	(void)intid;
++	if (sweet_gicd == 0 || intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS_MIN) {
++		return;
++	}
++	gic_v3_spi_mask(intid);
++	sweet_gic_write32(sweet_gicd + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
++	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
++		if (sweet_gic_spi[i].intid == intid) {
++			os_atomic_store(&sweet_gic_spi[i].intid, 0, release);
++			while (os_atomic_load(&sweet_gic_spi[i].busy, acquire) != 0) {
++				;
++			}
++		}
++	}
 +}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index f585be7..1a7a9ed 100644
