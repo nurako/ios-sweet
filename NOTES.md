@@ -328,6 +328,26 @@ two hw_init registers (`0x8e04` rb_dbg_eco_cntl 0x04100000, `0x0534` rbbm_nc_mod
 **CI BLOCKED:** GitHub Actions is disabled on the repo (dispatch 422) - private-repo macOS minutes
 exhausted. 0114 is committed and unbuilt until the repo goes public or the limit resets.
 
+**THE COMMAND PROCESSOR WORKS (2026-11-25, Image AU `a9846e93...`, patch 0117).** The wedge was
+`CP_SET_SECURE_MODE` itself: with the zap shader authenticated *before* the CP starts, sending it
+made the CP wait for a shader that never ran on the GPU, and every later packet was swallowed but
+never completed (rptr advances, `rbbm_status` stays busy). Skipping the command when `zap_loaded`
+already ran early fixed it in one step:
+```
+step 20: the zap shader was authenticated before the CP started; not sending CP_SET_SECURE_MODE
+step 21: ring words 9..12: CP_MEM_WRITE; rptr 13 of 13, status 0x1, cp fault 0, protect 0
+step 21: the page reads 0x600dc0de: THE 3D CORE WRITES OUR MEMORY ON COMMAND
+step 22: 1080x2400 picture, three solid fills + flushes; rptr 121 of 121, status 0x1
+step 22: flush words 0xc0c0c0c 0xd0e0d0e (told 0xc0c0c0c, 0xd0e0d0e)
+step 22: the picture is not what the core was told to draw
+```
+So the GPU executes command streams and writes our memory. Remaining: the 2D fill's pixel content
+(the `pixels (b g r a): first … middle … last …` line says whether it is a format, pitch or
+CCU/write-back issue). Also noted: the panel copy at the end calls `ml_io_map_wcomb(FB_PA,
+FB_ROW*TARGET_H)` = ~10.4 MB, but the io submap is only 8 MB (`IO_MAP_SIZE`, osfmk/arm/io_map.c),
+so that mapping must be avoided or chunked - the powered-point 17.5 MB panic is the same io-submap
+ceiling, not a GPU fault.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
