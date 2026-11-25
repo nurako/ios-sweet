@@ -139,7 +139,14 @@ for vendor names under `fw/`; `hakios_image_file()` maps them:
 Returned pointers point into the ADT (valid for the kernel's life), matching
 the reference's contract. `disk_out` is `-1` (no RAM-disk image).
 
-## 5. Build-system changes (see `build-integration.patch`)
+## 5. Build-system changes (`xnu/patches/0200-hakios-gpu.patch`)
+
+The scratch `build-integration.patch` has been turned into the real numbered
+patch **`xnu/patches/0200-hakios-gpu.patch`** (branch only; main's series stops
+at 0118). It adds the full source files, not just the config lines. It was
+generated from a tree that had patches 0001..0118 applied and checked with
+`git apply --check` against that exact CI state; it does not touch
+`bsd/dev/sweet_gpu.c` (that name appears only as context in `bsd/conf/files`).
 
 * `bsd/conf/files`: add `hakios.board.c`, `hakios.adreno.c`,
   `hakios_gpu_adapter.c` (`standard`).
@@ -149,7 +156,13 @@ the reference's contract. `disk_out` is `-1` (no RAM-disk image).
 * Copy headers to `bsd/sys/hakios.board.h`, `bsd/sys/hakios.input.h`,
   `iokit/Kernel/MiniIOSurface.h`, `iokit/Kernel/MiniDrivers.h`.
 * Call `hakios_adreno_init()` from `sweet_ufs_init()` after
-  `sweet_gpu_init()`. It returns immediately unless `adreno=N` or `gpu=1`.
+  `sweet_gpu_init()`, gated on `PE_parse_boot_argn("adreno", ...) != 0`, so
+  the default boot and existing `sweetgpu=N` runs are unchanged.
+* `tools/mkadt.py`: `--board alioth` now emits
+  `/chosen hakios-board = "alioth\0"` (7 bytes, as `hakios_board_is_alioth()`
+  requires; `cstr()` supplies the NUL). `--board sweet` output is byte-for-byte
+  unchanged (checked with fixed-seed builds for sweet, sweet --highmem and
+  sweet --qemu: same SHA-256 before and after).
 * No new CFLAGS are needed for these files; both compile with the flags
   `xnu-cc.py` borrows from the existing CI commands.
 
@@ -158,8 +171,8 @@ the reference's contract. `disk_out` is `-1` (no RAM-disk image).
 | # | step | effort |
 | --- | --- | --- |
 | 0 | port the two files + adapter + this inventory (this branch) | **done, ~1 day** |
-| 1 | wire the build patch into a new numbered `xnu/patches/0119-...` on the branch only, add `/chosen hakios-board`, add `board_pil_gpu*` to the alioth boot cmdline | 0.5 day |
-| 2 | one CI run + one `fastboot boot` at `adreno=1..21`, compare the step log with our probe (zap/GMU/CP), no service yet | 1-2 days |
+| 1 | `xnu/patches/0200-hakios-gpu.patch`, `/chosen hakios-board`, and the evaluation cmdline with `board_pil_gpu*` | **done, see section 7** |
+| 2 | one CI run + one `fastboot boot` at `adreno=1..22`, compare the step log with our probe (zap/GMU/CP/frame), no service yet | 1-2 days |
 | 3 | `adreno_keep=1` + `HakiosGPUStart()`: bring the IOKit service up; validate DRM gem/submit with a tiny userland client | 2-3 days |
 | 4 | merge surface buffers: adapt `surfaceBuffer()` to `SweetSurface` (or move to MiniIOSurface), keep AppleCLCD/HID working | 3-5 days |
 | 5 | port `osfmk/arm64/gic_v3_irq.c` (or a GPU-only SPI path) and enable `gpu_irq=1` | 2-3 days |
@@ -170,7 +183,72 @@ its step 21 and draws its 2D test frame, or the log says exactly which step
 fails. Only after step 4 does the GPU service have real IOSurface-backed
 buffers, and only after step 6 do OpenGL ES apps render.
 
-## 7. Files added by this port
+## 7. Evaluation boot (one bootable build)
+
+Generate the ADT with the GPU blobs (the adapter serves these four properties;
+verified in a generated alioth ADT: `gmu-firmware` 41548 B, `sqe-firmware`
+31632 B, `zap-metadata` 6860 B, `zap-segment` 1676 B under `/sweet-gpu`):
+
+```
+python3 tools/mkadt.py shim/out/alioth.adt --board alioth --highmem \
+    --gmu-fw research/alioth-gpu/a650_gmu.bin \
+    --sqe-fw research/alioth-gpu/a650_sqe.fw \
+    --zap-mdt research/alioth-gpu/a650_zap.mdt \
+    --zap-seg research/alioth-gpu/a650_zap.b02
+```
+
+Kernel cmdline for the evaluation boot (`sweetgpu=0` keeps the old probe off;
+`adreno=22` runs the reference ladder through the 2D frame; `adreno_keep=0`
+lets it stop cleanly after the watch instead of starting HakiosGPU):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 sweetgpu=0 \
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
+adreno=22 adreno_keep=0 adreno_pause=0 adreno_watch=30 gpu_irq=0
+```
+
+`adreno=N` runs steps 1..N and stops at the first failure. Use `adreno=4`,
+`=10`, `=13`, `=15`, `=17`, `=20`, `=21`, `=22` to bisect. `adreno_keep=1`
+with `adreno=21` or `22` additionally starts the HakiosGPU service (not useful
+until the surface merge), and `adreno_skip=0x...` skips step bits (e.g. the
+reference's `gpu=1` path skips steps 10-12 on its other board; do not skip them
+here).
+
+What to look for (all lines start with `adreno:`):
+
+| step | line that shows success |
+| --- | --- |
+| 1-3 | `step 3: done`; GPUCC reads, PLL/GDSC values |
+| 4 | `CX is on` |
+| 5 | clocks reported on, GMU RCG at 200 MHz |
+| 6-7 | GMU/RPMh register reads; no `FAILED` |
+| 8-9 | `SMMU: ... stream match registers ...`; context test |
+| 10 | `TAKES WHAT IS WRITTEN: its firmware can be loaded` |
+| 11-12 | `TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL` |
+| 13-14 | `THE GMU'S FIRMWARE IS LOADED` |
+| 15 | `THE GMU'S FIRMWARE RUNS` |
+| 16 | `THE GMU'S MESSAGE QUEUES ARE UP` |
+| 17 | `THE 3D CORE HAS POWER AND ANSWERS` |
+| 18 | 3D-core SMMU context and SQE microcode loaded |
+| 19 | `TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER` |
+| 20 | `THE 3D CORE TAKES COMMANDS` |
+| 21 | `THE 3D CORE WRITES OUR MEMORY ON COMMAND` |
+| 22 | first-pixel line then **`A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top`** |
+
+A failure prints `adreno: step N: FAILED; the steps after it are not attempted`
+and the next steps are skipped. The 2D-frame success criterion is the pixel
+readback (`the picture's first pixel is 00 80 ff ff ...`) plus the step-22
+line above. **Caveat:** the adapter's `MiniIOMobileFramebufferShow()` only logs
+the request, so the pixels are proven in GPU memory but are not yet copied to
+the panel; a screenshot will not show the bands until the display bridge is
+implemented. Read the log on the next boot with
+`sweetlogdump=262144 sweetloggrep=adreno sweetlogdumpwait=120 ufslogsecs=1`
+(and keep `sweetgpu=0`).
+
+## 8. Files added by this port
 
 ```
 hakios-port/kernel/...                 reference sources, verbatim
