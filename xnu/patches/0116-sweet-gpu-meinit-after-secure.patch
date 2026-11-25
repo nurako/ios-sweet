@@ -1,0 +1,85 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1416,6 +1416,25 @@
+ 	if (steps < 11 || back0 != 0x600d0001u || back1 != 0x0a110002u)
+ 		goto collapse;
+ 
++	if (steps >= 18)
++	{
++	/* The zap ladder belongs before anything of the GPU is started (HackiOS
++	 * order). Asking once the GMU runs and the CP has accepted CP_ME_INIT is
++	 * what got -3145797 on alioth; try the early point first. */
++	if (steps >= 20) {
++		unsigned zs = 3;
++		(void)PE_parse_boot_argn("sweetgpuzap", &zs, sizeof(zs));
++		if (zs >= 2) {
++			printf("SWEET GPU: step 20 early: the zap ladder, before anything of the GPU is started (the powered-point run panicked)\n");
++			gpu_zap_ladder(zs);
++			printf("SWEET GPU: step 20 early: %s\n", zap_loaded ? "the shader is loaded and running" :
++			    "no shader (the lines above say why); carrying on");
++		}
++	}
++	}
++	if (steps < 18)
++		goto collapse;
++
+ 	/* ---- step 11: memory for the GMU, SMMU context 1 ---- */
+ 	{
+ 		const void *prop = NULL;
+@@ -1809,25 +1828,6 @@
+ 	    gpu_rd(gpu, GPU_CP_RB_BASE));
+ 	printf("SWEET GPU: step 17: THE 3D CORE HAS POWER AND ANSWERS\n");
+ 	gpu_core = gpu;
+-	if (steps >= 18)
+-	{
+-	/* The zap ladder belongs before anything of the GPU is started (HackiOS
+-	 * order). Asking once the GMU runs and the CP has accepted CP_ME_INIT is
+-	 * what got -3145797 on alioth; try the early point first. */
+-	if (steps >= 20) {
+-		unsigned zs = 3;
+-		(void)PE_parse_boot_argn("sweetgpuzap", &zs, sizeof(zs));
+-		if (zs >= 2) {
+-			printf("SWEET GPU: step 20 early: the zap ladder, now the 3D core is powered (hakios step 19)\n");
+-			gpu_zap_ladder(zs);
+-			printf("SWEET GPU: step 20 early: %s\n", zap_loaded ? "the shader is loaded and running" :
+-			    "no shader (the lines above say why); carrying on");
+-		}
+-	}
+-	}
+-	if (steps < 18)
+-		goto collapse;
+-
+ 	/* ---- step 18: the 3D core's memory: ring and microcode ---- */
+ 	static struct gpu_block core_ring, core_sqe;
+ 	const uint8_t *sqe = NULL;
+@@ -2023,6 +2023,30 @@
+ 		goto collapse;
+ 	}
+ 	printf("SWEET GPU: step 20: THE 3D CORE IS OUT OF SECURE MODE\n");
++
++	/*
++	 * The command processor was initialised while the core was still secure;
++	 * give it CP_ME_INIT once more now that the zap shader has run, so it is
++	 * initialised in the state it will actually work in.
++	 */
++	{
++		ring[at++] = (7u << 28) | 8u | (gpu_parity(8) << 15) | (CP_ME_INIT << 16) | (gpu_parity(CP_ME_INIT) << 23);
++		for (unsigned i = 0; i < 8; ++i)
++			ring[at++] = me_init[i];
++		gpu_to_memory(core_ring.mem, 4u * at);
++		gpu_wr(gpu, GPU_CP_RB_WPTR, at);
++		uint32_t rp2 = ~0u, st2 = ~0u;
++		for (unsigned i = 0; i < 20000 && (rp2 != at || (st2 & GPU_BUSY)); ++i) {
++			delay(100);
++			rp2 = gpu_rd(gpu, GPU_CP_RB_RPTR);
++			st2 = gpu_rd(gpu, GPU_RBBM_STATUS);
++		}
++		printf("SWEET GPU: step 20: CP_ME_INIT again: rptr %u of %u, status %#x\n", rp2, at, st2);
++		if (rp2 != at || (st2 & GPU_BUSY)) {
++			printf("SWEET GPU: step 20: the command processor does not take a second CP_ME_INIT\n");
++			goto collapse;
++		}
++	}
+ 	if (steps < 21)
+ 		goto collapse;
+ 
