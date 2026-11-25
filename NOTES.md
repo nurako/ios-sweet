@@ -314,6 +314,20 @@ were red herrings, and so was the "another kernel holds a shader" guess. `resear
 now holds the phone's real blobs (mdt sha256 2458df52...). Image AI `4019d008...` = same 0113
 kernel with the corrected firmware.
 
+**ZAP WORKS, CP STILL HANGS ON MEM_WRITE (2026-11-25).** With the phone's own `.mdt`, the log
+dump confirms the whole zap ladder succeeds: `TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM
+THIS KERNEL`, `tell TrustZone where the image goes: 0x8681a000`, `writing 1676 bytes`,
+`TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER`, `THE 3D CORE IS OUT OF SECURE MODE`
+(rptr 11 of 11, cp_int 0x1), and at teardown `zap shader given back to TrustZone`. Step 21 then
+fails: `CP_MEM_WRITE` moves rptr to 15 but `rbbm_status` stays `0x800005` (GPU busy) and no word
+is written. Remaining difference to hakios (working): they authenticate the zap AFTER the core is
+powered (their step 19, after step 18 power), we did it before CX power came up, so the zap shader
+may never have actually run on the GPU. Patch 0114 moves the ladder to just after step 17 and adds
+two hw_init registers (`0x8e04` rb_dbg_eco_cntl 0x04100000, `0x0534` rbbm_nc_mode_cntl 1).
+
+**CI BLOCKED:** GitHub Actions is disabled on the repo (dispatch 422) - private-repo macOS minutes
+exhausted. 0114 is committed and unbuilt until the repo goes public or the limit resets.
+
 **REFERENCE: `coreycusick/ios-guacamole`** (noted 2026-11-22) - an older-SoC port that
 reports iOS 27 working; useful for userland/driver compatibility questions later.
 
