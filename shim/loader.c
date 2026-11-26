@@ -173,6 +173,12 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	smmu_stream0_bypass();
+	/* Hold the answer on screen long enough to be photographed: the kernel clears it. */
+	{
+		volatile uint64_t n = 300000000ull;
+		while (n--)
+			__asm__ volatile("nop");
+	}
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
