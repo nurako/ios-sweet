@@ -32,7 +32,18 @@ fsck.hfsplus -f "$img" || true
 
 echo "== mount $img at $mnt"
 mkdir -p "$mnt"
-mount -o loop,rw "$img" "$mnt"
+# The iOS boots leave the HFS+ journal dirty, and Linux mounts such a volume
+# read-only unless forced (`force` skips the journal; fsck above and below
+# check the metadata itself).
+if ! mount -o loop,rw,force "$img" "$mnt" 2>/dev/null; then
+	mount -o loop,rw "$img" "$mnt"
+fi
+if ! touch "$mnt/.sweet-write-test" 2>/dev/null; then
+	echo "still read-only: try 'sudo umount $mnt' and re-run" >&2
+	umount "$mnt" 2>/dev/null
+	exit 1
+fi
+rm -f "$mnt/.sweet-write-test"
 
 echo "== install files"
 mkdir -p "$mnt/usr/local/lib" "$mnt/usr/local/bin"
