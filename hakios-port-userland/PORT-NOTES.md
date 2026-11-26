@@ -26,8 +26,10 @@ iOS process (backboardd, SpringBoard, a game)
 ```
 
 * Mesa is cross-built for iOS 16.5 by `tools/mk-mesa.sh` (Mesa **25.0.7**, sha256
-  `592272df…0f8a6`, source `archive.mesa3d.org`) with the eight `tools/mesa/*.patch`
-  files this port copies under `mesa/patches/`.
+  `592272df…0f8a6`, source `archive.mesa3d.org`) with `tools/mesa/*.patch`. This
+  port copies the **eight patches the OpenGL ES path needs** under
+  `mesa/patches/`; the reference also applies `air-frontend.patch` and
+  `air-ir3.patch`, which only feed the separate AIR/Metal build.
 * `tools/mesa/hakios-drm/` **is libdrm** for this system. `xf86drm.h` declares the
   subset freedreno uses; `hakios.drm.c` implements it. The model is literal:
   * `drmOpenWithType("msm", …)` finds the IOKit service named `HakiosGPU`,
