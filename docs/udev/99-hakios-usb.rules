@@ -1,0 +1,16 @@
+# HakiOS K40 CDC-ACM serial port (usb=2, 1209:316d) for the logged-in user.
+#
+# Install once:
+#   sudo install -m 0644 docs/udev/99-hakios-usb.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=tty
+#   # unplug/replug the USB cable, then: ls -l /dev/hakios-usb /dev/ttyACM*
+#
+# TAG+="uaccess" gives the user on the active seat an ACL (log out/in if the
+# session was already open).  dialout is a fallback for systems without
+# systemd-logind or for a headless user.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="316d", SYMLINK+="hakios-usb", MODE="0660", GROUP="dialout", TAG+="uaccess"
+
+# The bootloader/loader serial gadget uses the same VID/PID while its own link
+# is up; the rule above intentionally matches it too, so the boot log is
+# readable before the kernel takes the controller.
