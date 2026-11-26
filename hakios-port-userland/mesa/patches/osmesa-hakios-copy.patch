@@ -9,7 +9,7 @@
  
  #include "glapi/glapi.h"  /* for OSMesaGetProcAddress below */
  
-@@ -1054,3 +1056,47 @@
+@@ -1054,3 +1056,50 @@
        debug_warning("Calling OSMesaPostprocess() after OSMesaMakeCurrent()\n");
     }
  }
@@ -21,6 +21,9 @@
 + * no glBlitFramebuffer, and an application's CAEAGLLayer is shown by such a copy (userland/src/eagl.c).
 + * Nothing of the context's state is touched. GL_FALSE: no such renderbuffer or texture, or no storage.
 + */
++/* the prototype first: Mesa builds with -Werror=missing-prototypes */
++GLAPI GLboolean GLAPIENTRY OSMesaHakiosCopy(GLuint renderbuffer, GLuint texture, GLboolean flip);
++
 +GLAPI GLboolean GLAPIENTRY
 +OSMesaHakiosCopy(GLuint renderbuffer, GLuint texture, GLboolean flip)
 +{
