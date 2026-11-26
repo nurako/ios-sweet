@@ -45,6 +45,7 @@ and Metal are not there yet.
 | USB (gadget console) | **Blocked**: the femto HS PHY and DWC3 come up (`ep0` configured), but the apps SMMU translates StreamID 0 with a faulting S2CR and EL1 writes do not take, so the controller cannot fetch our DMA descriptors |
 | Wi-Fi / BT / cellular / audio / camera | Not working (no drivers) |
 | Logging | Kernel console ring persisted in the last 4 MiB of `userdata`, readable at the next boot with `sweetlogdump` / `sweetloggrep` (see below) |
+| SWEETBOX | Opt-in (`sweetbox=1`): a 1 MiB mailbox before the log ring accepts a checksummed file payload from recovery ADB and installs it at the next boot, without reflashing `userdata` (see [`docs/sweetbox.md`](docs/sweetbox.md)) |
 
 ## How it boots
 
@@ -75,6 +76,15 @@ ufslogsecs=1                    # flush the ring every second so the tail is com
 
 The dump prints at UFS init, before the root is mounted, so a quiet cmdline
 (`sweettouch=0 sweetkeys=0 sweetusb=0 sweetgpu=0`) keeps it on screen for the hold.
+
+### Installing files without reflashing `userdata` (SWEETBOX)
+
+Patch 0400 reserves 1 MiB immediately before the log ring for a mailbox. Pack
+files with `tools/sweet-box.py pack`, write them from recovery ADB with
+`tools/sweet-box.py apply`, then boot with `sweetbox=1`; the kernel installs
+them before launchd. The first box also installs `sweet-autorun` and a launchd
+job, so later boxes can run `/private/var/tmp/autorun.sh` and report through
+the log. Full design, commands and recovery: [`docs/sweetbox.md`](docs/sweetbox.md).
 
 ## How to build and boot (alioth)
 
@@ -199,6 +209,7 @@ The series starts from upstream ios-sweet (0001–0069). The alioth work in this
 | 0101–0102 | USB/SMMU reporting, `sweetlogdumpwait` |
 | 0103–0108 | GPU phases 1–2, step reordering, log-dump timing and `sweetloggrep` |
 | 0109 | Full staged Adreno 650 bring-up (steps 1–21, GMU firmware, HFI, SQE/CP, zap via SCM) |
+| 0400 | SWEETBOX: checksummed 1 MiB mailbox before the console ring, installs files before launchd (`sweetbox=1`, opt-in) |
 
 ## GPU bring-up (state of the art in this fork)
 

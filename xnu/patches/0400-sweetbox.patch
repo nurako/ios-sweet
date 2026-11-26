@@ -1,0 +1,515 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -708,6 +708,66 @@
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+ 
++/*
++ * SWEETBOX mailbox (0400): a 1 MiB raw area immediately BEFORE the console
++ * log header, so the log's own layout (last 1025 blocks) is untouched and an
++ * old log reader still works. The host writes a packed, checksummed payload
++ * there from recovery with tools/sweet-box.py; sweet_box.c reads it after
++ * the root mounts. Keeping it outside the HFS image (which ends at 16 GiB in
++ * a ~107 GiB partition) means the boot path never rewrites HFS metadata.
++ */
++#define SWEET_BOX_BLOCKS        256u
++#define SWEET_BOX_BYTES         (SWEET_BOX_BLOCKS * UFS_BLOCK)
++
++/* Device LBA of mailbox block 0, or 0 when the partition is too small. */
++static uint64_t
++sweet_box_lba(void)
++{
++	if (!su.nblocks || su.nblocks < SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS + 1) {
++		return 0;
++	}
++	return su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_BOX_BLOCKS;
++}
++
++/* Raw mailbox access for sweet_box.c; bounded to the reserved 1 MiB. */
++int sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count);
++int sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count);
++
++int
++sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count)
++{
++	uint64_t base = sweet_box_lba();
++	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
++		return EINVAL;
++	}
++	int error;
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(base + first, count);
++	if (!error) {
++		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count)
++{
++	uint64_t base = sweet_box_lba();
++	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
++		return EINVAL;
++	}
++	int error;
++	lck_mtx_lock(&sweet_ufs_lock);
++	memcpy((void *)(su.dma + DMA_BOUNCE), src, count * UFS_BLOCK);
++	error = ufs_write_blocks(base + first, count);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+@@ -821,7 +881,8 @@
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on || !su.writable ||
++	    su.nblocks < 2 * SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -170,7 +170,7 @@
+ {
+ 	if (!sweet_null_parsed) {
+ 		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
+-			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
++			strlcpy(sweet_null_names, "backboardd,SpringBoard,sweet-autorun", sizeof(sweet_null_names));
+ 		}
+ 		sweet_null_parsed = 1;
+ 	}
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -951,6 +951,19 @@
+ 	}
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEETBOX (0400): install a packed, checksummed payload from the
++	 * userdata tail before launchd runs. Boot-arg sweetbox=0 (default)
++	 * keeps the old boot exactly as it was.
++	 */
++	{
++		extern void sweet_box_init(void);
++		sweet_box_init();
++	}
++#endif
++
++
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
+ 		int err;
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_box.c			standard
+ bsd/dev/hakios.usb.c			standard
+ bsd/dev/hakios.dwc3.c			standard
+ bsd/dev/hakios_usb_adapter.c		standard
+--- /dev/null
++++ b/bsd/dev/sweet_box.c
+@@ -0,0 +1,390 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEETBOX (0400): install files from the PC into the running iOS root
++ * without reflashing userdata.
++ *
++ * The mailbox is the 1 MiB raw area immediately before the persistent
++ * console log (last 1025 blocks of userdata); see sweet_ufs.c. The PC packs
++ * it with tools/sweet-box.py and writes it through recovery ADB (the same
++ * path tools/sweet-log-pull.sh reads). This file verifies the magic, the
++ * header checksum and the payload CRC-32 before it touches any file, then:
++ *
++ *   - entries named ROOT/<path> are written to /<path> (only with boot-arg
++ *     sweetboxroot=1, and only under the allowlist below);
++ *   - every other entry is written flat to /private/var/tmp/<name>
++ *     ("/" becomes "_", the kernel has no mkdir KPI);
++ *   - /private/var/tmp/SWEETBOX.done is written last, so the launchd job
++ *     com.sweet.autorun (userland/sweet-autorun.c) knows this boot's box is
++ *     complete before it runs /private/var/tmp/autorun.sh;
++ *   - the mailbox header state becomes 1 (installed) or 2 (failed), so the
++ *     same box is not applied twice. The PC tool always writes state 0.
++ *
++ * Runs from bsd_init after the root is mounted and before launchd, so a
++ * ROOT/System/Library/xpc/launchd.plist + ROOT/System/Library/LaunchDaemons
++ * job are used by the same boot. Boot-arg sweetbox=0 (default) is a no-op.
++ *
++ * The format is byte-order little endian, header 32 bytes:
++ *   "SWEETBOX" | u32 version=1 | u32 nfiles | u32 payload_len |
++ *   u32 payload_crc32 | u32 state | u32 header_crc32
++ * payload_crc32 covers the payload_len bytes after the header;
++ * header_crc32 covers the first 28 bytes. A file entry is
++ *   u16 namelen | name | u32 size | u32 crc32 | data.
++ *
++ * Phase-1 trade-offs: the PC must be in recovery to write the mailbox, so a
++ * box applies on the next boot (there is no live channel into the running
++ * system). RAM cost is one 1 MiB buffer during bsd_init. The allowlist is
++ * deliberately narrow; /usr/libexec/sweet-autorun and the launchd cache are
++ * in it because that is the one-time bootstrap.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/uio.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++
++extern int sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count);
++extern int sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count);
++
++#define BOX_MAGIC          "SWEETBOX"
++#define BOX_VERSION        1u
++#define BOX_HEADER_SIZE    32u
++#define BOX_MAX_FILES      64u
++#define BOX_MAX_NAME       255u
++#define BOX_BLOCKS         256u
++#define BOX_BYTES          (BOX_BLOCKS * 4096u)
++#define BOX_BASE_DIR       "/private/var/tmp"
++#define BOX_DONE_FILE      BOX_BASE_DIR "/SWEETBOX.done"
++#define BOX_ROOT           "ROOT/"
++#define BOX_ROOT_LEN       5u
++
++#define BOX_STATE_PENDING  0u
++#define BOX_STATE_DONE     1u
++#define BOX_STATE_FAILED   2u
++
++struct box_header {
++	char magic[8];
++	uint32_t version, nfiles, payload_len, payload_crc, state, header_crc;
++};
++
++static uint32_t
++box_header_crc(const struct box_header *h)
++{
++	return crc32(0, h, offsetof(struct box_header, header_crc));
++}
++
++static int
++box_write_file(const char *path, const uint8_t *data, uint32_t size, vfs_context_t ctx)
++{
++	struct vnode *vp = NULLVP;
++	/* vnode_open takes kernel F-flags (FWRITE), not O_WRONLY. */
++	int err = vnode_open(path, FWRITE | O_CREAT, 0755, 0, &vp, ctx);
++	if (err || vp == NULLVP) {
++		printf("SWEET BOX: open %s: %d\n", path, err);
++		return err ? err : ENOENT;
++	}
++	/*
++	 * vnode_open() ignores O_TRUNC on this path (vn_open_auth leaves it to
++	 * the open syscall), so truncate explicitly like kern_core.c does:
++	 * otherwise a shorter replacement keeps the old file's tail.
++	 */
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_data_size, 0);
++	err = vnode_setattr(vp, &va, ctx);
++	if (err) {
++		printf("SWEET BOX: truncate %s: %d\n", path, err);
++	}
++	if (!err && size) {
++		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++		uio_addiov(uio, (user_addr_t)(uintptr_t)data, size);
++		err = VNOP_WRITE(vp, uio, 0, ctx);
++		uio_free(uio);
++	}
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return err ? err : cerr;
++}
++
++/* No empty, "." or ".." components and no leading '/'. */
++static bool
++box_path_ok(const char *path)
++{
++	const char *c = path;
++	if (!path[0] || path[0] == '/') {
++		return false;
++	}
++	for (;;) {
++		const char *e = strchr(c, '/');
++		size_t n = e ? (size_t)(e - c) : strlen(c);
++		if (n == 0 || (n == 1 && c[0] == '.') ||
++		    (n == 2 && c[0] == '.' && c[1] == '.')) {
++			return false;
++		}
++		if (!e) {
++			return true;
++		}
++		c = e + 1;
++	}
++}
++
++/*
++ * Root installs are the dangerous part (a bad launchd cache or launchd
++ * itself can stop the UI). Phase 1 accepts only these destinations; add
++ * prefixes deliberately, and remember that a broken file here can be
++ * replaced by the next box because this runs before launchd reads anything.
++ */
++static const char *box_root_allowed[] = {
++	"private/var/tmp/",
++	"private/var/mobile/",
++	"usr/libexec/sweet-autorun",
++	"usr/local/bin/",
++	"var/local/bin/",
++	"var/local/lib/",
++	"System/Library/LaunchDaemons/",
++	"System/Library/xpc/launchd.plist",
++	NULL
++};
++
++static bool
++box_root_allowed_path(const char *path)
++{
++	for (unsigned i = 0; box_root_allowed[i]; i++) {
++		const char *a = box_root_allowed[i];
++		size_t n = strlen(a);
++		if (strncmp(path, a, n) == 0) {
++			/* Exact match, or a prefix ending in '/' */
++			if (path[n] == '\0' || (n && a[n - 1] == '/')) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++static void *
++box_read(struct box_header *h, uint32_t *payload_len)
++{
++	vm_offset_t kva;
++	if (kmem_alloc(kernel_map, &kva, BOX_BYTES, KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET BOX: no memory for the mailbox\n");
++		return NULL;
++	}
++	void *buf = (void *)kva;
++	if (sweet_ufs_box_read(0, buf, BOX_BLOCKS) != 0) {
++		printf("SWEET BOX: cannot read the mailbox (UFS not ready)\n");
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	memcpy(h, buf, sizeof(*h));
++	if (memcmp(h->magic, BOX_MAGIC, 8) != 0) {
++		printf("SWEET BOX: no SWEETBOX magic in the mailbox\n");
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	if (h->version != BOX_VERSION || h->header_crc != box_header_crc(h)) {
++		printf("SWEET BOX: bad header (version %u, crc %#x/%#x)\n",
++		    h->version, h->header_crc, box_header_crc(h));
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	if (h->state != BOX_STATE_PENDING) {
++		printf("SWEET BOX: mailbox state %u, not pending; skipping\n", h->state);
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	if (h->nfiles == 0 || h->nfiles > BOX_MAX_FILES ||
++	    h->payload_len == 0 || h->payload_len > BOX_BYTES - BOX_HEADER_SIZE) {
++		printf("SWEET BOX: bad size (nfiles %u, payload %u)\n",
++		    h->nfiles, h->payload_len);
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	uint32_t crc = crc32(0, (const uint8_t *)buf + BOX_HEADER_SIZE, h->payload_len);
++	if (crc != h->payload_crc) {
++		printf("SWEET BOX: payload CRC mismatch (%#x != %#x); ignored\n",
++		    crc, h->payload_crc);
++		kmem_free(kernel_map, kva, BOX_BYTES);
++		return NULL;
++	}
++	*payload_len = h->payload_len;
++	return buf;
++}
++
++static int
++box_stamp_state(uint32_t state)
++{
++	vm_offset_t kva;
++	if (kmem_alloc(kernel_map, &kva, 4096, KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	uint8_t *blk = (uint8_t *)kva;
++	int err = sweet_ufs_box_read(0, blk, 1);
++	if (err) {
++		kmem_free(kernel_map, kva, 4096);
++		return err;
++	}
++	struct box_header *h = (struct box_header *)blk;
++	if (memcmp(h->magic, BOX_MAGIC, 8) != 0) {
++		kmem_free(kernel_map, kva, 4096);
++		return EINVAL;
++	}
++	h->state = state;
++	h->header_crc = box_header_crc(h);
++	err = sweet_ufs_box_write(0, blk, 1);
++	kmem_free(kernel_map, kva, 4096);
++	return err;
++}
++
++/*
++ * One pass over the entries. root_pass: write only ROOT/ entries to /<path>.
++ * Otherwise write the rest flat to BOX_BASE_DIR and count every entry.
++ * Returns the number written, sets *seen to the number of entries of this
++ * kind and *failed when a write was refused.
++ */
++static unsigned
++box_walk(const uint8_t *payload, uint32_t payload_len, uint32_t nfiles,
++    bool root_pass, unsigned *seen, bool *failed)
++{
++	const uint8_t *cur = payload;
++	const uint8_t *end = payload + payload_len;
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned written = 0;
++
++	*seen = 0;
++	*failed = false;
++	uint32_t i;
++	for (i = 0; i < nfiles && cur < end; i++) {
++		if (cur + 2 > end) {
++			printf("SWEET BOX: truncated entry %u\n", i);
++			*failed = true;
++			break;
++		}
++		uint16_t namelen;
++		memcpy(&namelen, cur, 2);
++		cur += 2;
++		if (namelen == 0 || namelen > BOX_MAX_NAME || cur + namelen + 8 > end) {
++			printf("SWEET BOX: bad entry %u (name %u)\n", i, namelen);
++			*failed = true;
++			break;
++		}
++		char name[BOX_MAX_NAME + 1];
++		memcpy(name, cur, namelen);
++		name[namelen] = '\0';
++		cur += namelen;
++		uint32_t size, crc;
++		memcpy(&size, cur, 4);
++		cur += 4;
++		memcpy(&crc, cur, 4);
++		cur += 4;
++		if (cur + size > end) {
++			printf("SWEET BOX: %s overruns the payload\n", name);
++			*failed = true;
++			break;
++		}
++		const uint8_t *data = cur;
++		cur += size;
++		if (crc32(0, data, size) != crc) {
++			printf("SWEET BOX: %s: file CRC mismatch, skipped\n", name);
++			*failed = true;
++			continue;
++		}
++
++		bool is_root = strncmp(name, BOX_ROOT, BOX_ROOT_LEN) == 0;
++		if (is_root != root_pass) {
++			continue;
++		}
++		(*seen)++;
++		char dest[512];
++		if (is_root) {
++			const char *rel = name + BOX_ROOT_LEN;
++			if (!box_path_ok(rel) || !box_root_allowed_path(rel)) {
++				printf("SWEET BOX: %s: root path not allowed, skipped\n", name);
++				*failed = true;
++				continue;
++			}
++			snprintf(dest, sizeof(dest), "/%s", rel);
++		} else {
++			for (unsigned k = 0; name[k]; k++) {
++				if (name[k] == '/') {
++					name[k] = '_';         /* flat: no directories */
++				}
++			}
++			if (name[0] == '.') {
++				name[0] = '_';             /* no ".." or hidden names */
++			}
++			snprintf(dest, sizeof(dest), BOX_BASE_DIR "/%s", name);
++		}
++		if (box_write_file(dest, data, size, ctx) == 0) {
++			printf("SWEET BOX: %s %s (%u B)\n",
++			    is_root ? "installed" : "extracted", dest, size);
++			written++;
++		} else {
++			*failed = true;
++		}
++	}
++	if (i != nfiles) {
++		printf("SWEET BOX: parsed %u of %u entries\n", i, nfiles);
++		*failed = true;
++	}
++	return written;
++}
++
++void
++sweet_box_init(void)
++{
++	uint32_t enabled = 0, root = 0;
++	(void)PE_parse_boot_argn("sweetbox", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetboxroot", &root, sizeof(root));
++
++	/* This boot's marker: empty until the box extraction below finishes. */
++	int derr = box_write_file(BOX_DONE_FILE, NULL, 0, vfs_context_kernel());
++	printf("SWEET BOX: enabled; emptied " BOX_DONE_FILE " (%d)\n", derr);
++
++	struct box_header h;
++	uint32_t payload_len = 0;
++	void *buf = box_read(&h, &payload_len);
++	if (!buf) {
++		/* Bad magic/CRC: leave the mailbox alone for the PC to inspect. */
++		return;
++	}
++	printf("SWEET BOX: %u file(s), %u payload bytes, root install %s\n",
++	    h.nfiles, payload_len, root ? "on" : "off");
++
++	const uint8_t *payload = (const uint8_t *)buf + BOX_HEADER_SIZE;
++	unsigned root_seen = 0, flat_seen = 0;
++	bool failed = false;
++	unsigned root_written = 0;
++	if (root) {
++		root_written = box_walk(payload, payload_len, h.nfiles, true,
++		    &root_seen, &failed);
++		if (root_written != root_seen) {
++			failed = true;
++		}
++	}
++	unsigned flat_written = box_walk(payload, payload_len, h.nfiles, false,
++	    &flat_seen, &failed);
++
++	char done[64];
++	int n = snprintf(done, sizeof(done), "%u/%u flat, %u/%u root\n",
++	    flat_written, flat_seen, root_written, root_seen);
++	if (box_write_file(BOX_DONE_FILE, (const uint8_t *)done, (uint32_t)n,
++	    vfs_context_kernel()) != 0) {
++		failed = true;
++	}
++	printf("SWEET BOX: done, %u/%u flat, %u/%u root%s\n", flat_written,
++	    flat_seen, root_written, root_seen, failed ? " (with errors)" : "");
++	int serr = box_stamp_state(failed ? BOX_STATE_FAILED : BOX_STATE_DONE);
++	printf("SWEET BOX: stamped state %u: %d\n",
++	    failed ? BOX_STATE_FAILED : BOX_STATE_DONE, serr);
++	kmem_free(kernel_map, (vm_offset_t)buf, BOX_BYTES);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
