@@ -1,0 +1,128 @@
+/* hakios: FFT-infra/QcomXnuUsbDebug usb/Dwc3.h at ab6e363, unchanged. */
+/* SPDX-License-Identifier: MIT */
+#ifndef DWC3_H
+#define DWC3_H
+#include <stddef.h>
+#include <stdint.h>
+
+/* One caller-owned, contiguous device-DMA mapping. Never assume DMA == PA. */
+#define DWC3_DMA_BYTES 32768u
+#define DWC3_DMA_ALIGNMENT 4096u
+#define DWC3_CONTEXT_ALIGNMENT 8u
+#define DWC3_CONTEXT_BYTES 40960u
+#define DWC3_TX_BYTES 16384u
+#define DWC3_RX_BYTES 16384u
+/* hakios: in mux mode one packet (what one dwc3_send_packet() gives) is one USB transfer, at most this long */
+#define DWC3_PACKET_MAX 4096u
+
+/* Copied at init; no SoC configuration, OS headers or platform IDs here.
+ * Each string must contain 1..63 printable ASCII characters (hakios: 63, for a 40-character UDID).
+ * hakios: mux != 0 -- not the serial port but what an iPhone shows: one vendor interface (class 0xff,
+ * subclass 0xfe, protocol 2: Apple's usbmux) as interface 1 beside an empty interface 0, bulk OUT 0x02
+ * and IN 0x82, configurations 1 to 4 alike, and packets (dwc3_send_packet()) instead of a byte stream. */
+struct dwc3_identity {
+    uint16_t vid, pid;
+    const char *manufacturer, *product, *serial;
+    int mux;
+    uint16_t bcd_device;
+};
+/* hakios: mux == DWC3_FASTBOOT -- Android's fastboot (the loader's link): one vendor interface (class 0xff, subclass
+ * 0x42, protocol 3), bulk OUT 0x02 and IN 0x82, one configuration. Nothing is armed by itself: each bulk transfer is
+ * started by the caller into or out of memory of its own (dwc3_bulk()) and seen to end (dwc3_bulk_done()). */
+#define DWC3_FASTBOOT 2
+/* one bulk transfer at most (a TRB's size field has 24 bits), a multiple of 4096 */
+#define DWC3_BULK_MAX 0x00fff000u
+
+enum dwc3_sync_direction {
+    DWC3_TO_DEVICE,
+    DWC3_FROM_DEVICE
+};
+
+enum dwc3_trace {
+    DWC3_TRACE_ID = 1,
+    DWC3_TRACE_TIMEOUT,
+    DWC3_TRACE_COMMAND,
+    DWC3_TRACE_DEVICE_EVENT,
+    DWC3_TRACE_SETUP,
+    DWC3_TRACE_UNSUPPORTED,
+    DWC3_TRACE_BAD_EVENT,
+    DWC3_TRACE_READY,
+    DWC3_TRACE_STUCK,      /* hakios: bus resets with no request between them: the device side from scratch */
+    DWC3_TRACE_CONFIGURED, /* hakios: SET_CONFIGURATION (a: the value, b: mux mode) */
+    DWC3_TRACE_ARMED,      /* hakios: a bulk OUT transfer started (a: the endpoint, b: bytes in the RX ring) */
+    DWC3_TRACE_NOT_READY   /* hakios: the host tried a bulk endpoint with no transfer there (a: the endpoint,
+                              b: active | configured << 8 | MIN(rx_used, 0xffff) << 16) */
+};
+
+struct dwc3_platform {
+    void *cookie;
+    uint32_t (*read32)(void *cookie, uint32_t offset);
+    void (*write32)(void *cookie, uint32_t offset, uint32_t value);
+    void (*delay_us)(void *cookie, uint32_t usec);
+    /* Must also handle noncoherent DMA. Event/TRB cache lines are separate. */
+    void (*dma_sync)(void *cookie, void *cpu, size_t bytes,
+                     enum dwc3_sync_direction direction);
+    void (*barrier)(void *cookie);
+    void (*trace)(void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b);
+};
+
+struct dwc3;
+size_t dwc3_context_bytes(void);
+/* Platform must have already established device role, PHY/clocks, power and
+ * SMMU mapping. This resets only the DWC device side; it never initializes PHY.
+ * Buffers must remain mapped at the same CPU/DMA addresses for this instance.
+ * Returns 0 or a negative code. On failure controller is left stopped. */
+int dwc3_init(void *context, size_t context_bytes,
+                  const struct dwc3_platform *platform,
+                  const struct dwc3_identity *identity,
+                  void *dma_cpu, uint64_t dma_device, size_t dma_bytes);
+int dwc3_start(struct dwc3 *dev);
+/* Each poll is bounded to min(budget, 256) events. Call from one CPU only;
+ * no interrupts, allocation, scheduler, EFI or platform-library calls occur. */
+int dwc3_poll(struct dwc3 *dev, unsigned int budget);
+/* Nonblocking ring; accepts early messages before the host opens the port. */
+size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
+/* hakios, mux mode: one packet (1..DWC3_PACKET_MAX bytes) queued whole, or not at all: returns 0 or -1 (no room). */
+int dwc3_send_packet(struct dwc3 *dev, const void *bytes, size_t count);
+/* hakios, mux mode: room for one more packet of that size */
+int dwc3_packet_room(const struct dwc3 *dev, size_t count);
+/* Nonblocking bulk-OUT receive ring. The caller must serialize this with poll
+ * on the same CPU. A device reset/disconnect clears pending RX bytes and
+ * advances rx_generation so a protocol parser can invalidate its state. */
+size_t dwc3_read(struct dwc3 *dev, void *bytes, size_t count);
+int dwc3_ready(const struct dwc3 *dev);
+size_t dwc3_queued(const struct dwc3 *dev);
+uint64_t dwc3_dropped(const struct dwc3 *dev);
+size_t dwc3_rx_pending(const struct dwc3 *dev);
+uint64_t dwc3_rx_overflow(const struct dwc3 *dev);
+uint32_t dwc3_rx_generation(const struct dwc3 *dev);
+struct dwc3_snapshot {
+    uint32_t events, commands, last_event, event_offset;
+    uint32_t snpsid, gctl, dcfg, dctl, dsts, event_count, enabled_endpoints;
+    uint32_t configured, dtr, queued, active_endpoints;
+    uint32_t rx_pending, rx_generation;
+    uint64_t rx_overflow;
+    int32_t failed;
+};
+/* Read-only diagnostics, for callers that already own powered MMIO access. */
+void dwc3_snapshot(struct dwc3 *dev, struct dwc3_snapshot *snapshot);
+/* hakios, fastboot mode: one bulk transfer started -- in (to the host) from `dma`, or out (from the host) into it;
+ * out, `bytes` is a multiple of the packet size, and a short packet ends it early. The memory stays the caller's
+ * to keep, and to clean or invalidate in its caches; it is not touched here. 0, or negative: one runs already in
+ * that direction, the device is not configured, or the size will not do. */
+int dwc3_bulk(struct dwc3 *dev, int in, uint64_t dma, uint32_t bytes);
+/* 1 and the bytes moved once it is over; 0 while it runs; negative if none runs or a reset ended it */
+int dwc3_bulk_done(struct dwc3 *dev, int in, uint32_t *bytes);
+/* A running one ended: its memory is the caller's again. */
+int dwc3_bulk_cancel(struct dwc3 *dev, int in);
+/* The packet size of the bulk endpoints now (512 at high speed, 64 at full); 0 while not configured. */
+uint32_t dwc3_packet_size(const struct dwc3 *dev);
+/* Stops DMA. Do not release mapping until this succeeds. */
+int dwc3_stop(struct dwc3 *dev);
+int dwc3_recover(struct dwc3 *dev);
+
+/* Descriptor view for host conformance tests and the firmware USB backend.
+ * type uses USB descriptor IDs; full_speed selects bulk wMaxPacketSize=64. */
+const void *dwc3_descriptor(const struct dwc3 *dev, unsigned int type, unsigned int index,
+                               int full_speed, size_t *length);
+#endif
