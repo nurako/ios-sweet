@@ -73,6 +73,13 @@ jobs:
       - name: Mesa build dependencies
         run: brew install meson ninja bison flex
 
+      - name: llvm tools (llvm-ar, llvm-ranlib, llvm-strip for Mesa)
+        run: |
+          # Xcode's toolchain does not ship llvm-ar/ranlib/strip on the runners.
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix llvm)/bin/llvm-ar" --version | head -1
+
       - name: Build Mesa (freedreno) + DRM client + gl_test
         # Additive: this only adds files to artifacts/.  The usbsh/usbmux job
         # above is unchanged.  build-mesa.sh pins Mesa 25.0.7 and the eight
