@@ -2,11 +2,15 @@
 #
 # Talk to usbsh on the phone over the usb=2 CDC-ACM serial port.
 #
-# The kernel's USB serial port carries the kernel log until the computer types
-# something; then usbsh (hakios-port-usb/userland/src/usbsh.c, launchd job
-# com.hakios.usbsh) takes the input, prints a banner and an "ios:<cwd># " prompt,
-# echoes each line, and runs it: builtins (ls, cat, b64, cd, pwd, dmesg, ...) or
-# a program with arguments. "log" gives the port back to the kernel log.
+# The kernel's USB serial port always carries the kernel log. A shell is the
+# exception: the host sends the magic line "\x1d\x1dSHELL\n", the kernel stops
+# the log, prints "--- usbsh: log paused; 'log' resumes it ---" and wakes usbsh
+# (hakios-port-usb/userland/src/usbsh.c, launchd job com.hakios.usbsh), which
+# prints an "ios:<cwd># " prompt, echoes each line, and runs it: builtins (ls,
+# cat, b64, cd, pwd, dmesg, ...) or a program with arguments. "log" returns the
+# port to the kernel log; 120 s with no shell input does the same.
+# If the magic is not acknowledged the tool prints the log stream instead, so
+# a silent or shell-less boot is still visible.
 #
 # Usage:
 #   tools/sweet-usbsh.sh                     interactive shell
@@ -18,7 +22,8 @@
 # Options:
 #   -d DEV    serial device (default: $SWEET_USB_PORT, else the first /dev/ttyACM*)
 #   -b BAUD   baud (default 115200; a CDC-ACM gadget ignores it)
-#   -t SEC    seconds to wait for each prompt (default 10; b64 transfers use 60)
+#   -t SEC    seconds to wait for each prompt / log fallback (default 10; b64: 60)
+#   -a SEC    seconds to wait for the shell banner (default 3)
 #   -l        keep the kernel log printed during the handshake
 #   -g REMOTE [LOCAL]
 #             download REMOTE with usbsh's "b64"; LOCAL "-" or omitted = stdout
@@ -33,13 +38,14 @@ exec python3 - "$@" <<'PY'
 import base64, glob, os, re, select, sys, termios, time
 
 def usage(code=2):
-    print(__doc__ or "usage: sweet-usbsh.sh [-d DEV] [-b BAUD] [-t SEC] [-l] [-g REMOTE [LOCAL]] [COMMAND...]",
+    print(__doc__ or "usage: sweet-usbsh.sh [-d DEV] [-b BAUD] [-t SEC] [-a SEC] [-l] [-g REMOTE [LOCAL]] [COMMAND...]",
           file=sys.stderr)
     raise SystemExit(code)
 
 port = os.environ.get("SWEET_USB_PORT", "")
 baud = int(os.environ.get("SWEET_USB_BAUD", "115200"))
 timeout = 10.0
+ack_timeout = 3.0
 keep_log = False
 get = False
 args = sys.argv[1:]
@@ -54,6 +60,8 @@ while i < len(args):
         i += 1; baud = int(args[i])
     elif a == "-t":
         i += 1; timeout = float(args[i])
+    elif a == "-a":
+        i += 1; ack_timeout = float(args[i])
     elif a == "-l":
         keep_log = True
     elif a == "-g":
@@ -146,6 +154,44 @@ def read_until_marker(marker, seconds):
             return bytes(buf)
     return None
 
+def read_for(seconds, initial=b""):
+    """Read whatever comes for SECONDS; return the bytes."""
+    buf = bytearray(initial)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as e:
+            if e.errno == 5:
+                break
+            raise
+        if not chunk:
+            continue
+        buf += chunk
+    return bytes(buf)
+
+def read_prompts(initial, want, seconds):
+    """Read until WANT total ios:... prompts are in INITIAL plus new bytes."""
+    buf = bytearray(initial)
+    deadline = time.monotonic() + seconds
+    while len(PROMPT.findall(buf)) < want and time.monotonic() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as e:
+            if e.errno == 5:
+                break
+            raise
+        if not chunk:
+            continue
+        buf += chunk
+    return bytes(buf) if len(PROMPT.findall(buf)) >= want else None
+
 def show(data):
     sys.stdout.buffer.write(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
     sys.stdout.buffer.flush()
@@ -157,14 +203,30 @@ def bail(msg, data=None):
     print(f"sweet-usbsh: {msg}", file=sys.stderr)
     raise SystemExit(1)
 
-# One write for the non-interactive cases: a bare CR takes the port (usbsh
-# prints its banner and a first prompt), then the command and its CR. Waiting
-# for the second prompt is what makes this race-free.
-def takeover(cmd):
-    os.write(fd, b"\r" + cmd.encode() + b"\r")
+MAGIC = b"\x1d\x1dSHELL\n"
+BANNER = b"--- usbsh: log paused; 'log' resumes it ---"
+
+def request_shell(ack_seconds):
+    """Send the magic line; return the banner bytes, or None if not acknowledged."""
+    os.write(fd, MAGIC)
+    return read_until_marker(BANNER, ack_seconds)
+
+def fallback_log(prefix, seconds):
+    """The magic was not acknowledged: print the log stream so the tool is never silent."""
+    if prefix:
+        show(prefix)
+    more = read_for(seconds)
+    if more:
+        show(more)
+    print(f"sweet-usbsh: no shell acknowledgement; printed {seconds:g} s of the kernel log instead",
+          file=sys.stderr)
+    raise SystemExit(1)
 
 if get:
-    takeover("b64 " + remote)
+    data = request_shell(ack_timeout)
+    if data is None:
+        fallback_log(None, timeout)
+    os.write(fd, b"b64 " + remote.encode() + b"\r")
     data = read_until_marker(b"b64: END", 60)
     if data is None:
         bail(f"no answer to b64 {remote}")
@@ -187,10 +249,13 @@ if get:
     raise SystemExit(0)
 
 if rest:
-    takeover(" ".join(rest))
-    data = read_until(2, timeout)
+    ack = request_shell(ack_timeout)
+    if ack is None:
+        fallback_log(None, timeout)
+    os.write(fd, " ".join(rest).encode() + b"\r")
+    data = read_prompts(ack, 2, timeout)
     if data is None:
-        bail("no prompt after the command", data)
+        bail("no prompt after the command", ack)
     text = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     lines = text.decode(errors="replace").split("\n")
     out = [l for l in lines
@@ -200,16 +265,15 @@ if rest:
         print("\n".join(out))
     raise SystemExit(0)
 
-# Interactive: handshake, then one line per prompt.
-os.write(fd, b"\r")
-data = read_until(1, timeout)
+# Interactive: request the shell, then one line per prompt.
+ack = request_shell(ack_timeout)
+if ack is None:
+    fallback_log(None, timeout)
+data = read_prompts(ack, 1, timeout)
 if data is None:
-    bail("no usbsh prompt (is usb=2 set and usbsh installed/running?)")
-if keep_log:
-    show(data)
-else:
-    show(b"".join(l + b"\n" for l in data.split(b"\n")
-                  if l.startswith(b"--- usbsh: the log is paused")))
+    bail("no usbsh prompt after the magic line", ack)
+show(data if keep_log else b"".join(l + b"\n" for l in data.split(b"\n")
+                                    if l.startswith(BANNER) or PROMPT.match(l)))
 try:
     while True:
         line = sys.stdin.readline()

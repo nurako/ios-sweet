@@ -52,6 +52,7 @@ static int port = -1;
 static int talking;                     /* the computer has typed since the log last had the port */
 static int network;                     /* -l: port is a TCP connection ("log" ends it) */
 static int hang_up;
+static int leave_shell;                 /* the USB shell's "log": close and wait for the next request */
 static char cwd[1024] = "/";
 
 /* To the port, '\n' as "\r\n" (a terminal on the other side). */
@@ -612,9 +613,10 @@ execute(char *line)
 	} else if (network && (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit"))) {
 		hang_up = 1;
 	} else if (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit")) {
-		out("usbsh: the log again (type anything to come back)\n");
+		out("usbsh: log mode again (send the magic line to return)\n");
 		ioctl(port, HAKIOS_USB_LOG);
 		talking = 0;
+		leave_shell = 1;
 	} else if (!strcmp(argv[0], "ls")) {
 		cmd_ls(argc > 1 ? argv[1] : ".");
 	} else if (!strcmp(argv[0], "cat") && argc > 1) {
@@ -760,15 +762,8 @@ serve(void)
 			char c = buf[i];
 
 			if (!talking) {
-				/* the first thing typed since the log had the port */
 				talking = 1;
-				bootlog("USBSH: the computer has taken the port; kernel log paused");
 				len = 0;
-				out("\n--- usbsh: the log is paused; 'help' for commands, 'log' to resume it ---\n");
-				prompt();
-				if (c == '\r' || c == '\n') {
-					continue;
-				}
 			}
 			if (c == '\r' || c == '\n') {
 				if (c == '\n' && i > 0 && buf[i - 1] == '\r') {
@@ -778,7 +773,8 @@ serve(void)
 				line[len] = 0;
 				execute(line);
 				len = 0;
-				if (hang_up) {
+				if (hang_up || leave_shell) {
+					leave_shell = 0;
 					return 0;
 				}
 				if (talking) {
@@ -934,7 +930,7 @@ usb_level(void)
 int
 main(int argc, char **argv)
 {
-	int level;
+	int level, ctl = -1;
 	unsigned tries = 0;
 
 	signal(SIGPIPE, SIG_IGN);
@@ -953,24 +949,59 @@ main(int argc, char **argv)
 		    level == 3 ? "usbmux owns the port" : "no CDC-ACM port on this boot");
 		return 0;
 	}
-	bootlog("USBSH: usb=2: waiting for /dev/hakios-usb (the kernel brings the CDC port up early in boot)");
+	/*
+	 * The log is the invariant: usbsh does not open /dev/hakios-usb at boot. It waits on the control node
+	 * until the kernel has seen the host's magic line and stopped the log; only then does the port belong to
+	 * the shell. After "log" or the kernel's idle timeout it closes the port and waits here again.
+	 */
+	bootlog("USBSH: usb=2: log mode; waiting for the shell magic on /dev/hakios-usb-shell");
 	for (;;) {
-		port = open("/dev/hakios-usb", O_RDWR);
-		if (port >= 0) {
-			break;
+		char c;
+		ssize_t n;
+
+		if (ctl < 0) {
+			ctl = open("/dev/hakios-usb-shell", O_RDONLY);
+			if (ctl < 0) {
+				if (tries == 0 || tries % 30 == 29) {
+					bootlog("USBSH: /dev/hakios-usb-shell not ready (%s), still waiting (%u s)",
+					    strerror(errno), tries + 1);
+				}
+				tries++;
+				sleep(1);
+				continue;
+			}
 		}
-		if (errno != ENXIO && errno != EBUSY && errno != ENOENT) {
-			bootlog("USBSH: open /dev/hakios-usb: %s", strerror(errno));
-			return 1;
+		n = read(ctl, &c, 1);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) {
+				continue;
+			}
+			bootlog("USBSH: control node: %s; reopening", n < 0 ? strerror(errno) : "closed");
+			close(ctl);
+			ctl = -1;
+			sleep(1);
+			continue;
 		}
-		if (tries == 0 || tries % 30 == 29) {
-			bootlog("USBSH: /dev/hakios-usb not ready (%s), still waiting (%u s)",
-			    strerror(errno), tries + 1);
+		bootlog("USBSH: host asked for a shell; opening /dev/hakios-usb");
+		for (tries = 0, port = -1; tries < 10; tries++) {
+			port = open("/dev/hakios-usb", O_RDWR);
+			if (port >= 0) {
+				break;
+			}
+			sleep(1);
 		}
-		tries++;
-		sleep(1);
+		if (port < 0) {
+			bootlog("USBSH: the shell request expired before open (%s); back to the log", strerror(errno));
+			continue;
+		}
+		bootlog("USBSH: shell took the port; 'log' or 120 s idle returns it to the log");
+		talking = 1;
+		leave_shell = 0;
+		prompt();
+		n = serve();
+		close(port);
+		port = -1;
+		bootlog("USBSH: shell ended (%s); waiting for the next request",
+		    n == 0 ? "log mode requested" : "port closed or idle timeout");
 	}
-	bootlog("USBSH: the port is open; shell ready (send CR to start)");
-	printf("usbsh: the USB serial port is ours to share with the kernel's log\n");
-	return serve();
 }

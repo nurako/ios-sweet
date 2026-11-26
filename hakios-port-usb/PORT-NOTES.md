@@ -373,24 +373,39 @@ upstream README; `hakios.dwc3.*` is MIT (m1n1/QcomXnuUsbDebug, notice kept);
 XNU-derived headers keep Apple's APSL-2.0 notices. `adapter/` is new work under
 this fork's license (see the repository `LICENSE`).
 
-## 8. Deterministic ownership (2026-11-26)
+## 8. Log-first port ownership (2026-11-26, revised)
 
 Both launchd jobs check `usb=` in `kern.bootargs` **before** opening
 `/dev/hakios-usb`:
 
-* `usb=2` -> `usbsh` is the only owner; it retries `open()` on
-  `ENXIO`/`EBUSY`/`ENOENT` until the kernel has brought the CDC-ACM port up.
-  `usbmux` exits 0 without opening.
-* `usb=3` -> `usbmux` is the only owner; it retries the same errors while the
-  kernel starts the device side. `usbsh` exits 0 without opening.
+* `usb=2` -> the kernel log owns the port. `usbsh` does not open it at boot;
+  it blocks on `/dev/hakios-usb-shell`. `usbmux` exits 0 without opening.
+* `usb=3` -> `usbmux` is the owner, as before. `usbsh` exits 0 without opening.
 
-Before this, `usbmux` opened the port unconditionally. On a `usb=2` boot it
-could win the single-opener `user_open` CAS, fail `HAKIOS_USB_IPHONE` with
-`ENOTSUP` and exit; `usbsh` then got `EBUSY`, returned 0, and launchd (KeepAlive
-only on a failed exit) never started it again. The CDC port stayed silent for
-the rest of the boot. That is the "worked once" race.
+A shell is requested on `usb=2` only by the magic line the host sends while
+the port is in log mode:
 
-The kernel now prints every owner transition (`owner thread started`, `the
-CDC-ACM port is up`, `a program (pid N) has the port`, `the controller is not
-up yet`, `another program already has the port`), so the boot log says where it
-stopped. There is no lock deadlock between the jobs; only the one-opener race.
+```
+1d 1d 53 48 45 4c 4c 0a          ("\x1d\x1dSHELL\n")
+```
+
+The kernel's port thread matches it in `shell_input()`, stops `feed_log()`,
+prints `--- usbsh: log paused; 'log' resumes it ---` on the port, sets
+`shell_wanted` and wakes `/dev/hakios-usb-shell`. `usbsh` opens
+`/dev/hakios-usb` only then; the open is refused with `EBUSY` if no request is
+pending, so no program can silence the log by accident. `HAKIOS_USB_LOG`
+(or the shell's `log` command) returns to log mode; 120 s without shell input
+does the same; a request with no attach for 10 s also returns.
+
+Kernel transition lines (one per change, all in the persistent ring):
+
+```
+usb: log mode
+usb: host asked for a shell
+usb: shell took the port
+usb: log mode again
+```
+
+The earlier race (usbmux opening unconditionally and making usbsh fail with
+`EBUSY`) is still fixed by the boot-arg gate above; it is no longer the only
+ordering rule.
