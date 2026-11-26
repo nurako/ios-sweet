@@ -23,10 +23,24 @@ JOBS = {
         'StandardOutPath': '/dev/console',
         'StandardErrorPath': '/dev/console',
     },
+    '/System/Library/LaunchDaemons/com.hakios.usbsh.plist': {
+        'Label': 'com.hakios.usbsh',
+        'ProgramArguments': ['/usr/local/bin/usbsh'],
+        'RunAtLoad': True,
+        'KeepAlive': {'SuccessfulExit': False},
+        'StandardOutPath': '/dev/null',
+        'StandardErrorPath': '/dev/null',
+    },
     '/System/Library/LaunchDaemons/com.hakios.gltest.plist': {
         'Label': 'com.hakios.gltest',
-        'ProgramArguments': ['/usr/local/bin/gl_test'],
-        'EnvironmentVariables': {'DYLD_LIBRARY_PATH': '/usr/local/lib'},
+        # wait for the USB gadget and the GUI, then let the output go both to
+        # the screen and to /dev/hakios-usb, which is what the host reads
+        'ProgramArguments': [
+            '/bin/sh', '-c',
+            'sleep 55; export DYLD_LIBRARY_PATH=/usr/local/lib; '
+            '/usr/local/bin/gl_test > /dev/hakios-usb 2>&1 || '
+            '/usr/local/bin/gl_test > /dev/console 2>&1',
+        ],
         'RunAtLoad': True,
         'StandardOutPath': '/dev/console',
         'StandardErrorPath': '/dev/console',
