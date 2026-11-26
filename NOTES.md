@@ -1,3 +1,27 @@
+
+## 2026-11-26 - GPU and USB both working (branch hakios-all)
+
+The hakios-alioth Adreno 650 driver, ported into our XNU (patch 0200, boot arg
+`adreno=N`), draws a correct 1080x2400 frame on the panel and takes the GPU
+interrupt; `HakiosGPU` is published with SweetSurface-backed surfaces. The same
+kernel carries their DWC3 stack (patch 0300, `usbhakios=1 usb=2`): it enumerates
+as 1209:316d with a CDC-ACM console on /dev/ttyACM0, so boots are logged to a
+file instead of photographed (tools/sweet-usb-console.sh; `usbreplay=1` replays
+the persistent ring on open).
+
+USB's last blocker was not TrustZone but the apps-SMMU match: the shim now writes
+SMR0 = VALID, id 0, mask 0 before XNU starts (`shim/loader.c`), after which the
+controller's DMA works. This also removes the "secure SMMU" assumption recorded
+earlier for USB.
+
+Combined cmdline: `sweetgpu=0 sweetusb=0 usbhakios=1 usb=2 adreno=22
+adreno_keep=1 gpu_irq=1 board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000`.
+
+Branches: hakios-all (GPU+USB), hakios-gpu, hakios-usb, hakios-battery (0500),
+hakios-small (0501 haptics/torch), hakios-net (0300-net), hakios-autorun (0400
+SWEETBOX), hakios-infra (CI cache, userland workflow, usbreplay), hakios-userland
+(GPU userland DRM/Mesa), docs/guacamole-research.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-11-22, latest)
