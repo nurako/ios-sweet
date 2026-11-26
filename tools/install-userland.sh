@@ -54,6 +54,28 @@ for f in gl_test usbmux usbsh; do
 	[ -f "$art/$f" ] && cp -f "$art/$f" "$mnt/usr/local/bin/$f" && chmod 755 "$mnt/usr/local/bin/$f" && echo "  /usr/local/bin/$f"
 done
 
+echo "== launchd jobs"
+# usbmux gives the USB shell; gl_test runs once at boot and prints to the
+# console so a GPU submission can be seen in the kernel log / USB console.
+jobs=$repo/tools/daemons
+if [ -d "$mnt/System/Library/LaunchDaemons" ] && [ -d "$jobs" ]; then
+	for j in com.hakios.usbmux.plist com.hakios.gltest.plist; do
+		[ -f "$jobs/$j" ] || continue
+		cp -f "$jobs/$j" "$mnt/System/Library/LaunchDaemons/$j"
+		chmod 644 "$mnt/System/Library/LaunchDaemons/$j"
+		echo "  /System/Library/LaunchDaemons/$j"
+	done
+	# gl_test wants libOSMesa from /usr/local/lib even without a login session
+	if [ -x "$mnt/usr/local/bin/gl_test" ] && [ -d "$mnt/usr/local/lib" ]; then
+		for f in "$mnt"/usr/local/lib/libOSMesa*.dylib; do
+			[ -f "$f" ] || continue
+			install_name_tool -id /usr/local/lib/$(basename "$f") "$f" 2>/dev/null || true
+		done
+	fi
+else
+	echo "  (no LaunchDaemons directory or no tools/daemons: skipped)"
+fi
+
 echo "== flush and unmount"
 sync
 umount "$mnt"
