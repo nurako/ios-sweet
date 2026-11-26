@@ -16,6 +16,22 @@ apps SMMU translate stream 0 for DWC3 DMA.
 
 ## 1. `usb=2`: the serial shell
 
+By default the port carries only what the driver prints after the host opens
+it. With `usbreplay=1` the driver first replays the persistent 4 MiB console
+ring (the ring `sweetlogdump` reads, which already contains the whole boot)
+and then continues with live console output:
+
+```
+SWEET USBCON: replay 1832240 bytes
+...
+SWEET USBCON: end
+```
+
+The replay starts on the host's DTR/open edge, is bounded to the last 4 MiB,
+and gives up after 30 s if the host never reads, so a non-reading host cannot
+stall the USB thread. With the default (`usbreplay` absent) behaviour is
+unchanged.
+
 The port carries the kernel log until the computer sends its first byte. After
 that `usbsh` takes over:
 
@@ -129,11 +145,11 @@ enforce them. If a stricter AMFI path is ever used, `usbmux`'s
 ## 4. Boot cmdlines
 
 ```
-# shell + files (usb=2)
+# shell + files (usb=2); add usbreplay=1 to see the boot before the host attached
 debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
 ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
-sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 usbhakios=1 usb=2
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 usbhakios=1 usb=2 usbreplay=1
 
 # iPhone mux (usb=3)
 ... same ... usbhakios=1 usb=3

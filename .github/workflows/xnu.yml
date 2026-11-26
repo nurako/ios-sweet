@@ -31,6 +31,32 @@ env:
 
 jobs:
   build:
+    # ---------------------------------------------------------------------
+    # Caching (repeat builds of the same tree)
+    #
+    # A cold run is ~12m45s: 1m48s KDK download+install, ~11m50s build.sh
+    # (run 45735232511). Two caches remove most of that on a repeat run:
+    #
+    #   * .cache-kdk/KDKs - the installed 13.5 KDK.tar; ~1m45s.
+    #   * dxb              - blacktop's checkout, xnu source + patches, and
+    #                        build/xnu.obj + fakeroot. build.sh skips the
+    #                        compile when build/xnu.obj/kernel.<type> exists,
+    #                        so a hit is mostly `make` deciding it is current.
+    #
+    # Expected: ~2-4 min on a hit (cache download + build.sh's checks),
+    # saving ~8-10 macOS minutes. The exact number depends on the runner's
+    # cache throughput and whether any source file's mtime is newer.
+    #
+    # Staleness is the risk and the key is deliberately strict: dxb SHA +
+    # hash of every xnu/patches/*.patch and *.sh + all workflow inputs
+    # (kernel/machine config, macOS version, keep-going) + the workflow file
+    # itself. Any change is a cache miss, so a build can never reuse objects
+    # from older patches. On a hit the numbered patches are NOT re-applied
+    # (they are already in the cached source); the tree's HEAD and patch
+    # hash are re-checked first. Empty/failed caches are harmless: the fetch
+    # step runs and produces a fresh dxb. GitHub evicts caches over 10 GB;
+    # a miss only means the old build time comes back.
+    # ---------------------------------------------------------------------
     # macOS 14 runners were retired from GitHub Actions on 2026-11-02, so the
     # Xcode 15 / iig 15 toolchain is gone.  macos-15 is arm64 (what the last
     # working macos-14-arm64 image was) but ships Xcode 16, whose iig emits
@@ -40,7 +66,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore KDK cache
+        id: kdk-cache
+        uses: actions/cache@v4
+        with:
+          path: .cache-kdk/KDKs
+          key: kdk-${{ runner.os }}-${{ env.MACOS_VERSION }}-v1
+
+      - name: Install cached KDK
+        if: steps.kdk-cache.outputs.cache-hit == 'true'
+        run: |
+          # The cache is runner-owned; build.sh looks for root-owned KDKs.
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo cp -R .cache-kdk/KDKs/. /Library/Developer/KDKs/
+          ls -d /Library/Developer/KDKs/*
+
+      - name: Restore dxb build cache
+        id: dxb-cache
+        uses: actions/cache@v4
+        with:
+          path: dxb
+          key: dxb-${{ runner.os }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ inputs.keep_going }}-${{ hashFiles('xnu/patches/*.patch', 'xnu/patches/*.sh', '.github/workflows/xnu.yml') }}
+
       - name: Fetch build script
+        if: steps.dxb-cache.outputs.cache-hit != 'true'
         run: |
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
@@ -51,6 +100,32 @@ jobs:
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
+          # what the cached tree is checked against on the next hit
+          git -C dxb rev-parse HEAD > dxb/.hakios-dxb-sha
+          sha256sum xnu/patches/* | sha256sum | cut -d' ' -f1 > dxb/.hakios-patch-hash
+
+      - name: Verify cached build tree
+        if: steps.dxb-cache.outputs.cache-hit == 'true'
+        run: |
+          test -x dxb/build.sh
+          test "$(git -C dxb rev-parse HEAD)" = "$DXB_SHA"
+          want=$(sha256sum xnu/patches/* | sha256sum | cut -d' ' -f1)
+          got=$(cat dxb/.hakios-patch-hash)
+          test "$want" = "$got" || {
+            echo "::error::dxb cache key matched but its patch hash is $got, expected $want"
+            exit 1
+          }
+          # The numbered patches are already applied in the cached xnu source.
+          # Remove them before build.sh's unconditional apply loop so it does
+          # not print "Skipping patch ..." for every one of ours (and does not
+          # touch an already-patched tree).
+          mkdir -p /tmp/hakios-applied-patches
+          mv dxb/patches/[0-9][0-9][0-9][0-9]-*.patch /tmp/hakios-applied-patches/ 2>/dev/null || true
+          mv dxb/patches/[0-9][0-9][0-9][0-9]-*.sh /tmp/hakios-applied-patches/ 2>/dev/null || true
+          ls dxb/build/xnu.obj/kernel.* 2>/dev/null || echo "no kernel yet: build.sh will compile"
+          if grep -q 'SWEET USBCON: replay' dxb/xnu/bsd/dev/hakios.usb.c; then
+            echo "USB replay source present in the cached tree"
+          fi
 
       - name: Deps
         run: |
@@ -85,11 +160,23 @@ jobs:
           # Only our own numbered patches (0001-...) are policed: blacktop's
           # dxb ships extra patches for newer macOS that legitimately do not
           # apply to 13.5 (TrustCache.patch, skywalk_sonoma.patch, ...).
+          # On a cache hit ours are already applied and were moved aside, so
+          # this only sees blacktop's warnings.
           if grep -E "Skipping patch .*/patches/[0-9]{4}-" build.log; then
             echo "::error::A patch failed to apply - the kernel does not contain it."
             exit 1
           fi
           echo "all ios-sweet patches applied"
+
+      - name: Stash KDK for the cache
+        if: always() && !cancelled()
+        run: |
+          if [ -d /Library/Developer/KDKs ]; then
+            mkdir -p .cache-kdk
+            sudo rm -rf .cache-kdk/KDKs
+            sudo cp -R /Library/Developer/KDKs .cache-kdk/
+            sudo chown -R "$USER" .cache-kdk
+          fi
 
       - name: Package build tree for local compiles
         if: always()

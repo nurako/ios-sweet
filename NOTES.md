@@ -10,6 +10,28 @@ launchd job no longer runs on a normal boot; touch `/var/tmp/run-gl-test` to
 run it once. Patch `0200` regenerated and compile-verified against CI
 `45778296613`; `0300` still applies after it.
 
+## Agent handoff 2026-11-26: hakios-infra CI + USB boot replay
+
+- **Caching in `xnu.yml`:** caches `dxb` (source/patches/`build/xnu.obj`/fakeroot)
+  and the installed 13.5 KDK. Key = dxb SHA + hash of `xnu/patches/*` + workflow
+  inputs + the workflow file. Expected repeat run ~2-4 min (from 12m45s); a hit
+  skips patch re-application after checking the cached HEAD and patch hash.
+  Risk is stale objects, which the strict key prevents; a miss costs a cold run.
+- **`userland.yml` (workflow_dispatch):** pinned Theos `8167f59` + pinned
+  `theos/sdks` `master-146e41f` iPhoneOS16.5.sdk (17.4 MB, sha256 checked);
+  builds `usbsh`/`usbmux` with `hakios-port-usb/userland/build.sh`, plus
+  `userland/sweet-autorun.c` when the branch has it; uploads `hakios-userland`.
+- **`usbreplay=1` in 0300/`hakios.usb.c`:** on the host's DTR edge replay the
+  last 4 MiB of the `sweet_log_append()` ring, `SWEET USBCON: replay N bytes`
+  ... `SWEET USBCON: end`, then live ring output. Queue-driven, cuts after 30 s
+  if the host never reads; default off.
+- **Docs:** `docs/udev/99-hakios-usb.rules`, `BRANCHES.md`, replay notes in
+  `docs/usb-shell.md` and `hakios-port-usb/PORT-NOTES.md`.
+- Verified: 0300 applies to baseline+0001..0118; `hakios.usb.c` compiles
+  (`0 of 1 failed`, log 45735232511); both workflow YAMLs parse; 0300 does not
+  touch `bsd/dev/sweet_gpu.c`. Not verified: a cached CI run, a userland build
+  on a Mac, and the replay on the phone (nothing booted from this branch).
+
 ## Agent handoff / active work (2026-11-22, latest)
 
 ### >>> UPDATE 2026-11-22 #2 (alioth): **iOS 16.7.16 HOME SCREEN + TOUCH WORKING**.
