@@ -1,9 +1,12 @@
 # Port notes: xiongnemo/hakios-alioth USB stack -> ios-sweet (hakios-usb branch)
 
-Status: **phase 1, compile-only evaluation**. The reference USB sources and their
-one header compile against this tree (main at `f8d920a`, plus the small adapter
-in `adapter/`). The port is opt-in behind `usbhakios=1`; the default boot path is
-unchanged. Nothing is pushed or booted from this branch.
+Status: **phase 2, shell/file path over USB** (phase 1 compile-only evaluation
+below is still current). The reference USB sources and header compile against
+this tree (main at `f8d920a`, plus the small adapter in `adapter/`), `usb=2`
+enumerates on the phone, and phase 2 adds the `usb=3` kernel socket hunk plus
+their `usbmux`/`usbsh` userland with build/install/host scripts. The port is
+opt-in behind `usbhakios=1`; the default boot path is unchanged. Nothing is
+pushed or booted from this branch.
 
 ## 1. What was imported
 
@@ -99,11 +102,12 @@ recorded; `LCK_MTX_DECLARE` expands to them).
    `usb=1` output (`SMRn ... S2CR ... CB ... SCTLR.M`) decides which story is
    true now; if it says FAULT, either a secure (SCM) mapping or a mapping the
    secure side already installed is required, exactly like the GPU wall.
-3. **`usb=3` host visibility.** Their `xnu-device.patch` also changes
+3. **`usb=3` host visibility.** Their `xnu-device.patch` changes
    `bsd/netinet/tcp_usrreq.c` so a connection from the userland mux process is
-   treated as "from the kernel" (pid 0), which lockdownd requires. That hunk is
-   **not** in `0300`; add it before expecting pairing. Their
-   `sysctl kern.bootargs` change (long cmdlines) is also not included.
+   treated as "from the kernel" (pid 0), which lockdownd requires. **Done in
+   phase 2** (part of `0300`). Their `sysctl kern.bootargs` change (long
+   cmdlines) is not included: our 251-byte cmdline is below arm64's 608-byte
+   `BOOT_LINE_LENGTH`, and `usbsh` only reads it to notice `usb=3`.
 4. **Shutdown/quiesce.** `hakios_usb_quiesce()` is called from their
    `loader_return.c`, which this tree does not have. With `usb>=2` the
    controller is left as the kernel left it on reboot; acceptable for a test
@@ -147,7 +151,11 @@ Branch-only patch, generated from the `f8d920a` buildtree and checked with
 * `iokit/conf/files.arm64` (the arm64 list, not `iokit/conf/files`): adds
   `hakios.usbmux.cpp optional iokitcpp`;
 * `bsd/dev/sweet_ufs.c`: declares `hakios_usb_init()` and calls it after
-  `sweet_gpu_init()`, gated on `PE_parse_boot_argn("usbhakios", ...)`.
+  `sweet_gpu_init()`, gated on `PE_parse_boot_argn("usbhakios", ...)`;
+* `bsd/netinet/tcp_usrreq.c`: the pid-0 peer hunk from their
+  `xnu-device.patch` — a connection whose peer is the process holding the
+  `usb=3` iPhone port (`hakios_usb_mux_pid()`) is reported as coming from the
+  kernel, which lockdownd requires.
 
 It does **not** modify `bsd/dev/sweet_usb.c`; our 0072-0101 probe/gadget and
 its femto PHY sequence stay as they are. No new CFLAGS are needed.
@@ -156,12 +164,11 @@ its femto PHY sequence stay as they are. No new CFLAGS are needed.
 
 | # | step | state |
 | --- | --- | --- |
-| 0 | import files, adapter, this inventory, `0300` patch, compile check | **done (this branch)** |
-| 1 | one CI run, then `usbhakios=1 usb=1` (read-only): read PHY/GDSC/clock state, DWC3 role, and the real SMMU S2CR/SCTLR for stream 0 | 1 boot |
-| 2 | if the controller is powered but the PHY is off, export the 0098 femto init and run it before `hakios_usb_init()`; retry `usb=1`, then `usb=2` with a PC `lsusb` | 1-2 days |
-| 3 | decide the SMMU route from step 1 (bypass already installed vs secure mapping); if FAULT, test the secure/SCM path or a secure-installed mapping | 1-3 days |
-| 4 | `usb=2`: serial kernel log + `/dev/hakios-usb` (no userland needed); this is the first useful live log | 1 day |
-| 5 | `usb=3`: add the `tcp_usrreq.c` hunk, port `usbmux`/`usbsh` and the launchd plist into the iOS root, verify lockdownd "Trust This Computer" | 2-4 days |
+| 0 | import files, adapter, this inventory, `0300` patch, compile check | **done, phase 1** |
+| 1 | `usbhakios=1 usb=1` (read-only): GCC/DWC3/SMMU report | **done on the phone** |
+| 2 | `usb=2` enumerates as `1209:316d` and streams the kernel log over CDC-ACM | **done on the phone** (SMR0 written by the shim) |
+| 3 | `usb=2` + `usbsh` in the root: shell and `b64` file download | **phase 2, needs the iOS SDK build + install** |
+| 4 | `usb=3` + `usbmux` + the `tcp_usrreq.c` hunk: iPhone mux, lockdownd 62078, AFC/file access via host `ifuse` | **phase 2, kernel side done; needs the userland build + trust pairing** |
 
 Honest stop points: after step 1 the log names exactly which block is off or
 which SMMU type stream 0 has. After step 2 either a PC enumerates
@@ -192,26 +199,140 @@ cd shim && BOARD=alioth CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm \
 fastboot boot shim/out/shim-boot-alioth.img
 ```
 
-Start with `usb=1` (read-only, safe on any boot). After the PHY step, use
-`usb=2`; only then try `usb=3`. A following boot with
+Three ladders, one kernel:
+
+```
+# usb=2: CDC-ACM shell + kernel log (the one that works on the phone now)
+... usual args ... \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 usbhakios=1 usb=2
+
+# usb=3: iPhone mux for lockdownd/AFC (host usbmuxd; needs userland usbmux)
+... usual args ... \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 usbhakios=1 usb=3
+
+# usb=1: read-only look, safe on any boot
+... usual args ... \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 usbhakios=1 usb=1
+```
+
+`usb=3` needs the shim's SMR0 = 0x80000000 write (main's `shim/loader.c`,
+already in place for the working `usb=2`). Host side, after the userland is
+installed:
+
+```
+# usb=2: shell and files (tools/sweet-usbsh.sh)
+tools/sweet-usbsh.sh 'ls /'
+tools/sweet-usbsh.sh -g /var/tmp/usbmux.log usbmux.log
+
+# usb=3: the phone as an iPhone (Linux host)
+sudo usbmuxd -f -v &
+idevice_id -l                 # the UDID given to HAKIOS_USB_IPHONE
+ideviceinfo                   # 62078: lockdownd (accept "Trust This Computer")
+ifuse /mnt/ios                # AFC over the same mux, after pairing
+```
+
+A following boot with
 `sweetlogdump=262144 sweetloggrep=usb: sweetlogdumpwait=120 ufslogsecs=1`
 (and `sweetusb=0`) reads the USB lines back from the persistent ring without a
 photo of a scrolling screen.
 
-Expected lines (all start with `usb:`): `level 1: a look, reading only`,
-`GCC USB30_PRIM GDSC ...`, `DWC3 GSNPSID ...`, `SMRn ... S2CR ... type ...`,
-and no `cannot map the registers` / `not a Redmi K40`.
+Expected lines (all start with `usb:`): for `usb=2`, `THE CONTROLLER IS THE
+KERNEL'S: a serial port (1209:316d ...)`; for `usb=3`, `an iPhone (05ac:12a8,
+serial ...) with Apple's usbmux interface`, `AppleUSBDeviceMux for lockdownd:
+published`, then from userland `usb: the USB mux is process N: its connections
+are the kernel's to lockdownd`.
 
-## 8. Files added by this port
+## 8. Phase 2: shell and file access (`usb=2`/`usb=3`)
+
+### 8.1 Kernel side
+
+The imported `hakios.usb.c` already implements both device shapes and all the
+ioctls the userland uses (`HAKIOS_USB_LOG`, `_IPHONE`, `_HOST`, `_GENERATION`,
+`_NOTE`). Phase 2 adds only the missing `tcp_usrreq.c` hunk in `0300`: when
+`tcp_lookup_peer_pid_locked()` sees the pid that called `HAKIOS_USB_IPHONE`, it
+reports pid 0 to lockdownd. `hakios_usb_mux_pid()` is already defined in
+`hakios.usb.c` (`-1` unless `usb=3`). No change to `sweet_usb.c`,
+`sweet_gpu.c`, or the default boot.
+
+Compile check for every touched kernel file (buildtree of run 45735232511,
+which already contains phase 1's `0300`):
+
+```
+XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-usb2.log \
+    research/ci-buildtree bsd/netinet/tcp_usrreq.c bsd/dev/hakios.usb.c \
+    bsd/dev/hakios.dwc3.c bsd/dev/hakios_usb_adapter.c bsd/dev/sweet_ufs.c \
+    iokit/Kernel/hakios.usbmux.cpp
+-> 0 of 6 files failed
+```
+
+### 8.2 Userland sources and whether they build here
+
+`hakios-port-usb/userland/src/usbmux.c` (670 lines) and `usbsh.c` (911) are
+copied verbatim; their plists are beside them. **They cannot be built on this
+Linux box**: they are normal dynamically linked arm64 iOS programs and need the
+iPhoneOS SDK headers/libraries (CoreFoundation, MobileGestalt, libproc). There
+is no SDK, theos, ld64 or ldid installed here. `build.sh` detects that and
+stops with instructions.
+
+Precise recipe (what the reference uses, and what we need):
+
+| item | value |
+| --- | --- |
+| host | macOS with Xcode 15/16, or Linux/macOS with Theos + cctools/ld64 + ldid |
+| SDK | **iPhoneOS16.5.sdk** (Theos) — it has CoreFoundation and a `libMobileGestalt.tbd`; a stock Xcode SDK may lack the private stub |
+| flags | `clang -arch arm64 -isysroot <SDK> -miphoneos-version-min=16.0 -O2` |
+| usbsh link | libSystem only (`proc_kmsgbuf` declared by hand in the source) |
+| usbmux link | `-framework CoreFoundation -lMobileGestalt` |
+| signing | ad-hoc: `ldid -S out/usbsh out/usbmux` (or `codesign -s -`) |
+| entitlements | none required by the sources; miniamfi here does not enforce them. `usbmux` calls `MGCopyAnswer(UniqueDeviceID)`; if a stricter AMFI path is ever used, add `com.apple.private.MobileGestalt.AllowedProtectedKeys = [UniqueDeviceID]`. `usbsh cs` needs `com.apple.private.cs.debugger` to inspect other processes |
+| install path | our root has no `/redwood`: binaries in `/usr/local/bin`, jobs in `/System/Library/LaunchDaemons` (override `JOBDIR=/Library/LaunchDaemons` if that is what your launchd scans) (`userland/install-root.sh` rewrites the plists) |
+| launchd jobs | `com.hakios.usbsh` (`RunAtLoad`, usb=2) and `com.hakios.usbmux` (`RunAtLoad`, `KeepAlive.SuccessfulExit=false`, usb=3) |
+
+```
+cd hakios-port-usb/userland
+IOS_SDK=~/theos/sdks/iPhoneOS16.5.sdk ./build.sh
+./install-root.sh /path/to/mounted/ios/root
+```
+
+`usbsh` runs on **usb=2** (the CDC-ACM port); `usbmux` runs on **usb=3** (the
+iPhone port). Both can be installed at once: the one whose boot argument is
+absent exits at once (usbsh checks `kern.bootargs`; usbmux's `open()` fails).
+
+### 8.3 Host side
+
+`tools/sweet-usbsh.sh` speaks the usbsh line protocol on `/dev/ttyACM0`
+(`-d`, `-b`, `-l`, `-t`; `-g REMOTE [LOCAL]` downloads via the builtin `b64`).
+Its byte-level I/O is done by embedded Python 3 (`termios` + `select`), because
+bash's `read -N` loses bytes at timeout boundaries and cannot preserve a bare
+newline, which corrupts b64. File access is currently **read-only** (`ls`,
+`cat`, `b64`): usbsh has no write builtin. Writes today go through a program it
+can run, or through AFC over `usb=3` + `ifuse` after pairing. See
+`docs/usb-shell.md` for the protocol and the host recipe.
+
+### 8.4 Files added in phase 2
+
+```
+hakios-port-usb/userland/src/usbmux.c, usbsh.c     reference, verbatim
+hakios-port-usb/userland/com.hakios.*.plist        reference launchd jobs
+hakios-port-usb/userland/build.sh                  SDK build (macOS/Theos)
+hakios-port-usb/userland/install-root.sh           install into our root
+tools/sweet-usbsh.sh                               serial host client
+docs/usb-shell.md                                  protocol + recipes
+```
+
+## 9. Files added by this port
 
 ```
 hakios-port-usb/kernel/...                 reference USB sources, verbatim
 hakios-port-usb/adapter/hakios_usb_adapter.c
+hakios-port-usb/userland/...               reference usbmux/usbsh + scripts
 hakios-port-usb/ORIGIN.md                  provenance + licenses
 hakios-port-usb/PORT-NOTES.md              this file
 hakios-port-usb/reference-xnu-device.patch their build/glue patch (reference)
 hakios-port-usb/reference-boot.args        their full boot args
 xnu/patches/0300-hakios-usb.patch          branch-only build integration
+tools/sweet-usbsh.sh                       host client for usbsh
+docs/usb-shell.md                          USB shell/mux docs
 ```
 
 Licenses: the device layer (`devices/redmi-k40/overlays/`) is MIT per the
