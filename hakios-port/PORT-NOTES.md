@@ -466,3 +466,19 @@ adreno: step 22: done
 ```
 and the phone showed the three bands (orange / white / blue). The Adreno 650 draws
 on the panel from our kernel.
+
+## 2026-11-26: interrupt + service (Image HK4 `11ea4904...`)
+
+CI run 45731891772 (phase 2: SweetSurface-backed MiniIOSurface, HakiosGPU publish,
+GIC SPI 332). Boot `adreno=22 adreno_keep=1 gpu_irq=1`:
+```
+HAKIOS GPU: panel copy 1080x2400 row 4352 -> 4320 via the console framebuffer (phys 0x9c000000)
+adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue
+HAKIOS GPU: GIC SPI 332 level attached, routed to MPIDR 0x81000000 (gpu_irq=1)
+adreno: THE 3D CORE'S INTERRUPT (GIC 332, level) tells the waits of each submission's end (gpu_irq=1)
+adreno: THE GPU STAYS ON for the system to draw with; the service HakiosGPU
+HakiosGPU: IOServiceMatching("HakiosGPU") will find this service; open it with type 8
+HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient
+```
+Bands on screen; iOS interactive afterwards. Next: a user client that allocates a surface and
+submits (needs the userland DRM/Mesa layer).
