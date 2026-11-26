@@ -5529,10 +5529,10 @@ index 0000000..cafdc46
 +    sysctl_developer_mode_status, "I", "iOS's developer mode, as the kernel has it");
 diff --git a/bsd/dev/hakios_gpu_adapter.c b/bsd/dev/hakios_gpu_adapter.c
 new file mode 100644
-index 0000000..110d1b5
+index 0000000..34e4799
 --- /dev/null
 +++ b/bsd/dev/hakios_gpu_adapter.c
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,410 @@
 +/*
 + * Adapter between xiongnemo/hakios-alioth's GPU stack and this tree.
 + *
@@ -5570,12 +5570,26 @@ index 0000000..110d1b5
 +
 +/* ---- the reference driver's logging and loader hooks -------------------- */
 +
++/* bsd/dev/sweet_ufs.c: the persistent console ring read by sweetlogdump. */
++extern void sweet_log_append(const char *c, int size);
++
++/*
++ * The reference tree mirrors the kernel log into a 64 KiB loader ring
++ * (osfmk/arm64/loader_return.c) and its USB driver streams that ring. Keep
++ * one copy here, shared with hakios-port-usb; every byte also goes into the
++ * persistent sweet console ring so either can be read back after a boot.
++ */
++#define HAKIOS_LOADER_LOG_TEE (64 * 1024)
++char loader_log_tee[HAKIOS_LOADER_LOG_TEE];
++volatile uint64_t loader_log_tee_total;
++
 +void
 +loader_log_putc(char c)
 +{
-+	/* The reference tree mirrors the kernel log into its UEFI loader ring.
-+	 * This tree reads the console ring back with sweetlogdump instead. */
-+	(void)c;
++	uint64_t at = __atomic_fetch_add(&loader_log_tee_total, 1, __ATOMIC_RELEASE);
++
++	loader_log_tee[at % HAKIOS_LOADER_LOG_TEE] = c;
++	sweet_log_append(&c, 1);
 +}
 +
 +void

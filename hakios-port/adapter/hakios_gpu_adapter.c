@@ -35,12 +35,26 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 /* ---- the reference driver's logging and loader hooks -------------------- */
 
+/* bsd/dev/sweet_ufs.c: the persistent console ring read by sweetlogdump. */
+extern void sweet_log_append(const char *c, int size);
+
+/*
+ * The reference tree mirrors the kernel log into a 64 KiB loader ring
+ * (osfmk/arm64/loader_return.c) and its USB driver streams that ring. Keep
+ * one copy here, shared with hakios-port-usb; every byte also goes into the
+ * persistent sweet console ring so either can be read back after a boot.
+ */
+#define HAKIOS_LOADER_LOG_TEE (64 * 1024)
+char loader_log_tee[HAKIOS_LOADER_LOG_TEE];
+volatile uint64_t loader_log_tee_total;
+
 void
 loader_log_putc(char c)
 {
-	/* The reference tree mirrors the kernel log into its UEFI loader ring.
-	 * This tree reads the console ring back with sweetlogdump instead. */
-	(void)c;
+	uint64_t at = __atomic_fetch_add(&loader_log_tee_total, 1, __ATOMIC_RELEASE);
+
+	loader_log_tee[at % HAKIOS_LOADER_LOG_TEE] = c;
+	sweet_log_append(&c, 1);
 }
 
 void

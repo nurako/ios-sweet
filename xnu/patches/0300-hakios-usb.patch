@@ -1,11 +1,11 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index dee13fe..8795482 100644
+index 380b8b9..ae20867 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,9 @@ bsd/dev/sweet_rpmh.c			standard
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_gpu.c			standard
+@@ -115,6 +115,9 @@ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/hakios.board.c			standard
+ bsd/dev/hakios.adreno.c			standard
+ bsd/dev/hakios_gpu_adapter.c		standard
 +bsd/dev/hakios.usb.c			standard
 +bsd/dev/hakios.dwc3.c			standard
 +bsd/dev/hakios_usb_adapter.c		standard
@@ -2834,10 +2834,10 @@ index 0000000..78f8e29
 +}
 diff --git a/bsd/dev/hakios_usb_adapter.c b/bsd/dev/hakios_usb_adapter.c
 new file mode 100644
-index 0000000..3ff7ac2
+index 0000000..807acce
 --- /dev/null
 +++ b/bsd/dev/hakios_usb_adapter.c
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,35 @@
 +/*
 + * hakios-port-usb: the few symbols xiongnemo/hakios-alioth's USB files expect
 + * from the rest of their kernel, implemented against this tree.
@@ -2845,13 +2845,12 @@ index 0000000..3ff7ac2
 + * Nothing here is on the default boot path: hakios_usb_init() is only called
 + * when the `usbhakios=1` boot argument is present (see 0300-hakios-usb.patch).
 + *
-+ *   hakios_board_is_alioth()  their /chosen hakios-board test, plus usbhakios=1
-+ *                             so this branch needs no ADT change to be tried
 + *   hakios_smmu_lock          serializes the read-only apps-SMMU walk in
 + *                             hakios.usb.c (their SMMU driver owns it upstream)
-+ *   loader_log_putc/tee       their loader log ring; here every byte also goes
-+ *                             into our persistent console ring (sweet_ufs.c)
-+ *                             so a session can be read back with sweetlogdump
++ *
++ * On hakios-all the GPU patch (0200) already supplies hakios_board_is_alioth()
++ * / hakios_board_panel_height() (hakios.board.c) and the loader log tee
++ * (hakios_gpu_adapter.c), so this adapter must not define them again.
 + *
 + * hakios_usbmux_publish()/hakios_usbmux_host() are defined by
 + * iokit/Kernel/hakios.usbmux.cpp, which is built with this adapter.
@@ -2864,68 +2863,29 @@ index 0000000..3ff7ac2
 +#include <kern/locks.h>
 +#include <sys/hakios.board.h>
 +
-+/* bsd/dev/sweet_ufs.c: the 4 MiB console ring read by sweetlogdump. */
-+extern void sweet_log_append(const char *c, int size);
-+
-+/* Their loader log tee (osfmk/arm64/loader_return.c upstream): 64 KiB. */
-+#define HAKIOS_LOADER_LOG_TEE (64 * 1024)
-+
-+char loader_log_tee[HAKIOS_LOADER_LOG_TEE];
-+volatile uint64_t loader_log_tee_total;
-+
-+void
-+loader_log_putc(char c)
-+{
-+	uint64_t at = __atomic_fetch_add(&loader_log_tee_total, 1, __ATOMIC_RELEASE);
-+
-+	loader_log_tee[at % HAKIOS_LOADER_LOG_TEE] = c;
-+	/* Never blocks; also survives the session in the UFS console ring. */
-+	sweet_log_append(&c, 1);
-+}
++/*
++ * The loader log tee and loader_log_putc() live in the GPU adapter
++ * (hakios-port/adapter/hakios_gpu_adapter.c) because hakios.adreno.c needs the
++ * same symbols; 0300 is applied after 0200, so there is exactly one copy.
++ * hakios.usb.c still streams loader_log_tee/loader_log_tee_total from there.
++ */
 +
 +/* Their SMMU driver owns this mutex upstream; the USB walk only reads. */
 +static LCK_GRP_DECLARE(hakios_smmu_lck_grp, "hakios-smmu");
 +LCK_MTX_DECLARE(hakios_smmu_lock, &hakios_smmu_lck_grp);
-+
-+bool
-+hakios_board_is_alioth(void)
-+{
-+	DTEntry chosen;
-+	const void *board;
-+	unsigned size;
-+	uint32_t opt_in = 0;
-+
-+	/*
-+	 * tools/mkadt.py does not emit /chosen hakios-board on this tree, so the
-+	 * explicit boot argument is the switch; a future ADT property also works.
-+	 */
-+	if (PE_parse_boot_argn("usbhakios", &opt_in, sizeof(opt_in)) && opt_in != 0) {
-+		return true;
-+	}
-+	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
-+	       SecureDTGetProperty(chosen, "hakios-board", &board, &size) == kSuccess &&
-+	       size == 7 && memcmp(board, "alioth", 7) == 0;
-+}
-+
-+/* Their panel height helper; not used by the USB files, kept for the header. */
-+uint32_t
-+hakios_board_panel_height(void)
-+{
-+	return hakios_board_is_alioth() ? 2400 : 2340;
-+}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index f585be7..92fd55d 100644
+index 1a7a9ed..cb13ea3 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
- extern void sweet_touch_init(void);
+@@ -56,6 +56,7 @@ extern void sweet_touch_init(void);
  extern void sweet_usb_probe(void);
  extern void sweet_gpu_init(void);
+ extern void hakios_adreno_init(void);
 +extern void hakios_usb_init(void);
  extern void alioth_keys_init(void);
  extern void alioth_touch_init(void);
  extern bool alioth_board(void);
-@@ -676,6 +677,17 @@ sweet_ufs_init(void)
+@@ -677,6 +678,17 @@ sweet_ufs_init(void)
  	sweet_usb_probe();
  	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
  	sweet_gpu_init();
@@ -2940,9 +2900,9 @@ index f585be7..92fd55d 100644
 +			hakios_usb_init();
 +		}
 +	}
- 	return 0;
- }
- 
+ 	/* xiongnemo/hakios-alioth Adreno stack: only when the command line asks
+ 	 * for a step with adreno=N; the default boot is unchanged. */
+ 	uint32_t hakios_gpu_steps = 0;
 diff --git a/bsd/netinet/tcp_usrreq.c b/bsd/netinet/tcp_usrreq.c
 index 917e523..2faed50 100644
 --- a/bsd/netinet/tcp_usrreq.c
@@ -2972,45 +2932,6 @@ index 917e523..2faed50 100644
  		error = 0;
  		in_pcb_checkstate(finp, WNT_RELEASE, 0);
  	}
-diff --git a/bsd/sys/hakios.board.h b/bsd/sys/hakios.board.h
-new file mode 100644
-index 0000000..aee9b3c
---- /dev/null
-+++ b/bsd/sys/hakios.board.h
-@@ -0,0 +1,33 @@
-+/*
-+ * The board: where the blocks of the phone's SoC are (bsd/dev/hakios.board.c). The drivers of the port were
-+ * brought up on one phone (the POCO X5 Pro, SM7325), and every address of a block they talk to is that
-+ * phone's -- unless the kernel's command line names another: board_<block>=0x... A device profile says so
-+ * (common/devices/<device>.conf, BOARD_ARGS; common/new-device.sh reads them out of the phone's own device
-+ * tree), so a phone with the same blocks at other places needs no other kernel.
-+ */
-+#ifndef _SYS_HK_BOARD_H_
-+#define _SYS_HK_BOARD_H_
-+
-+#include <mach/vm_types.h>
-+#include <stdbool.h>
-+
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+
-+/* the physical address of a block: board_<name>= on the command line, else `dflt` (the brought-up phone's) */
-+vm_offset_t hakios_board_addr(const char *name, vm_offset_t dflt);
-+/* a number of the board (counts, sizes): board_<name>=, else `dflt` */
-+uint32_t hakios_board_number(const char *name, uint32_t dflt);
-+/* every board_ address that was given, once, to the log (hakios.input.c, at the drivers' start) */
-+void hakios_board_report(void);
-+/* the loader's hakios-board names a kona phone (umi, alioth) */
-+bool hakios_board_kona_name(const void *board, unsigned size);
-+bool hakios_board_is_alioth(void);
-+uint32_t hakios_board_panel_height(void);
-+
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+#endif /* _SYS_HK_BOARD_H_ */
 diff --git a/iokit/Kernel/hakios.usbmux.cpp b/iokit/Kernel/hakios.usbmux.cpp
 new file mode 100644
 index 0000000..ceff31c
@@ -3095,14 +3016,14 @@ index 0000000..ceff31c
 +	gMux->messageClients(kMuxHostMessage, (void *)(uintptr_t)(connected ? 1 : 0));
 +}
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index acc9ae0..b18b717 100644
+index c1eeefe..8bc2be1 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -14,6 +14,7 @@ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitc
- iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
- iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
- iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
-+iokit/Kernel/hakios.usbmux.cpp                                    optional iokitcpp
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/hakios.gpu.cpp                                      optional iokitcpp
+ iokit/Kernel/hakios_miniosurface_stub.cpp                        optional iokitcpp
++iokit/Kernel/hakios.usbmux.cpp                                    optional iokitcpp
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
