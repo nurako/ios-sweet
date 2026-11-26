@@ -1,9 +1,9 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index dee13fe..f6d0eff 100644
+index bbf0e6a..5c4358e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -114,6 +114,8 @@ bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_gpu.c			standard
+@@ -121,6 +121,8 @@ bsd/dev/hakios.dwc3.c			standard
+ bsd/dev/hakios_usb_adapter.c		standard
  bsd/dev/alioth_keys.c			standard
  bsd/dev/alioth_touch.c			standard
 +bsd/dev/alioth_haptic.c			standard
@@ -1147,11 +1147,11 @@ index 45565d1..2b1df07 100644
  }
  #endif
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index f585be7..1a6cb14 100644
+index 10e43f4..d95935c 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -57,6 +57,8 @@ extern void sweet_usb_probe(void);
- extern void sweet_gpu_init(void);
+@@ -59,6 +59,8 @@ extern void hakios_adreno_init(void);
+ extern void hakios_usb_init(void);
  extern void alioth_keys_init(void);
  extern void alioth_touch_init(void);
 +extern void alioth_haptic_init(void);
@@ -1159,7 +1159,7 @@ index f585be7..1a6cb14 100644
  extern bool alioth_board(void);
  
  #define REG_CAP         0x00
-@@ -676,6 +678,24 @@ sweet_ufs_init(void)
+@@ -678,6 +680,24 @@ sweet_ufs_init(void)
  	sweet_usb_probe();
  	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
  	sweet_gpu_init();
@@ -1181,6 +1181,6 @@ index f585be7..1a6cb14 100644
 +			alioth_torch_init();
 +		}
 +	}
- 	return 0;
- }
- 
+ 	/*
+ 	 * xiongnemo/hakios-alioth's USB stack (hakios-port-usb), opt-in only:
+ 	 * without usbhakios=1 the default boot is unchanged.

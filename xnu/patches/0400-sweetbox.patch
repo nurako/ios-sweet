@@ -1,85 +1,20 @@
---- a/bsd/dev/sweet_ufs.c
-+++ b/bsd/dev/sweet_ufs.c
-@@ -708,6 +708,66 @@
- #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
- #define SWEET_LOG_SECS          10u
- 
-+/*
-+ * SWEETBOX mailbox (0400): a 1 MiB raw area immediately BEFORE the console
-+ * log header, so the log's own layout (last 1025 blocks) is untouched and an
-+ * old log reader still works. The host writes a packed, checksummed payload
-+ * there from recovery with tools/sweet-box.py; sweet_box.c reads it after
-+ * the root mounts. Keeping it outside the HFS image (which ends at 16 GiB in
-+ * a ~107 GiB partition) means the boot path never rewrites HFS metadata.
-+ */
-+#define SWEET_BOX_BLOCKS        256u
-+#define SWEET_BOX_BYTES         (SWEET_BOX_BLOCKS * UFS_BLOCK)
-+
-+/* Device LBA of mailbox block 0, or 0 when the partition is too small. */
-+static uint64_t
-+sweet_box_lba(void)
-+{
-+	if (!su.nblocks || su.nblocks < SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS + 1) {
-+		return 0;
-+	}
-+	return su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_BOX_BLOCKS;
-+}
-+
-+/* Raw mailbox access for sweet_box.c; bounded to the reserved 1 MiB. */
-+int sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count);
-+int sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count);
-+
-+int
-+sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count)
-+{
-+	uint64_t base = sweet_box_lba();
-+	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
-+		return EINVAL;
-+	}
-+	int error;
-+	lck_mtx_lock(&sweet_ufs_lock);
-+	error = ufs_read_blocks(base + first, count);
-+	if (!error) {
-+		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
-+	}
-+	lck_mtx_unlock(&sweet_ufs_lock);
-+	return error;
-+}
-+
-+int
-+sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count)
-+{
-+	uint64_t base = sweet_box_lba();
-+	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
-+		return EINVAL;
-+	}
-+	int error;
-+	lck_mtx_lock(&sweet_ufs_lock);
-+	memcpy((void *)(su.dma + DMA_BOUNCE), src, count * UFS_BLOCK);
-+	error = ufs_write_blocks(base + first, count);
-+	if (!error) {
-+		error = ufs_sync_cache();
-+	}
-+	lck_mtx_unlock(&sweet_ufs_lock);
-+	return error;
-+}
-+
- static char sweet_log_ring[SWEET_LOG_SIZE];
- static uint64_t _Atomic sweet_log_total;
- static int sweet_log_chan;
-@@ -821,7 +881,8 @@
- 	thread_t thread;
- 
- 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
--	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
-+	if (!on || !su.writable ||
-+	    su.nblocks < 2 * SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS) {
- 		return;
- 	}
- 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ae20867..bbf0e6a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_box.c			standard
+ bsd/dev/hakios.board.c			standard
+ bsd/dev/hakios.adreno.c			standard
+ bsd/dev/hakios_gpu_adapter.c		standard
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 291a546..3004984 100644
 --- a/bsd/dev/mem.c
 +++ b/bsd/dev/mem.c
-@@ -170,7 +170,7 @@
+@@ -170,7 +170,7 @@ sweet_null_tee(char *name, size_t len)
  {
  	if (!sweet_null_parsed) {
  		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
@@ -88,38 +23,9 @@
  		}
  		sweet_null_parsed = 1;
  	}
---- a/bsd/kern/bsd_init.c
-+++ b/bsd/kern/bsd_init.c
-@@ -951,6 +951,19 @@
- 	}
- 
- 
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	/*
-+	 * SWEETBOX (0400): install a packed, checksummed payload from the
-+	 * userdata tail before launchd runs. Boot-arg sweetbox=0 (default)
-+	 * keeps the old boot exactly as it was.
-+	 */
-+	{
-+		extern void sweet_box_init(void);
-+		sweet_box_init();
-+	}
-+#endif
-+
-+
- #if CONFIG_NETBOOT
- 	if (netboot) {
- 		int err;
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -112,6 +112,7 @@
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_gpu.c			standard
-+bsd/dev/sweet_box.c			standard
- bsd/dev/hakios.usb.c			standard
- bsd/dev/hakios.dwc3.c			standard
- bsd/dev/hakios_usb_adapter.c		standard
+diff --git a/bsd/dev/sweet_box.c b/bsd/dev/sweet_box.c
+new file mode 100644
+index 0000000..571cc0f
 --- /dev/null
 +++ b/bsd/dev/sweet_box.c
 @@ -0,0 +1,390 @@
@@ -513,3 +419,108 @@
 +	kmem_free(kernel_map, (vm_offset_t)buf, BOX_BYTES);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index cb13ea3..10e43f4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -716,6 +716,66 @@ sweet_ufs_init(void)
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+ 
++/*
++ * SWEETBOX mailbox (0400): a 1 MiB raw area immediately BEFORE the console
++ * log header, so the log's own layout (last 1025 blocks) is untouched and an
++ * old log reader still works. The host writes a packed, checksummed payload
++ * there from recovery with tools/sweet-box.py; sweet_box.c reads it after
++ * the root mounts. Keeping it outside the HFS image (which ends at 16 GiB in
++ * a ~107 GiB partition) means the boot path never rewrites HFS metadata.
++ */
++#define SWEET_BOX_BLOCKS        256u
++#define SWEET_BOX_BYTES         (SWEET_BOX_BLOCKS * UFS_BLOCK)
++
++/* Device LBA of mailbox block 0, or 0 when the partition is too small. */
++static uint64_t
++sweet_box_lba(void)
++{
++	if (!su.nblocks || su.nblocks < SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS + 1) {
++		return 0;
++	}
++	return su.first_block + su.nblocks - SWEET_LOG_BLOCKS - SWEET_BOX_BLOCKS;
++}
++
++/* Raw mailbox access for sweet_box.c; bounded to the reserved 1 MiB. */
++int sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count);
++int sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count);
++
++int
++sweet_ufs_box_read(uint32_t first, void *dst, uint32_t count)
++{
++	uint64_t base = sweet_box_lba();
++	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
++		return EINVAL;
++	}
++	int error;
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(base + first, count);
++	if (!error) {
++		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_box_write(uint32_t first, const void *src, uint32_t count)
++{
++	uint64_t base = sweet_box_lba();
++	if (!base || !count || first + count > SWEET_BOX_BLOCKS) {
++		return EINVAL;
++	}
++	int error;
++	lck_mtx_lock(&sweet_ufs_lock);
++	memcpy((void *)(su.dma + DMA_BOUNCE), src, count * UFS_BLOCK);
++	error = ufs_write_blocks(base + first, count);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+@@ -829,7 +889,8 @@ sweet_log_start(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on || !su.writable ||
++	    su.nblocks < 2 * SWEET_LOG_BLOCKS + SWEET_BOX_BLOCKS) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..1104ce4 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -951,6 +951,19 @@ bsd_init(void)
+ 	}
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEETBOX (0400): install a packed, checksummed payload from the
++	 * userdata tail before launchd runs. Boot-arg sweetbox=0 (default)
++	 * keeps the old boot exactly as it was.
++	 */
++	{
++		extern void sweet_box_init(void);
++		sweet_box_init();
++	}
++#endif
++
++
+ #if CONFIG_NETBOOT
+ 	if (netboot) {
+ 		int err;
