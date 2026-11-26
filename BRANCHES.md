@@ -1,5 +1,11 @@
 # Branches
 
+**`hakios-integrate` is the integration branch**: it merges `hakios-infra`,
+`hakios-battery`, `hakios-small`, `hakios-autorun` and `hakios-userland` onto
+`hakios-panicfix` and carries feature patches `0200` -> `0300` -> `0400` ->
+`0500` -> `0501` in that order.  `hakios-net` and `hakios-console` are
+deliberately not merged.
+
 One line per branch: what it carries, its feature patch number (everything
 also has the baseline `0001`-`0118`), and the extra boot arguments.  The
 common prefix is the usual UI line:
@@ -19,7 +25,8 @@ sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0
 | `hakios-all` | GPU and USB together (0200 + 0300), combined cmdline and expectations | `0200-hakios-gpu.patch`, `0300-hakios-usb.patch` | common line + `sweetgpu=<N> sweetgpukeep=1 usbhakios=1 usb=2` (or `usb=3`) |
 | `hakios-infra` | `hakios-all` tree plus CI caching, the `userland` workflow, USB log replay, udev rule, this file | `0200`, `0300` (0300 gains `usbreplay=1`) | common line + `usbhakios=1 usb=2 usbreplay=1` (add `sweetgpu=<N> sweetgpukeep=1` for GPU) |
 | `hakios-battery` | Alioth PM8150B fg-gen4 gauge / SMB5 charger readout, opt-in, compile-only | `0500-hakios-battery.patch` | `batteryhakios=1` |
-| `hakios-small` | Currently the same commit/tree as `hakios-battery` (battery phase 1); kept as the small-root experiment branch | `0500-hakios-battery.patch` | `batteryhakios=1` |
+| `hakios-small` | `hakios-battery` plus AW8697 haptics and PM8150L torch, opt-in, compile-only | `0500-hakios-battery.patch`, `0501-hakios-haptic-torch.patch` | `batteryhakios=1 haptichakios=1 torchstep=1` (or `torchstep=2`) |
+| `hakios-integrate` | **Integration branch**: `hakios-panicfix` + infra + GPU + USB/replay + SWEETBOX + battery + haptic/torch + userland (Mesa/gl_test).  Patch order `0200` -> `0300` -> `0400` -> `0500` -> `0501` | `0200`, `0300`, `0400`, `0500`, `0501` | common line + `sweetgpu=22 sweetgpukeep=1 usbhakios=1 usb=2 usbreplay=1 sweetbox=1 batteryhakios=1 haptichakios=1 torchstep=1` |
 | `hakios-net` | Wi-Fi kernel side ported from xiongnemo/hakios-alioth (WCN6750/ath11k path), compile-only, not booted | `0300-hakios-net.patch` (branch-local) | `wihakios=1 wifi=1 wifi_loud=1 wifi_mac=...` |
 | `hakios-autorun` | SWEETBOX no-reflash install channel: mailbox, `sweet-autorun`, launchd bootstrap | `0400-sweetbox.patch` | `sweetbox=1` (first box: `sweetbox=1 sweetboxroot=1`) |
 | `docs/guacamole-research` | Research only: how ios-guacamole booted iOS 27 on SM8150 and what transfers to alioth; no kernel changes | none | none (documentation) |

@@ -1,5 +1,30 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## UPDATE 2026-11-26 (hakios-integrate): one branch for all current work
+`hakios-integrate` is `hakios-panicfix` plus `hakios-infra` (CI object/KDB
+caching, `usbreplay=1`, udev rule), `hakios-battery` (0500 PM8150B fg-gen4),
+`hakios-small` (0501 AW8697 haptics, PM8150L torch), `hakios-autorun` (0400
+SWEETBOX) and `hakios-userland` (DRM client, Mesa 25.0.7 patches, gl_test,
+build scripts; its workflow keeps both the usbsh/usbmux and Mesa/gl_test +
+llvm/bison + signing steps).  Verified patch order on the CI buildtree
+(`45833002347`, upstream blacktop xnu 6639065 + 0001..0118):
+`0200` GPU -> `0300` USB (with usbreplay) -> `0400` SWEETBOX -> `0500`
+battery -> `0501` haptic/torch; each `git apply --check` passes after the
+previous one, and none of them touches `bsd/dev/sweet_gpu.c`.  `0400` and
+`0501` were regenerated for the post-`0300` context.  The single boot line
+that turns every extra on (each still opt-in) is the common UI line plus:
+
+```
+sweetgpu=22 sweetgpukeep=1 usbhakios=1 usb=2 usbreplay=1 \
+sweetbox=1 batteryhakios=1 haptichakios=1 torchstep=1
+```
+
+`hakios-net` (unbuilt ath11k/LinuxKPI object) and `hakios-console` (active
+work elsewhere) are deliberately not merged.  SWEETBOX, battery and
+haptic/torch log through the existing `printf`/`sweet_log_append()` console
+tee, and all use the shared `sweet_spmi_read()` helper; no second tee or
+duplicate global was added.
+
 ## UPDATE 2026-11-26 (hakios-panicfix): gl_test panic fixed and made opt-in
 The userland GPU client panic (`phystokv_range: illegal PA 0x50304000`) is
 diagnosed in `hakios-port/PORT-NOTES.md` (last section): an IOVA-shaped value
