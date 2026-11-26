@@ -99,6 +99,20 @@ jobs:
              hakios-port-userland/out/exported-gl.txt \
              "$GITHUB_WORKSPACE/artifacts/"
 
+      - name: Sign every Mach-O artifact (ad-hoc)
+        run: |
+          # iOS runs arm64 binaries only from a valid signature; ad-hoc ("-")
+          # is enough for our AMFI policy, and the dylib needs it as much as
+          # the executables.
+          for f in artifacts/*; do
+            case "$(file -b "$f")" in
+              Mach-O*)
+                codesign -f -s - "$f"
+                codesign -v "$f" && echo "signed: $f"
+                ;;
+            esac
+          done
+
       - name: Build sweet-autorun when this branch has it
         run: |
           # sweet-autorun lives on hakios-autorun (and branches that merged it).
