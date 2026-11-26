@@ -126,7 +126,7 @@ if [ ! -f "$BDIR/build.ninja" ]; then
 		-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=enabled \
 		-Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= \
 		-Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled -Dgallium-xa=disabled \
-		-Dlmsensors=disabled -Dbuild-tests=false 2>&1 | tee "$BUILD/meson-setup.log"
+		-Dlmsensors=disabled -Dbuild-tests=false -Dwerror=false 2>&1 | tee "$BUILD/meson-setup.log"
 fi
 ninja -C "$BDIR" 2>&1 | tee "$BUILD/ninja.log"
 
