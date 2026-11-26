@@ -1,0 +1,299 @@
+diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c	2026-11-26 13:17:47.565800152 +0530
++++ b/bsd/dev/sweet_spmi.c	2026-11-26 13:18:55.188827298 +0530
+@@ -86,11 +86,19 @@
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks; keys retain their own lanes.
++	 * SID 0 is sweet's PM6150 (QG 0x48, SMB 0x10-0x13). SID 2 is alioth's
++	 * PM8150B: fg-gen4 fg-batt-soc 0x40 + fg-batt-info 0x41, and the same
++	 * SMB5 charger IP at 0x10-0x13. Nothing else may be reached. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool sweet_block = sid == 0 &&
++	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x48);
++	bool alioth_block = sid == 2 &&
++	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++	    peripheral == 0x13 || peripheral == 0x40 || peripheral == 0x41);
++	if (!sp_ready || !out || addr > 0xffffu ||
++	    (!sweet_block && !alioth_block)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-26 13:17:47.566321942 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-26 13:18:55.189317390 +0530
+@@ -2,6 +2,9 @@
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * batteryhakios=1: alioth's PM8150B fg-gen4 gauge (SPMI SID 2), read-only,
++ * hardware monotonic SOC + live VBATT/IBATT. Voltage-derived SOC and the
++ * static fallback stay for every other boot.
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -16,6 +19,83 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
++/*
++ * Alioth (Mi 11X / K40 / POCO F3, SM8250-AC): PM8150B on SPMI SID 2.
++ * fg-gen4 is split across fg-batt-soc@0x4000 (hardware monotonic SOC at
++ * +0x09, shadow +0x0A) and fg-batt-info@0x4100 (battery-missing +0x07,
++ * VBATT +0xA0/shadow +0xA6, IBATT +0xA2/shadow +0xA8). SMB5's charger
++ * state machine is at 0x1006 and USBIN_PLUGIN (bit 4) at 0x1310.
++ * Conversions are the vendor ones (fg-util.c):
++ *   uV = raw * 122070 / 1000, uA = sign16(raw) * 488281 / 1000,
++ * positive current = discharging (IOPMPowerSource wants charging > 0).
++ * The shadow copies certify a non-torn sample without writing HOLD.
++ */
++#define ALIOTH_BATT_SID          2u
++#define ALIOTH_BATT_SOC_BASE     0x4000u
++#define ALIOTH_BATT_INFO_BASE    0x4100u
++#define ALIOTH_TYPE              (ALIOTH_BATT_SOC_BASE + 0x04u)
++#define ALIOTH_MSOC              (ALIOTH_BATT_SOC_BASE + 0x09u)
++#define ALIOTH_MSOC_CP           (ALIOTH_BATT_SOC_BASE + 0x0Au)
++#define ALIOTH_SYS_BATT          (ALIOTH_BATT_INFO_BASE + 0x07u)
++#define ALIOTH_VBATT             (ALIOTH_BATT_INFO_BASE + 0xA0u)
++#define ALIOTH_VBATT_CP          (ALIOTH_BATT_INFO_BASE + 0xA6u)
++#define ALIOTH_IBATT             (ALIOTH_BATT_INFO_BASE + 0xA2u)
++#define ALIOTH_IBATT_CP          (ALIOTH_BATT_INFO_BASE + 0xA8u)
++#define ALIOTH_USBIN_RT_STS      0x1310u
++#define ALIOTH_CHGR_STATUS1      0x1006u
++#define ALIOTH_CHGR_STATUS2      0x1007u
++#define ALIOTH_USBIN_PLUGIN_BIT  0x10u
++#define ALIOTH_CAPACITY_MAH      4520u
++
++static bool
++aliothShadowByte(unsigned address, unsigned copyAddress, uint8_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t a, b;
++		if (sweet_spmi_read(ALIOTH_BATT_SID, address, &a) ||
++		    sweet_spmi_read(ALIOTH_BATT_SID, copyAddress, &b)) {
++			return false;
++		}
++		if (a == b) {
++			*value = a;
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++aliothShadowWord(unsigned address, unsigned copyAddress, uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t a0, a1, b0, b1;
++		if (sweet_spmi_read(ALIOTH_BATT_SID, address, &a0) ||
++		    sweet_spmi_read(ALIOTH_BATT_SID, address + 1, &a1) ||
++		    sweet_spmi_read(ALIOTH_BATT_SID, copyAddress, &b0) ||
++		    sweet_spmi_read(ALIOTH_BATT_SID, copyAddress + 1, &b1)) {
++			return false;
++		}
++		if (a0 == b0 && a1 == b1) {
++			*value = (uint16_t)((unsigned)a0 | ((unsigned)a1 << 8));
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Vendor fg_get_msoc(): 255 -> 100, 0 -> 0, else round((raw-1)*98/253)+1. */
++static unsigned
++aliothMonotonicPercent(uint8_t raw)
++{
++	if (raw == 0xffu) {
++		return 100;
++	}
++	if (raw == 0u) {
++		return 0;
++	}
++	return (unsigned)((((unsigned)raw - 1u) * 98u + 126u) / 253u) + 1u;
++}
++
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+ public:
+@@ -26,8 +106,9 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
+-	int fLastMode;
++	bool fTimerAdded, fRunning, fReal, fAlioth;
++	unsigned fCapacityMah;
++	int fLastMode, fLastPercent;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -51,7 +132,8 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fAlioth = false;
++	fCapacityMah = 5020u;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -72,6 +154,7 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fLastPercent = -1;
+ 	return true;
+ }
+ 
+@@ -101,11 +184,12 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (sweet DT nominal=5020, alioth pack=4520).
++	 * powerd computes C*100/M. */
++	const unsigned capacity = (fCapacityMah * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fCapacityMah);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,10 +203,12 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fCapacityMah);
++	putNumber("DesignCapacity", fCapacityMah);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
++	/* iOS battery convention: centidegrees C. The gauge's battery
++	 * thermistor lives on PM8150B's ADC (RRADC), which is not ported:
++	 * 25.0 C is fixed and marked estimated, not a measurement. */
+ 	putNumber("Temperature", 2500);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+@@ -152,11 +238,14 @@
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+ 	int mode = measured ? 1 : 0;
+-	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++	if (mode != fLastMode || (int)percent != fLastPercent) {
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA temp=25.0C(est) external=%d charging=%d\n",
++		    !measured ? "static fallback" :
++		    fAlioth ? "PM8150B fg-gen4 / hardware SOC" :
++		    "PM6150 / estimated SOC",
++		    percent, mv, ma, external, charging);
+ 		fLastMode = mode;
++		fLastPercent = (int)percent;
+ 	}
+ }
+ 
+@@ -206,6 +295,43 @@
+ void
+ SweetBattery::poll(void)
+ {
++	if (fAlioth) {
++		/* PM8150B fg-gen4 + SMB5, read-only. Shadow copies reject torn
++		 * samples; every datum is maintained by the gauge/firmware. */
++		uint8_t type = 0, sys = 0, usb = 0, chg = 0, chg2 = 0;
++		uint8_t msoc = 0;
++		uint16_t vraw = 0, iraw = 0;
++		bool valid = fReal &&
++		    !sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_TYPE, &type) &&
++		    type == 0x0du &&
++		    !sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_SYS_BATT, &sys) &&
++		    (sys & 0x07u) == 0u && /* HW/ALG/CMP battery-missing bits */
++		    aliothShadowByte(ALIOTH_MSOC, ALIOTH_MSOC_CP, &msoc) &&
++		    aliothShadowWord(ALIOTH_VBATT, ALIOTH_VBATT_CP, &vraw) &&
++		    aliothShadowWord(ALIOTH_IBATT, ALIOTH_IBATT_CP, &iraw) &&
++		    !sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_USBIN_RT_STS, &usb) &&
++		    !sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_CHGR_STATUS1, &chg) &&
++		    !sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_CHGR_STATUS2, &chg2);
++		unsigned mv = valid ?
++		    (unsigned)(((uint64_t)vraw * 122070u) / 1000000u) : 0u;
++		valid = valid && mv >= 2800u && mv <= 4600u;
++		if (!valid) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++			return;
++		}
++		unsigned percent = aliothMonotonicPercent(msoc);
++		bool external = (usb & ALIOTH_USBIN_PLUGIN_BIT) != 0;
++		bool capable = external; /* SMB5 charges autonomously on valid input. */
++		unsigned state = chg & 7u; /* INHIBIT..TERMINATE state machine */
++		bool batOv = (chg2 & 0x02u) != 0; /* CHARGER_ERROR_STATUS_BAT_OV */
++		bool charging = capable && state >= 1u && state <= 4u && !batOv;
++		bool full = external && state == 5u && !batOv;
++		int sraw = (iraw & 0x8000u) ? (int)iraw - 65536 : (int)iraw;
++		/* Positive while charging, as IOPMPowerSource expects. */
++		int ma = (int)-((int64_t)sraw * 488281u / 1000000u);
++		publish(percent, mv, ma, external, capable, charging, full, true, true);
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -263,8 +389,48 @@
+ 		return false;
+ 	}
+ 	int real = 0;
++	int hakios = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	(void)PE_parse_boot_argn("batteryhakios", &hakios, sizeof(hakios));
++	fAlioth = hakios == 1;
++	if (fAlioth) {
++		fCapacityMah = ALIOTH_CAPACITY_MAH;
++	}
++	fReal = (fAlioth || real == 1) && sweet_spmi_init() == 0;
++	if (fReal && fAlioth) {
++		/* One-shot register probe: raw bytes, shadow copies and the
++		 * derived values on one line, so a boot photo is a verdict. */
++		uint8_t type = 0, sys = 0, msoc = 0, msoccp = 0, usb = 0;
++		uint8_t chg = 0, chg2 = 0;
++		uint8_t v0 = 0, v1 = 0, vc0 = 0, vc1 = 0, i0 = 0, i1 = 0;
++		int e_type = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_TYPE, &type);
++		int e_sys = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_SYS_BATT, &sys);
++		int e_msoc = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_MSOC, &msoc) |
++		    sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_MSOC_CP, &msoccp);
++		int e_v = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_VBATT, &v0) |
++		    sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_VBATT + 1, &v1) |
++		    sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_VBATT_CP, &vc0) |
++		    sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_VBATT_CP + 1, &vc1);
++		int e_i = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_IBATT, &i0) |
++		    sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_IBATT + 1, &i1);
++		int e_usb = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_USBIN_RT_STS, &usb);
++		int e_chg = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_CHGR_STATUS1, &chg);
++		int e_c2 = sweet_spmi_read(ALIOTH_BATT_SID, ALIOTH_CHGR_STATUS2, &chg2);
++		unsigned vraw = (unsigned)v0 | ((unsigned)v1 << 8);
++		unsigned vcp = (unsigned)vc0 | ((unsigned)vc1 << 8);
++		int iraw16 = (int)((unsigned)i0 | ((unsigned)i1 << 8));
++		int sraw = (iraw16 & 0x8000) ? iraw16 - 65536 : iraw16;
++		IOLog("SWEET BATTERY: alioth probe type=%d/%#x sys=%d/%#x "
++		    "msoc=%d/%#x,%#x(%u%%) v=%d/%#x,%#x(%umV) "
++		    "i=%d/%#x(%dmA) usb=%d/%#x chg=%d/%#x c2=%d/%#x "
++		    "temp=25.0C(est, not measured)\n",
++		    e_type, type, e_sys, sys, e_msoc, msoc, msoccp,
++		    aliothMonotonicPercent(msoc), e_v, vraw, vcp,
++		    (unsigned)(((uint64_t)vraw * 122070u) / 1000000u),
++		    e_i, (unsigned)iraw16 & 0xffffu,
++		    (int)-((int64_t)sraw * 488281u / 1000000u),
++		    e_usb, usb, e_chg, chg, e_c2, chg2);
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
