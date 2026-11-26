@@ -2943,6 +2943,35 @@ index f585be7..92fd55d 100644
  	return 0;
  }
  
+diff --git a/bsd/netinet/tcp_usrreq.c b/bsd/netinet/tcp_usrreq.c
+index 917e523..2faed50 100644
+--- a/bsd/netinet/tcp_usrreq.c
++++ b/bsd/netinet/tcp_usrreq.c
+@@ -2076,6 +2076,8 @@ tcp_sysctl_info(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused
+ 	return 0;
+ }
+ 
++extern int hakios_usb_mux_pid(void);   /* (redmi-k40) bsd/dev/hakios.usb.c: -1 unless usb=3 has a mux */
++
+ static int
+ tcp_lookup_peer_pid_locked(struct socket *so, pid_t *out_pid)
+ {
+@@ -2112,6 +2114,15 @@ tcp_lookup_peer_pid_locked(struct socket *so, pid_t *out_pid)
+ 
+ 	if (finp) {
+ 		*out_pid = finp->inp_socket->last_pid;
++		/*
++		 * (redmi-k40) usb=3: an iPhone's USB mux is in its kernel (AppleUSBDeviceMux); this phone's is a program
++		 * (/redwood/bin/usbmux), and lockdownd takes a connection from 127.0.0.1 for one over USB only when its
++		 * peer is the kernel (pid 0; else "non kernel peer ... Peer is unsafe."). The process holding the iPhone
++		 * port (bsd/dev/hakios.usb.c) is that mux: it is said to be the kernel here, and only it.
++		 */
++		if (*out_pid > 0 && *out_pid == hakios_usb_mux_pid()) {
++			*out_pid = 0;
++		}
+ 		error = 0;
+ 		in_pcb_checkstate(finp, WNT_RELEASE, 0);
+ 	}
 diff --git a/bsd/sys/hakios.board.h b/bsd/sys/hakios.board.h
 new file mode 100644
 index 0000000..aee9b3c
