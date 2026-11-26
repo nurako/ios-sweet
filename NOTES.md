@@ -31,6 +31,17 @@ run it once. Patch `0200` regenerated and compile-verified against CI
   (`0 of 1 failed`, log 45735232511); both workflow YAMLs parse; 0300 does not
   touch `bsd/dev/sweet_gpu.c`. Not verified: a cached CI run, a userland build
   on a Mac, and the replay on the phone (nothing booted from this branch).
+### >>> UPDATE 2026-11-26 (alioth): BATTERY PHASE 1 (compile-only, opt-in) <<<
+
+Patch `0500-hakios-battery.patch` (branch only, after 0118) adds alioth's
+PM8150B fg-gen4 gauge to the existing `SweetBattery` IOPMPowerSource. SPMI
+SID 2 blocks 0x40/0x41 (SOC, VBATT/IBATT shadows) plus the SMB5 charger at
+0x1006/0x1007/0x1310 are read-only; `batteryhakios=1` selects it, everything
+else (including the default boot) keeps the static 100% / 4200 mV fallback.
+One probe line prints all raw registers + derived percent/mV/mA/temp. Both
+files pass xnu-cc (`0 of 2 failed`) and the patch applies cleanly to the
+45735232511 buildtree (0001..0118). Temperature stays fixed 25.0 C (RRADC
+not ported), cycles 0. Not booted. Notes: `hakios-port-battery/PORT-NOTES.md`.
 
 ## Agent handoff / active work (2026-11-22, latest)
 
