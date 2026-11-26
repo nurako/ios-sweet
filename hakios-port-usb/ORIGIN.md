@@ -17,6 +17,15 @@ SM8250-AC "kona").
 | `kernel/bsd/sys/hakios.board.h` | `devices/redmi-k40/overlays/xnu/files/bsd/sys/hakios.board.h` | (same tree; `hakios_board_is_alioth()`) |
 | `reference-xnu-device.patch` | `devices/redmi-k40/xnu-device.patch` | `df8a294da42f98e5d7a54c651ff023251286e52e` |
 | `reference-boot.args` | `devices/redmi-k40/boot.args` | `6d74081322044061da70588d4cbf59a39a8bb217` |
+| `userland/src/usbmux.c` | `devices/redmi-k40/overlays/userland/src/usbmux.c` | `787523b541987561e795e9477d76ceb73462f3f0` |
+| `userland/src/usbsh.c` | `devices/redmi-k40/overlays/userland/src/usbsh.c` | `154d04197a6cf81e30f249c036faaa591e17fe88` |
+| `userland/com.hakios.usbmux.plist` | `devices/redmi-k40/overlays/userland/com.hakios.usbmux.plist` | `ad5680eb1faec67fa9f6ef3722d46118313212c8` |
+| `userland/com.hakios.usbsh.plist` | `devices/redmi-k40/overlays/userland/com.hakios.usbsh.plist` | `6977953569e5994b4eae998e50f50a0246bbae1e` |
+
+Their `devices/redmi-k40/overlays/userland/build.sh` (blob
+`2f18bc56b2c0ec2c943bce72aa0405e41a066792`) is the source of the build flags
+recorded in `PORT-NOTES.md` section 8.2; it was read, not copied, because it
+builds the whole reference userland image.
 
 ## License
 
