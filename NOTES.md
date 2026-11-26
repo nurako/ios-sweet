@@ -2059,19 +2059,26 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
 
-### >>> UPDATE 2026-11-26 (alioth): HAPTICS + FLASHLIGHT (compile-only, opt-in) <<<
+### >>> UPDATE 2026-11-26 (alioth): HAPTIC BOOT-HANG FIX (compile-only) <<<
 
-Patch `0501-hakios-haptic-torch.patch` (branch only, after 0500) adds two
-self-contained alioth drivers: `bsd/dev/alioth_haptic.c` (AW8697 at qupv3_se11
-0xa84000 / gpio60-61 / reset 130 / int 129 / addr 0x5a) and
-`bsd/dev/alioth_torch.c` (PM8150L flash, SPMI SID 5 / 0xd300, channel 0). The
-haptic probe runs over GENI I2C (our `alioth_touch.c` pattern) and only writes
-and reads back `SYSINTM=0xff`; no waveform is started and the chip is held in
-reset afterwards. The torch gets one bounded ON at `torchma` mA (default 125)
-for `torchsecs` (default 2) and always turns off, or exposes `/dev/hakios-torch`
-for a debug write with `torchstep=2`. `sweet_spmi_write()` is restricted to
-SID 5 / 0xd300 through an EE0-owned channel. Opt-in `haptichakios=1` /
-`torchstep=1|2`; default boot unchanged. All four touched files pass xnu-cc
-(`0 of 4 failed`), 0500 then 0501 apply cleanly to the 45735232511 buildtree
-(0001..0118), and neither touches `bsd/dev/sweet_gpu.c`. Not booted. Notes:
+First hardware run with `haptichakios=1` reached the launchd early-boot phase
+and then watchdog-rebooted; without the flag the same build booted. Cause: the
+AW8697 probe's GENI/QUP waits had no shared bound, and its 5 s start delay was
+a `delay()` busy-spin. Fix in `0501-hakios-haptic-torch.patch`: every poll is
+bounded by `mach_absolute_time` (2 ms per wait, 20 ms for the whole probe,
+plus a round cap); on expiry one line
+`HAKIOS HAPTIC: timed out waiting for <what> (0x%x)` is printed, gpio130 is
+driven low, no further register is written, and the thread returns. The probe
+is still only spawned by `alioth_haptic_init()` (called from
+`sweet_ufs_init()` on alioth and only when the boot arg is present) but runs
+on its own kernel thread; the pre-probe delay is now
+`assert_wait_deadline()`/`thread_block()`, the GPU adapter pattern. The torch
+reads type/subtype before `show()` or any write: alioth's `0x18/0x0000`
+prints once, forces `lit=0`/`wanted=0`, and never lights. 0501 was
+regenerated against the post-0500 tree and order-simulated on blacktop
+`6639065` + `0001..0118`: `0119` -> `0200` -> `0300` -> `0400` -> `0500` ->
+`0501`; it does not touch `bsd/dev/sweet_gpu.c`. Compile: `0 of 2 files
+failed` (xnu-cc, `gh run view 45852234119`). Next: temporary-boot with
+`haptichakios=1 haptichakiosdelay=0` and confirm the GUI appears with either
+the AW8697 proof or exactly one timeout line. Notes:
 `hakios-port-small/PORT-NOTES.md`.

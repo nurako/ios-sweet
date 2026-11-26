@@ -1,9 +1,12 @@
 # Port notes: haptics (AW8697) + flashlight (PM8150L) on alioth
 
-Branch: `hakios-small`, based on `hakios-battery` (patches 0001..0118 + 0500).
-Status: **compile-only, opt-in, no hardware run yet.** The default boot is
-unchanged: without `haptichakios=1` and `torchstep=1|2` neither driver maps
-MMIO, touches a GPIO, writes a PMIC register, or starts a thread.
+Branch: `hakios-hapticfix`, based on `hakios-integrate` (patches 0001..0118 +
+`0119` -> `0200` -> `0300` -> `0400` -> `0500` -> `0501`).
+Status: **the first hardware run with `haptichakios=1` reached early launchd
+and then watchdog-reset before the GUI; this branch bounds every wait and
+defers the probe.** The default boot is unchanged: without `haptichakios=1`
+and `torchstep=1|2` neither driver maps MMIO, touches a GPIO, writes a PMIC
+register, or starts a thread.
 
 ## 1. Inventory
 
@@ -33,7 +36,9 @@ reference header:
 * **new** `bsd/dev/alioth_haptic.c` — AW8697 probe over GENI I2C.
   * GCC vote + RCG for wrap1 s5 (same sequence as `alioth_touch.c` for wrap0 s4).
   * GENI SE11 FIFO I2C at 400 kHz: `I2C_WRITE`/`I2C_READ` opcodes, repeated
-    START for a register read, 5 ms command timeout, abort on error.
+    START for a register read. Every poll (RCG update, GCC branch halt,
+    M-command completion, abort) is bounded by `mach_absolute_time`: 2 ms per
+    wait, 20 ms for the whole probe including its 5+8 ms reset pulses.
   * checks `SE_FW` protocol == 3 (I2C) first; if ABL did not load I2C firmware,
     it prints and touches nothing.
   * releases reset (low 5 ms, high, 8 ms), reads id `0x00` (expect 0x97),
@@ -69,20 +74,57 @@ reference header:
 Neither patch modifies `bsd/dev/sweet_gpu.c` (the name appears only as a
 context line in `bsd/conf/files`).
 
+## 2.1 Boot-hang fix (2026-11-26, first hardware run)
+
+Observed: with `haptichakios=1` the phone reached the launchd early-boot phase
+and then rebooted; without the flag it booted normally. The haptic probe was
+therefore the reset cause, not a kernel/CI regression.
+
+* **Cause.** The GENI/QUP waits had no shared bound. A board where SE11 is not
+  muxed to I2C (or whose RCG/branch never comes out of halt) leaves the polled
+  status bit at "busy" forever. The old loops only had per-loop iteration
+  counts; the 5 s probe delay itself was a `delay()` busy-spin, so launchd was
+  sharing the boot with a spinning kernel thread. Either way the watchdog
+  could fire before the GUI.
+* **Bound.** `hap_ns()` reads `mach_absolute_time()` (same clock idiom as
+  `alioth_touch.c`/`torch.c`). `wait_clear()` gets 2 ms and the whole probe
+  20 ms; `HAP_POLL_ROUNDS` is an independent round cap in case the counter
+  does not advance. Every wait (RCG update, each GCC branch halt, M-command
+  completion, M-command abort) prints exactly one line on expiry:
+
+  ```
+  HAKIOS HAPTIC: timed out waiting for <what> (0x<last read>)
+  ```
+
+  and the probe immediately drives gpio130 low, writes no further register,
+  and returns. The torch side was made equally passive: the module is
+  identified **before** `show()` or any write, and alioth's
+  `type=0x18 subtype=0x0000` slot (not the UMI PM8150L `0x18/0x0004`) prints
+  one line, forces `lit=0`/`wanted=0`, and does nothing else.
+* **Where it runs.** `sweet_ufs_init()` still only calls
+  `alioth_haptic_init()`, which returns immediately unless
+  `haptichakios` is present and non-zero. The actual probe runs in its own
+  kernel thread, and the pre-probe delay is now
+  `assert_wait_deadline()`/`thread_block()` (GPU adapter pattern), not a
+  `delay()` spin. An absent boot arg means no thread at all; a broken chip
+  means the thread times out and the boot continues.
+* **Ordering.** `0501` is regenerated against the post-`0500` tree and verified
+  to apply in order on blacktop `6639065` + `0001..0118`:
+  `0119` -> `0200` -> `0300` -> `0400` -> `0500` -> `0501`.
+
 ## 3. Build verification
 
 ```
-XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-small.log \
-    /tmp/opencode/bt-small bsd/dev/alioth_haptic.c bsd/dev/alioth_torch.c \
-    bsd/dev/sweet_spmi.c bsd/dev/sweet_ufs.c --per-file
-0 of 4 files failed
+XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-hap.log \
+    /tmp/research/ci-buildtree bsd/dev/alioth_haptic.c bsd/dev/alioth_torch.c
+0 of 2 files failed
 ```
 
-Also compiled to objects and checked `llvm-nm -u`: the only names not in the
-CI `config/allsymbols` are the other new object's symbols (resolved at link).
-Log: `gh run view 45735232511 -R nurako/ios-sweet --log` (hakios-usb
-buildtree; patches 0001..0118 plus the USB work). `git apply --check` of 0500
-then 0501 passes forward on a clean tree at `a03dc7e` (blacktop + 0001..0118).
+Log: `gh run view 45852234119 -R nurako/ios-sweet --log` (integrate
+buildtree; patches 0001..0118 + 0119/0200/0300/0400/0500/0501). The patch
+order was re-simulated locally on blacktop `6639065` + `0001..0118`:
+`0119` -> `0200` -> `0300` -> `0400` -> `0500` -> `0501` all applied, and
+`0501` does not touch `bsd/dev/sweet_gpu.c`.
 
 ## 4. Boot cmdlines
 
@@ -113,7 +155,7 @@ Torch debug node (no light until userland writes mA):
 ... torchstep=2 torchmaxs=30
 ```
 
-## 5. Expected proof lines (NOT yet observed on hardware)
+## 5. Expected proof lines (first hardware run timed out; fix not yet re-run)
 
 Haptics:
 
@@ -131,7 +173,17 @@ HAKIOS HAPTIC: chip held in reset (gpio130 low); done
 ```
 
 If `SE11 is not an I2C engine` appears, ABL left the serial engine in another
-protocol; nothing was touched and the boot continues.
+protocol; nothing was touched and the boot continues. If SE11/QUP never comes
+out of halt or the I2C command never completes, the *only* new line is one
+bounded timeout, followed by the chip being held in reset:
+
+```
+HAKIOS HAPTIC: timed out waiting for wrap1 s5 RCG update (0x...)
+HAKIOS HAPTIC: timed out waiting for GCC branch 0x18004 halt (0x...)
+HAKIOS HAPTIC: timed out waiting for i2c read completion (0x...)
+```
+
+The boot must continue to the GUI in every one of those cases.
 
 Flashlight:
 
@@ -165,9 +217,12 @@ module is darkened.
    fixed 25 C gauge cannot provide a real pack temperature.
 5. **GENI I2C is new here.** Only `alioth_touch.c`'s SPI use of the same
    engine is proven. If SE11 is not in I2C mode, or the clock/RCG differs,
-   the probe fails at the proto check or times out; it never retries forever.
-6. **Hardware run** — none. Watch for: the haptic id, the `0x03` round trip,
-   `GLBRD5=0`, the torch `rt=0x0090`, and that `stage` stays 0.
+   the probe fails at the proto check or in one of the bounded waits above;
+   it never retries forever.
+6. **Hardware run** — the first one watchdog-reset (see 2.1); the bounded
+   build has not booted yet. Watch for either the id/`0x03` proof or a single
+   `timed out waiting for ...` line followed by a normal GUI boot, plus the
+   torch `rt=0x0090` and `stage=0` when `torchstep=1`.
 
 ## 7. Risks and safe defaults
 
@@ -182,9 +237,11 @@ module is darkened.
   one byte, through an EE0-owned channel; the torch file additionally
   allowlists registers and reads every write back. Any surprise stops all
   further writes for the boot.
-* **A hanging bus.** GENI transfers have bounded polls (5 ms command timeout,
-  abort + FIFO drain on error); SPMI writes have a 1 s loop and poison the
-  lane on timeout. Both run on their own kernel thread after a delay, so a
-  failure cannot stall `sweet_ufs_init`.
+* **A hanging bus.** GENI polls are now system-counter bounded: 2 ms per
+  wait, 20 ms per probe, plus a round cap; on expiry the chip is held in
+  reset and no further register is written. SPMI writes have a 1 s loop and
+  poison the lane on timeout. Both drivers run on their own kernel thread,
+  and their delays sleep (`assert_wait_deadline`) instead of spinning, so a
+  failure cannot stall `sweet_ufs_init` or starve launchd.
 * **Keep both opt-in.** The default boot must stay the reference: no
   `haptichakios`, no `torchstep`.

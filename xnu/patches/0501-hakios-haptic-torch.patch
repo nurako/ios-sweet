@@ -13,10 +13,10 @@ index bbf0e6a..5c4358e 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/alioth_haptic.c b/bsd/dev/alioth_haptic.c
 new file mode 100644
-index 0000000..015e420
+index 0000000..3f4753d
 --- /dev/null
 +++ b/bsd/dev/alioth_haptic.c
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,632 @@
 +/*
 + * ALIOTH HAPTIC (Redmi K40 / POCO F3 / Mi 11X, SM8250-AC): Awinic AW8697
 + * linear-resonant actuator, probed and verified read-only+one-safe-write.
@@ -42,6 +42,11 @@ index 0000000..015e420
 + * (gpio130 low). A missing I2C firmware, a busy engine, a NACK or a value
 + * that does not read back all end the probe with a line and leave the
 + * default boot path as it found it.
++ *
++ * Every wait is bounded by mach_absolute_time: 2 ms per register poll and
++ * 20 ms for the whole probe. On expiry exactly one line names the wait,
++ * the chip is held in reset and nothing else is written. The first alioth
++ * run hung the boot here; a guest driver must never be able to do that.
 + *
 + * The chip id is AW8697 register 0x00 = 0x97 (the AW86927 at 0x9270 lives
 + * on other boards; alioth uses the AW8697).
@@ -130,8 +135,20 @@ index 0000000..015e420
 +#define AW_SYSINTM       0x03u
 +#define AW_GLBRD5        0x46u
 +
++/*
++ * Every register wait is bounded by the system counter. One wait gets at
++ * most HAP_POLL_NS, the whole probe HAP_TOTAL_NS (the 5+8 ms reset pulses
++ * come out of that). HAP_POLL_ROUNDS is a second, independent ceiling so a
++ * non-advancing counter (or a broken delay()) still terminates the poll.
++ * A guest driver must never be able to spin the boot to a watchdog reset.
++ */
++#define HAP_POLL_NS      (2ull * NSEC_PER_MSEC)
++#define HAP_TOTAL_NS     (20ull * NSEC_PER_MSEC)
++#define HAP_POLL_ROUNDS  20000u
++
 +static struct {
 +	vm_offset_t gcc, tlmm, se;
++	uint64_t deadline_ns;
 +	bool ready, dead, released;
 +} h;
 +
@@ -149,6 +166,34 @@ index 0000000..015e420
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
 +	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint64_t
++hap_ns(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static bool
++hap_expired(void)
++{
++	return h.dead || hap_ns() >= h.deadline_ns;
++}
++
++/* The one line a timeout is allowed to print; no register write follows. */
++static bool
++hap_timeout(const char *what, uint32_t seen)
++{
++	/* Exactly one timeout line per probe, whatever path gets here first. */
++	if (!h.dead) {
++		printf("HAKIOS HAPTIC: timed out waiting for %s (0x%x)\n",
++		    what, seen);
++	}
++	h.dead = true;
++	return false;
 +}
 +
 +static void
@@ -174,15 +219,25 @@ index 0000000..015e420
 +}
 +
 +static bool
-+wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask, const char *what)
 +{
-+	for (unsigned i = 0; i < 5000; ++i) {
-+		if (!(rd(base, off) & mask)) {
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
++		uint32_t value = rd(base, off);
++
++		if (!(value & mask)) {
 +			return true;
 +		}
-+		delay(1);
++		if (h.dead || hap_ns() >= until) {
++			return hap_timeout(what, value);
++		}
++		delay(10);
 +	}
-+	return false;
++	return hap_timeout(what, rd(base, off));
 +}
 +
 +static bool
@@ -205,22 +260,23 @@ index 0000000..015e420
 +		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
 +		wr(h.gcc, HAP_RCG + 4u, cfg);
 +		wr(h.gcc, HAP_RCG, rd(h.gcc, HAP_RCG) | 1u);
-+		if (!wait_clear(h.gcc, HAP_RCG, 1u)) {
-+			printf("HAKIOS HAPTIC: wrap1 s5 RCG update stuck (%#x)\n",
-+			    rd(h.gcc, HAP_RCG));
++		if (!wait_clear(h.gcc, HAP_RCG, 1u,
++		    "wrap1 s5 RCG update")) {
 +			return false;
 +		}
 +	}
 +	const uint32_t branches[] = {0x18004, 0x18008, 0x23138, 0x23140, 0x185fc};
 +	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		char what[40];
++
 +		/* wrap1 s_ahb runs in hardware clock gating and reads halted. */
 +		if (branches[i] == 0x18008u &&
 +		    (rd(h.gcc, 0x18008u) & (1u << 1))) {
 +			continue;
 +		}
-+		if (!wait_clear(h.gcc, branches[i], 1u << 31)) {
-+			printf("HAKIOS HAPTIC: GCC branch %#x halted (%#x)\n",
-+			    branches[i], rd(h.gcc, branches[i]));
++		snprintf(what, sizeof(what), "GCC branch %#x halt",
++		    branches[i]);
++		if (!wait_clear(h.gcc, branches[i], 1u << 31, what)) {
 +			return false;
 +		}
 +	}
@@ -230,12 +286,27 @@ index 0000000..015e420
 +static void
 +se_abort(void)
 +{
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++	bool acked = false;
++
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
 +	wr(h.se, SE_M_CMD_CTRL, 2); /* abort the M command */
-+	for (unsigned i = 0; i < 5000; ++i) {
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
 +		if (rd(h.se, SE_M_IRQ) & (1u << 5)) {
++			acked = true;
 +			break;
 +		}
-+		delay(1);
++		if (h.dead || hap_ns() >= until) {
++			break;
++		}
++		delay(10);
++	}
++	if (!acked) {
++		/* Leave the bus alone; the probe is already over. */
++		(void)hap_timeout("M command abort", rd(h.se, SE_M_IRQ));
++		return;
 +	}
 +	for (unsigned i = 0; i < 64 && (rd(h.se, SE_RX_COUNT) & 0x1ffffffu);
 +	    ++i) {
@@ -251,6 +322,9 @@ index 0000000..015e420
 +static bool
 +se_init(void)
 +{
++	if (hap_expired()) {
++		return hap_timeout("probe budget before SE11 init", 0);
++	}
 +	uint32_t fw = rd(h.se, SE_FW);
 +	uint32_t tx = rd(h.se, SE_HW_TX), rx = rd(h.se, SE_HW_RX);
 +
@@ -306,7 +380,7 @@ index 0000000..015e420
 +	    (stretch ? I2C_STOP_STRETCH : 0u);
 +	uint32_t stat = 0;
 +
-+	if (h.dead || len == 0 || len > 64) {
++	if (hap_expired() || len == 0 || len > 64) {
 +		return EIO;
 +	}
 +	if (rd(h.se, SE_STATUS) & 1u) {
@@ -329,7 +403,11 @@ index 0000000..015e420
 +		}
 +	}
 +	wr(h.se, SE_M_CMD0, cmd | param);
-+	for (unsigned i = 0; i < 5000; ++i) {
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
 +		stat = rd(h.se, SE_M_IRQ);
 +		if (stat & M_ERRORS) {
 +			printf("HAKIOS HAPTIC: i2c %s irq=%#x\n",
@@ -341,15 +419,18 @@ index 0000000..015e420
 +		if (stat & M_DONE) {
 +			break;
 +		}
++		if (h.dead || hap_ns() >= until) {
++			break;
++		}
 +		delay(10);
 +	}
-+	wr(h.se, SE_M_IRQ_CLR, stat);
 +	if (!(stat & M_DONE)) {
-+		printf("HAKIOS HAPTIC: i2c %s timeout irq=%#x\n",
-+		    read ? "read" : "write", stat);
-+		se_abort();
++		/* No M_IRQ_CLR, no abort write: the probe is over. */
++		(void)hap_timeout(read ? "i2c read completion" :
++		    "i2c write completion", stat);
 +		return EIO;
 +	}
++	wr(h.se, SE_M_IRQ_CLR, stat);
 +	if (read) {
 +		unsigned got = 0;
 +		uint32_t count = rd(h.se, SE_RX_COUNT) & 0x1ffffffu;
@@ -401,16 +482,32 @@ index 0000000..015e420
 +	h.released = high;
 +}
 +
++/* Any timeout ends here: actuator unpowered, nothing else written. */
++static void
++hold_reset(void)
++{
++	if (h.tlmm) {
++		reset_pin(false);
++		h.released = false;
++	}
++}
++
 +static bool
 +put(uint8_t reg, uint8_t value, uint8_t *back)
 +{
 +	if (regs_write(reg, &value, 1)) {
-+		printf("HAKIOS HAPTIC: %#04x <- %#04x NOT ACKNOWLEDGED\n",
-+		    reg, value);
++		/* A timeout already printed its one line. */
++		if (!h.dead) {
++			printf("HAKIOS HAPTIC: %#04x <- %#04x NOT ACKNOWLEDGED\n",
++			    reg, value);
++		}
 +		return false;
 +	}
 +	if (regs_read(reg, back, 1)) {
-+		printf("HAKIOS HAPTIC: %#04x could not be read back\n", reg);
++		if (!h.dead) {
++			printf("HAKIOS HAPTIC: %#04x could not be read back\n",
++			    reg);
++		}
 +		return false;
 +	}
 +	printf("HAKIOS HAPTIC: %#04x <- %#04x, reads %#04x%s\n", reg, value,
@@ -422,19 +519,23 @@ index 0000000..015e420
 +probe(void)
 +{
 +	uint8_t id = 0, back = 0, state = 0xff;
-+	bool ok = true;
++	bool ok = true, was_released;
 +
++	h.deadline_ns = hap_ns() + HAP_TOTAL_NS;
++	h.dead = false;
 +	h.gcc = ml_io_map(HAP_GCC_PA, 0x60000);
 +	h.tlmm = ml_io_map(HAP_TLMM_PA + HAP_TLMM_SOUTH, HAP_TLMM_SIZE);
 +	h.se = ml_io_map(HAP_SE_PA, HAP_SE_SIZE);
 +	if (!h.gcc || !h.tlmm || !h.se) {
 +		printf("HAKIOS HAPTIC: MMIO mapping failed\n");
++		hold_reset();
 +		return;
 +	}
 +	printf("HAKIOS HAPTIC: gpio%u SDA gpio%u SCL gpio%u reset gpio%u int, "
 +	    "chip 0x%02x on SE11 0x%x\n", HAP_PIN_SDA, HAP_PIN_SCL,
 +	    HAP_PIN_RESET, HAP_PIN_INT, AW_ADDRESS, HAP_SE_PA);
 +	if (!haptic_clocks() || !se_init()) {
++		hold_reset();
 +		return;
 +	}
 +	/* I2C pins: function qup11 (mux 1), no pull, as the vendor pinctrl. */
@@ -453,8 +554,16 @@ index 0000000..015e420
 +	printf("HAKIOS HAPTIC: reset gpio%u cfg=%#x io=%#x after (high=released)\n",
 +	    HAP_PIN_RESET, rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET)),
 +	    rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET) + 4u));
++	if (hap_expired()) {
++		(void)hap_timeout("probe budget before AW8697 read", 0);
++		hold_reset();
++		return;
++	}
 +
 +	if (regs_read(AW_ID, &id, 1)) {
++		if (h.dead) {
++			goto done;
++		}
 +		printf("HAKIOS HAPTIC: nobody answers at 0x%02x (AW8697 held in "
 +		    "reset or not powered)\n", AW_ADDRESS);
 +		ok = false;
@@ -466,38 +575,59 @@ index 0000000..015e420
 +	if (ok) {
 +		/* The only write: mask interrupts. It cannot start the motor. */
 +		ok = put(AW_SYSINTM, 0xff, &back);
++		if (h.dead) {
++			goto done;
++		}
 +	}
 +	if (ok && !regs_read(AW_GLBRD5, &state, 1)) {
++		if (h.dead) {
++			goto done;
++		}
 +		printf("HAKIOS HAPTIC: GLBRD5 %#04x state=%u%s\n", state,
 +		    state & 0x0fu, (state & 0x0fu) == 0 ? " (standby)" : "");
 +	}
 +	if (ok) {
 +		uint8_t r[8] = {0};
 +		if (!regs_read(0x00, r, sizeof(r))) {
++			if (h.dead) {
++				goto done;
++			}
 +			printf("HAKIOS HAPTIC: regs 00-07: %02x %02x %02x %02x "
 +			    "%02x %02x %02x %02x\n", r[0], r[1], r[2], r[3], r[4],
 +			    r[5], r[6], r[7]);
 +		}
 +		printf("HAKIOS HAPTIC: AW8697 verified; no waveform was started\n");
 +	}
++done:
 +	/* Never leave the actuator enabled: hold it in reset again. */
-+	if (h.released) {
-+		reset_pin(false);
++	was_released = h.released;
++	hold_reset();
++	if (was_released && !h.dead) {
 +		printf("HAKIOS HAPTIC: chip held in reset (gpio%u low); done\n",
 +		    HAP_PIN_RESET);
 +	}
 +}
 +
++static int haptic_sleep_chan;
++
 +static void
 +haptic_thread(void *arg, wait_result_t result)
 +{
 +	unsigned delay_s = 5;
++	uint64_t deadline;
++
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("haptichakiosdelay", &delay_s,
 +	    sizeof(delay_s));
-+	printf("HAKIOS HAPTIC: starting in %u s (haptichakios=1)\n", delay_s);
-+	wait_ms(delay_s * 1000u);
++	if (delay_s > 60) {
++		delay_s = 60;
++	}
++	printf("HAKIOS HAPTIC: probe in %u s (haptichakios=1)\n", delay_s);
++	/* Sleep, do not spin: launchd must keep running under the watchdog. */
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&haptic_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
 +	probe();
 +	thread_terminate(current_thread());
 +}
@@ -521,10 +651,10 @@ index 0000000..015e420
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/alioth_torch.c b/bsd/dev/alioth_torch.c
 new file mode 100644
-index 0000000..19bc976
+index 0000000..084e02f
 --- /dev/null
 +++ b/bsd/dev/alioth_torch.c
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,506 @@
 +/*
 + * ALIOTH FLASHLIGHT (Redmi K40 / POCO F3 / Mi 11X, SM8250-AC): the PM8150L
 + * flash LED module at SPMI SID 5, peripheral 0xd300, channel 0.
@@ -816,10 +946,17 @@ index 0000000..19bc976
 +	return ns / NSEC_PER_MSEC;
 +}
 +
++static int torch_sleep_chan;
++
 +static void
 +wait_ms(unsigned ms)
 +{
-+	delay(ms * 1000u);
++	uint64_t deadline;
++
++	/* Sleep, do not spin: a 30 s light must not hold a CPU busy. */
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&torch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
 +/* /dev/hakios-torch: a 32-bit little-endian mA value; 0 is off. */
@@ -980,14 +1117,22 @@ index 0000000..19bc976
 +		printf("HAKIOS TORCH: SPMI unavailable; nothing touched\n");
 +		thread_terminate(current_thread());
 +	}
-+	show("module before");
++	/*
++	 * Identify the module before showing or writing anything. alioth's
++	 * PM8150L slot answers type=0x18 subtype=0x0000, not the UMI's
++	 * 0x18/0x0004: never touch that module. One line, then done.
++	 */
 +	uint8_t type = 0, subtype = 0;
 +	if (get(FLASH_TYPE, &type) || get(FLASH_SUBTYPE, &subtype) ||
 +	    type != 0x18u || subtype != 0x04u) {
-+		printf("HAKIOS TORCH: type=%#04x subtype=%#04x, not the PM8150L "
-+		    "flash module; nothing written\n", type, subtype);
++		printf("HAKIOS TORCH: type=%#04x subtype=%#04x is not the "
++		    "PM8150L flash module; nothing written, light stays off\n",
++		    type, subtype);
++		lit = false;
++		wanted = 0;
 +		thread_terminate(current_thread());
 +	}
++	show("module before");
 +	if (level == 1) {
 +		one_shot(ma, seconds);
 +	} else {
