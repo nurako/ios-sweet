@@ -31,6 +31,7 @@ run it once. Patch `0200` regenerated and compile-verified against CI
   (`0 of 1 failed`, log 45735232511); both workflow YAMLs parse; 0300 does not
   touch `bsd/dev/sweet_gpu.c`. Not verified: a cached CI run, a userland build
   on a Mac, and the replay on the phone (nothing booted from this branch).
+
 ### >>> UPDATE 2026-11-26 (alioth): BATTERY PHASE 1 (compile-only, opt-in) <<<
 
 Patch `0500-hakios-battery.patch` (branch only, after 0118) adds alioth's
@@ -1961,3 +1962,20 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+### >>> UPDATE 2026-11-26 (alioth): HAPTICS + FLASHLIGHT (compile-only, opt-in) <<<
+
+Patch `0501-hakios-haptic-torch.patch` (branch only, after 0500) adds two
+self-contained alioth drivers: `bsd/dev/alioth_haptic.c` (AW8697 at qupv3_se11
+0xa84000 / gpio60-61 / reset 130 / int 129 / addr 0x5a) and
+`bsd/dev/alioth_torch.c` (PM8150L flash, SPMI SID 5 / 0xd300, channel 0). The
+haptic probe runs over GENI I2C (our `alioth_touch.c` pattern) and only writes
+and reads back `SYSINTM=0xff`; no waveform is started and the chip is held in
+reset afterwards. The torch gets one bounded ON at `torchma` mA (default 125)
+for `torchsecs` (default 2) and always turns off, or exposes `/dev/hakios-torch`
+for a debug write with `torchstep=2`. `sweet_spmi_write()` is restricted to
+SID 5 / 0xd300 through an EE0-owned channel. Opt-in `haptichakios=1` /
+`torchstep=1|2`; default boot unchanged. All four touched files pass xnu-cc
+(`0 of 4 failed`), 0500 then 0501 apply cleanly to the 45735232511 buildtree
+(0001..0118), and neither touches `bsd/dev/sweet_gpu.c`. Not booted. Notes:
+`hakios-port-small/PORT-NOTES.md`.
