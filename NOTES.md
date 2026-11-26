@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## UPDATE 2026-11-26 (hakios-panicfix): gl_test panic fixed and made opt-in
+The userland GPU client panic (`phystokv_range: illegal PA 0x50304000`) is
+diagnosed in `hakios-port/PORT-NOTES.md` (last section): an IOVA-shaped value
+reached `copypv()`'s physical cache flush via `newBuffer()`. `newBuffer()` now
+validates every `getPhysicalSegment()` run against `hakios_gpu_phys_ok()`, and
+`copypv()` only flushes `pmap_valid_address()` physical ranges. The gl_test
+launchd job no longer runs on a normal boot; touch `/var/tmp/run-gl-test` to
+run it once. Patch `0200` regenerated and compile-verified against CI
+`45778296613`; `0300` still applies after it.
+
 ## Agent handoff / active work (2026-11-22, latest)
 
 ### >>> UPDATE 2026-11-22 #2 (alioth): **iOS 16.7.16 HOME SCREEN + TOUCH WORKING**.

@@ -27,6 +27,7 @@
 #include <pexpert/arm/protos.h>
 #include <console/video_console.h>
 #include <arm/machine_routines.h>
+#include <vm/pmap.h>
 #include <kern/simple_lock.h>
 #include <os/atomic_private.h>
 #include <IOKit/IOInterrupts.h>
@@ -169,6 +170,34 @@ hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_o
  * KERN_NO_SPACE (a panic on the way).
  */
 extern struct vc_info vinfo;
+
+/*
+ * Whether `phys` (for `size` bytes) may be handed to the GPU's SMMU: it must
+ * be kernel-managed DRAM (pmap_valid_address -- this kernel maps only the high
+ * bank, 0x1_00000000.., through phystokv/phystokv_range), or, for a scan-out
+ * buffer only, the boot framebuffer that the console already mapped.
+ *
+ * Anything else -- in particular the reserved region below 0x80000000 and the
+ * GPU address window (0x20000000..0x1_00000000, where 0x50304000 lives) -- is
+ * an address that phystokv_range() is required to panic on. A user client
+ * must never be able to make the kernel convert one, so buffers carrying such
+ * a value are refused while they are still only a request.
+ */
+extern boolean_t pmap_valid_address(uint64_t addr);
+bool
+hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout)
+{
+	uint64_t fb = vinfo.v_physaddr;
+	uint64_t fb_size = (uint64_t)vinfo.v_rowbytes * vinfo.v_height;
+
+	if (phys == 0 || size == 0 || phys + size < phys) {
+		return false;                   /* no address, or a range that wraps */
+	}
+	if (pmap_valid_address(phys) && pmap_valid_address(phys + size - 1)) {
+		return true;                    /* kernel-managed, and in the linear map */
+	}
+	return scanout && fb != 0 && fb_size != 0 && phys >= fb && phys + size <= fb + fb_size;
+}
 
 void
 MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes)

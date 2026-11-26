@@ -33,13 +33,19 @@ JOBS = {
     },
     '/System/Library/LaunchDaemons/com.hakios.gltest.plist': {
         'Label': 'com.hakios.gltest',
-        # wait for the USB gadget and the GUI, then let the output go both to
-        # the screen and to /dev/hakios-usb, which is what the host reads
+        # OPT-IN: a broken GPU client panics the kernel, so this job must not
+        # run on a normal boot.  It runs once only when the root carries the
+        # sentinel /var/tmp/run-gl-test; the sentinel is removed first, so a
+        # panic leaves the next boot safe.  To run it deliberately, on a
+        # mounted root:
+        #     touch <root>/var/tmp/run-gl-test
+        # (or, on a booted phone: touch /var/tmp/run-gl-test) and reboot.
         'ProgramArguments': [
             '/bin/sh', '-c',
-            'sleep 55; export DYLD_LIBRARY_PATH=/usr/local/lib; '
+            'if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; '
+            'sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; '
             '/usr/local/bin/gl_test > /dev/hakios-usb 2>&1 || '
-            '/usr/local/bin/gl_test > /dev/console 2>&1',
+            '/usr/local/bin/gl_test > /dev/console 2>&1; fi',
         ],
         'RunAtLoad': True,
         'StandardOutPath': '/dev/console',

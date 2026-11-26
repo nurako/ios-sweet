@@ -821,6 +821,8 @@ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (
 /* boot-arg gpu_test_nomem=S (a test): from second S of the run on, 20 s of buffers refused as if there were no room */
 static TUNABLE(uint32_t, gGPUTestNoMem, "gpu_test_nomem", 0);
 extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
+/* hakios_gpu_adapter.c: whether a (phys, size) may be entered into the GPU's SMMU */
+extern "C" bool hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout);
 
 class HakiosGPUUserClient : public IOUserClient
 {
@@ -841,7 +843,8 @@ class HakiosGPUUserClient : public IOUserClient
 	void *                  fSpace;                 /* its own GPU address space; NULL (gpu_spaces=0): the shared one */
 
 	struct gpu_buffer * buffer(uint32_t handle);
-	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
+	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags,
+	    bool scanout, uint32_t * handle);
 	void freeBuffer(struct gpu_buffer * b);
 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 	void dropKept(struct gpu_kept * k);
@@ -1044,11 +1047,26 @@ HakiosGPUUserClient::buffer(uint32_t handle)
  * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
  */
 struct gpu_buffer *
-HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
+HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags,
+    bool scanout, uint32_t * handle)
 {
 	struct gpu_buffer * b = NULL;
 	bool mapped = true;
+	static uint32_t refused;
 
+	/*
+	 * The range asked for must be inside the descriptor before its physical
+	 * segments are asked for: a surface request names its own offsets, and a
+	 * descriptor's getPhysicalSegment() past its end is not a physical
+	 * address at all.
+	 */
+	if (memory == NULL || size == 0 || from > memory->getLength() || size > memory->getLength() - from) {
+		if (refused++ < 16) {
+			hakios_tl("HakiosGPU: buffer of %llu bytes from %llu in a descriptor of %llu: refused\n", size, from,
+			    memory != NULL ? (unsigned long long) memory->getLength() : 0ULL);
+		}
+		return NULL;
+	}
 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
 		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
 
@@ -1067,13 +1085,29 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	 * (11-19) Each physically contiguous run once, its 4 KB pages entered from it -- the segment was asked for again at
 	 * every 4 KB, with gGPULock held: buffers made in 1.8-3.2 ms each while Map started (census c26), the GPU's waits
 	 * taking the lock again up to ~3 ms late meanwhile.
+	 *
+	 * Every run is checked first (hakios_gpu_phys_ok): only kernel-managed
+	 * DRAM, or the framebuffer for a scan-out surface, may be entered into
+	 * the SMMU. A value in the GPU address window (0x20000000..0x1_00000000)
+	 * or in the reserved region below 0x80000000 -- 0x50304000 was one --
+	 * used to be entered, and the next IOKit cache flush of that "physical"
+	 * range called phystokv_range() and panicked the kernel. Refuse it here,
+	 * while it is still a request.
 	 */
 	for (uint64_t offset = 0; offset < size && mapped;) {
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 		uint64_t run = length >= 4096 ? MIN((uint64_t) length & ~4095ULL, size - offset) : 4096;
 
-		mapped = phys != 0;
+		if (phys == 0 || length == 0 || !hakios_gpu_phys_ok(phys, run, scanout)) {
+			if (refused++ < 16) {
+				hakios_tl("HakiosGPU: buffer of %llu bytes, %llu from its start: physical %#llx (%llu bytes) is "
+				    "not kernel memory%s; refused\n", size, offset, (uint64_t) phys, run,
+				    scanout ? " (nor the framebuffer)" : "");
+			}
+			mapped = false;
+			break;
+		}
 		for (uint64_t k = 0; k < run && mapped; k += 4096) {
 			mapped = hakios_gpu_map_in(fSpace, b->address + offset + k, phys + k, flags & MSM_BO_GPU_READONLY);
 		}
@@ -1251,7 +1285,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	}
 
 	IOLockLock(gGPULock);
-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+	b = newBuffer(memory, 0, size, request->flags, false, &request->handle);
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
@@ -1320,7 +1354,8 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 		if (b != NULL) {
 			MiniIOSurfaceDrop(s);
 		} else if ((memory = IOSubMemoryDescriptor::withSubRange(s->client, 0, s->info.allocSize,
-		    s->client->getDirection())) != NULL && (b = newBuffer(s->client, 0, wsize, wflags, &request->handle)) != NULL) {
+		    s->client->getDirection())) != NULL && (b = newBuffer(s->client, 0, wsize, wflags, false,
+		    &request->handle)) != NULL) {
 			b->memory = memory;
 			b->kernel = s->kpixels;
 			b->surface = s;
@@ -1396,7 +1431,7 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(pixels, from, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(pixels, from, size, 0, s->scanPhys != 0, &request->handle)) != NULL) {
 		b->memory = memory;
 		b->kernel = s->kpixels;
 		b->surface = s;

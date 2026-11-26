@@ -5529,10 +5529,10 @@ index 0000000..cafdc46
 +    sysctl_developer_mode_status, "I", "iOS's developer mode, as the kernel has it");
 diff --git a/bsd/dev/hakios_gpu_adapter.c b/bsd/dev/hakios_gpu_adapter.c
 new file mode 100644
-index 0000000..34e4799
+index 0000000..1779b43
 --- /dev/null
 +++ b/bsd/dev/hakios_gpu_adapter.c
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,439 @@
 +/*
 + * Adapter between xiongnemo/hakios-alioth's GPU stack and this tree.
 + *
@@ -5562,6 +5562,7 @@ index 0000000..34e4799
 +#include <pexpert/arm/protos.h>
 +#include <console/video_console.h>
 +#include <arm/machine_routines.h>
++#include <vm/pmap.h>
 +#include <kern/simple_lock.h>
 +#include <os/atomic_private.h>
 +#include <IOKit/IOInterrupts.h>
@@ -5704,6 +5705,34 @@ index 0000000..34e4799
 + * KERN_NO_SPACE (a panic on the way).
 + */
 +extern struct vc_info vinfo;
++
++/*
++ * Whether `phys` (for `size` bytes) may be handed to the GPU's SMMU: it must
++ * be kernel-managed DRAM (pmap_valid_address -- this kernel maps only the high
++ * bank, 0x1_00000000.., through phystokv/phystokv_range), or, for a scan-out
++ * buffer only, the boot framebuffer that the console already mapped.
++ *
++ * Anything else -- in particular the reserved region below 0x80000000 and the
++ * GPU address window (0x20000000..0x1_00000000, where 0x50304000 lives) -- is
++ * an address that phystokv_range() is required to panic on. A user client
++ * must never be able to make the kernel convert one, so buffers carrying such
++ * a value are refused while they are still only a request.
++ */
++extern boolean_t pmap_valid_address(uint64_t addr);
++bool
++hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout)
++{
++	uint64_t fb = vinfo.v_physaddr;
++	uint64_t fb_size = (uint64_t)vinfo.v_rowbytes * vinfo.v_height;
++
++	if (phys == 0 || size == 0 || phys + size < phys) {
++		return false;                   /* no address, or a range that wraps */
++	}
++	if (pmap_valid_address(phys) && pmap_valid_address(phys + size - 1)) {
++		return true;                    /* kernel-managed, and in the linear map */
++	}
++	return scanout && fb != 0 && fb_size != 0 && phys >= fb && phys + size <= fb + fb_size;
++}
 +
 +void
 +MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes)
@@ -6424,10 +6453,10 @@ index 0000000..35b00e6
 +#endif /* _IOKIT_MINIIOSURFACE_H */
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..d6905e0
+index 0000000..dd94ef5
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,1942 @@
+@@ -0,0 +1,1977 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -7251,6 +7280,8 @@ index 0000000..d6905e0
 +/* boot-arg gpu_test_nomem=S (a test): from second S of the run on, 20 s of buffers refused as if there were no room */
 +static TUNABLE(uint32_t, gGPUTestNoMem, "gpu_test_nomem", 0);
 +extern "C" void hakios_data_range(uint32_t *size_mb, uint32_t *used_mb, uint32_t *hole_mb);
++/* hakios_gpu_adapter.c: whether a (phys, size) may be entered into the GPU's SMMU */
++extern "C" bool hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout);
 +
 +class HakiosGPUUserClient : public IOUserClient
 +{
@@ -7271,7 +7302,8 @@ index 0000000..d6905e0
 +	void *                  fSpace;                 /* its own GPU address space; NULL (gpu_spaces=0): the shared one */
 +
 +	struct gpu_buffer * buffer(uint32_t handle);
-+	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags,
++	    bool scanout, uint32_t * handle);
 +	void freeBuffer(struct gpu_buffer * b);
 +	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
 +	void dropKept(struct gpu_kept * k);
@@ -7474,11 +7506,26 @@ index 0000000..d6905e0
 + * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
 + */
 +struct gpu_buffer *
-+HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
++HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags,
++    bool scanout, uint32_t * handle)
 +{
 +	struct gpu_buffer * b = NULL;
 +	bool mapped = true;
++	static uint32_t refused;
 +
++	/*
++	 * The range asked for must be inside the descriptor before its physical
++	 * segments are asked for: a surface request names its own offsets, and a
++	 * descriptor's getPhysicalSegment() past its end is not a physical
++	 * address at all.
++	 */
++	if (memory == NULL || size == 0 || from > memory->getLength() || size > memory->getLength() - from) {
++		if (refused++ < 16) {
++			hakios_tl("HakiosGPU: buffer of %llu bytes from %llu in a descriptor of %llu: refused\n", size, from,
++			    memory != NULL ? (unsigned long long) memory->getLength() : 0ULL);
++		}
++		return NULL;
++	}
 +	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
 +		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
 +
@@ -7497,13 +7544,29 @@ index 0000000..d6905e0
 +	 * (11-19) Each physically contiguous run once, its 4 KB pages entered from it -- the segment was asked for again at
 +	 * every 4 KB, with gGPULock held: buffers made in 1.8-3.2 ms each while Map started (census c26), the GPU's waits
 +	 * taking the lock again up to ~3 ms late meanwhile.
++	 *
++	 * Every run is checked first (hakios_gpu_phys_ok): only kernel-managed
++	 * DRAM, or the framebuffer for a scan-out surface, may be entered into
++	 * the SMMU. A value in the GPU address window (0x20000000..0x1_00000000)
++	 * or in the reserved region below 0x80000000 -- 0x50304000 was one --
++	 * used to be entered, and the next IOKit cache flush of that "physical"
++	 * range called phystokv_range() and panicked the kernel. Refuse it here,
++	 * while it is still a request.
 +	 */
 +	for (uint64_t offset = 0; offset < size && mapped;) {
 +		IOByteCount length = 0;
 +		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 +		uint64_t run = length >= 4096 ? MIN((uint64_t) length & ~4095ULL, size - offset) : 4096;
 +
-+		mapped = phys != 0;
++		if (phys == 0 || length == 0 || !hakios_gpu_phys_ok(phys, run, scanout)) {
++			if (refused++ < 16) {
++				hakios_tl("HakiosGPU: buffer of %llu bytes, %llu from its start: physical %#llx (%llu bytes) is "
++				    "not kernel memory%s; refused\n", size, offset, (uint64_t) phys, run,
++				    scanout ? " (nor the framebuffer)" : "");
++			}
++			mapped = false;
++			break;
++		}
 +		for (uint64_t k = 0; k < run && mapped; k += 4096) {
 +			mapped = hakios_gpu_map_in(fSpace, b->address + offset + k, phys + k, flags & MSM_BO_GPU_READONLY);
 +		}
@@ -7681,7 +7744,7 @@ index 0000000..d6905e0
 +	}
 +
 +	IOLockLock(gGPULock);
-+	b = newBuffer(memory, 0, size, request->flags, &request->handle);
++	b = newBuffer(memory, 0, size, request->flags, false, &request->handle);
 +	if (b != NULL) {
 +		b->memory = memory;
 +		b->kernel = (uint8_t *) memory->getBytesNoCopy();
@@ -7750,7 +7813,8 @@ index 0000000..d6905e0
 +		if (b != NULL) {
 +			MiniIOSurfaceDrop(s);
 +		} else if ((memory = IOSubMemoryDescriptor::withSubRange(s->client, 0, s->info.allocSize,
-+		    s->client->getDirection())) != NULL && (b = newBuffer(s->client, 0, wsize, wflags, &request->handle)) != NULL) {
++		    s->client->getDirection())) != NULL && (b = newBuffer(s->client, 0, wsize, wflags, false,
++		    &request->handle)) != NULL) {
 +			b->memory = memory;
 +			b->kernel = s->kpixels;
 +			b->surface = s;
@@ -7826,7 +7890,7 @@ index 0000000..d6905e0
 +	if (b != NULL) {
 +		memory->release();
 +		MiniIOSurfaceDrop(s);
-+	} else if ((b = newBuffer(pixels, from, size, 0, &request->handle)) != NULL) {
++	} else if ((b = newBuffer(pixels, from, size, 0, s->scanPhys != 0, &request->handle)) != NULL) {
 +		b->memory = memory;
 +		b->kernel = s->kpixels;
 +		b->surface = s;
@@ -8549,3 +8613,28 @@ index acc9ae0..c1eeefe 100644
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+diff --git a/osfmk/arm64/loose_ends.c b/osfmk/arm64/loose_ends.c
+index fcdc6d4..cca129c 100644
+--- a/osfmk/arm64/loose_ends.c
++++ b/osfmk/arm64/loose_ends.c
+@@ -716,11 +716,18 @@ copypv(addr64_t source, addr64_t sink, unsigned int size, int which)
+ 	kern_return_t res = bcopy_phys_internal(source, sink, size, which);
+ 
+ #ifndef __ARM_COHERENT_IO__
+-	if (which & cppvFsrc) {
++	/*
++	 * Only a physical address the kernel can convert may be flushed as one:
++	 * flush_dcache64(phys) with a bad PA reaches phystokv_range(), which panics
++	 * (arm_vm_init.c: "illegal PA"). bcopy_phys_internal() above already coped
++	 * with a non-managed address through the copy window; there is no cache
++	 * line to push for device memory, so leave it alone.
++	 */
++	if ((which & cppvFsrc) && (!(which & cppvPsrc) || pmap_valid_address(source))) {
+ 		flush_dcache64(source, size, ((which & cppvPsrc) == cppvPsrc));
+ 	}
+ 
+-	if (which & cppvFsnk) {
++	if ((which & cppvFsnk) && (!(which & cppvPsnk) || pmap_valid_address(sink))) {
+ 		flush_dcache64(sink, size, ((which & cppvPsnk) == cppvPsnk));
+ 	}
+ #endif

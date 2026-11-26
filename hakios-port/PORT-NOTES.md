@@ -482,3 +482,80 @@ HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient
 ```
 Bands on screen; iOS interactive afterwards. Next: a user client that allocates a surface and
 submits (needs the userland DRM/Mesa layer).
+
+## 2026-11-26: gl_test panic — illegal PA 0x50304000 and the opt-in test job
+
+The first Mesa userland client (`gl_test`, pid 67, started by launchd) panicked:
+
+```
+panic(cpu 6 caller 0xfffffe0007b0ce7c): phystokv_range: illegal PA 0x50304000;
+      phys base 0x100000000, size 0x13ff00000 (arm_vm_init.c:406)
+```
+
+The caller resolves in the CI kernel artifact of run `45778296613`
+(`kernel.development.sweet`, `__TEXT` at `0xfffffe0007004000`) to
+`phystokv_range.cold.1+0x44` — the `panic()` at `osfmk/arm64/arm_vm_init.c:406`.
+The path to it is `copypv()` → `flush_dcache64(addr, size, phys=TRUE)` (the
+`cppvFsnk`/`cppvFsrc` flush), which calls `flush_dcache()` with no `pa_valid()`
+guard; `flush_dcache()` then asks `phystokv_range()` for the linear mapping of a
+physical address and panics when there is none. `IOMemoryDescriptor::readBytes/
+writeBytes` reach `copypv()` with the result of `getPhysicalSegment()`.
+
+**Why 0x50304000 is not a physical address.** It is below both the low DRAM
+window (`0x80000000..0xbf000000`) and the high bank (`0x1_00000000..`), so
+`pmap_valid_address()` is false for it. It is, however, exactly inside the GPU
+address window (`hakios.adreno.c`: `GPU_ADDRESSES_START 0x20000000`,
+`GPU_ADDRESSES_SIZE 0xe0000000`, allocations rounded to 64 KiB) and 0x50304000
+is 64 KiB-aligned. The other candidates are ruled out by evidence:
+
+* (a) SweetSurface physical memory: `sweet_surface_create_physical()` is called
+  with `video.v_baseAddr`; the boot log says `phys 0x9c000000`, not 0x50304000,
+  and 0x50304000 is not any panel/carveout address in our ADT.
+* (c) SweetSurface kernel base: `kernelAddress()` returns a kernel VA
+  (`0xfffffe...`) or an `IOBufferMemoryDescriptor` VA, never a 32-bit PA; the
+  seed page is likewise a kernel VA.
+* (b) an IOVA mistaken for a PA is the only value consistent with both the
+  window and the alignment. `newBuffer()` used to pass every
+  `getPhysicalSegment()` result straight into `hakios_gpu_map_in()` and into
+  the descriptor the client later maps/copies; the validation was only on the
+  segment being non-zero.
+
+**Fix.** `hakios_gpu_phys_ok(phys, size, scanout)` (adapter) accepts only
+kernel-managed DRAM (`pmap_valid_address()` at both ends) or, for a scan-out
+buffer only, the boot framebuffer range from `vinfo`. `newBuffer()` now checks
+the requested `from/size` against `memory->getLength()` and validates **every**
+run before entering any page into the SMMU; a refusal is logged and the
+request gets `kIOReturnNoMemory`, never a panic. As a second, kernel-wide
+guard, `copypv()` only flushes a physical source/sink when
+`pmap_valid_address()` says it can be converted; device memory is not flushed
+through `flush_dcache64(phys)`. Both are in `xnu/patches/0200-hakios-gpu.patch`
+(which still does not touch `bsd/dev/sweet_gpu.c`; 0300 still applies after it).
+
+**The test job is now opt-in.** `tools/add-launchd-jobs.py` and
+`tools/daemons/com.hakios.gltest.plist` run `gl_test` only if
+`/var/tmp/run-gl-test` exists; the job removes the sentinel *before* starting
+the client, so a panic cannot repeat on the next boot. Run it deliberately:
+
+```
+# on a mounted root image
+touch <mounted-root>/var/tmp/run-gl-test
+# or on a booted phone before rebooting
+touch /var/tmp/run-gl-test
+```
+
+The job then sleeps 5 s (USB gadget) and runs with
+`DYLD_LIBRARY_PATH=/usr/local/lib`, output to `/dev/hakios-usb` with a fallback
+to `/dev/console`. No sentinel = no gl_test on a normal boot.
+
+**Verification.** `tools/xnu-cc.py` against CI run `45778296613` (`/tmp/ci-fix.log`)
+compiles `hakios_gpu_adapter.c`, `hakios.gpu.cpp` and `osfmk/arm64/loose_ends.c`
+with 0 failures. Regenerated `0200` applies to blacktop `6639065` + `0001..0118`;
+`0300` applies cleanly after it.
+
+**Still uncertain.** The panic string alone cannot name the descriptor that
+carried 0x50304000: gl_test's OSMesa path uses only GEM + `kHakiosShow`
+(userland notes §1.2), and the exact user call that first produced the value
+was not captured (no `HakiosGPU` buffer/surface refusal line appeared before
+the panic). The new checks make either the GEM or the surface route refuse that
+value; if a later boot logs `physical ... is not kernel memory; refused`, that
+line names the route and is the next thing to read.

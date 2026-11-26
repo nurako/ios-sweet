@@ -55,8 +55,10 @@ for f in gl_test usbmux usbsh; do
 done
 
 echo "== launchd jobs"
-# usbmux gives the USB shell; gl_test runs once at boot and prints to the
-# console so a GPU submission can be seen in the kernel log / USB console.
+# usbmux gives the USB shell; gl_test is opt-in (touch /var/tmp/run-gl-test)
+# because a broken GPU client panics the kernel on every boot otherwise.
+# When deliberately enabled it prints to the console so a GPU submission can
+# be seen in the kernel log / USB console, and removes its sentinel first.
 jobs=$repo/tools/daemons
 if [ -d "$mnt/System/Library/LaunchDaemons" ] && [ -d "$jobs" ]; then
 	for j in com.hakios.usbmux.plist com.hakios.gltest.plist; do
