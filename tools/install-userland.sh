@@ -72,6 +72,9 @@ if [ -d "$mnt/System/Library/LaunchDaemons" ] && [ -d "$jobs" ]; then
 			install_name_tool -id /usr/local/lib/$(basename "$f") "$f" 2>/dev/null || true
 		done
 	fi
+	# The directory alone is not enough: launchd reads the job list from
+	# /System/Library/xpc/launchd.plist on this root.
+	python3 "$repo/tools/add-launchd-jobs.py" "$mnt"
 else
 	echo "  (no LaunchDaemons directory or no tools/daemons: skipped)"
 fi
