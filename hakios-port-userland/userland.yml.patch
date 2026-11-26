@@ -1,0 +1,26 @@
+--- a/.github/workflows/userland.yml
++++ b/.github/workflows/userland.yml
+@@ -70,6 +70,23 @@
+           mkdir -p "$GITHUB_WORKSPACE/artifacts"
+           cp out/usbsh out/usbmux "$GITHUB_WORKSPACE/artifacts/"
+ 
++      - name: Mesa build dependencies
++        run: brew install meson ninja bison flex
++
++      - name: Build Mesa (freedreno) + DRM client + gl_test
++        # Additive: this only adds files to artifacts/.  The usbsh/usbmux job
++        # above is unchanged.  build-mesa.sh pins Mesa 25.0.7 and the eight
++        # patches in hakios-port-userland/mesa/patches/.
++        run: |
++          set -o pipefail
++          CLANG_BIN=$(xcrun --find clang)
++          IOS_SDK="$IOS_SDK" CLANG="$CLANG_BIN" hakios-port-userland/build-userland-gpu.sh
++          mkdir -p "$GITHUB_WORKSPACE/artifacts"
++          cp hakios-port-userland/out/gl_test \
++             hakios-port-userland/out/libOSMesa.8.dylib \
++             hakios-port-userland/out/exported-gl.txt \
++             "$GITHUB_WORKSPACE/artifacts/"
++
+       - name: Build sweet-autorun when this branch has it
+         run: |
+           # sweet-autorun lives on hakios-autorun (and branches that merged it).
