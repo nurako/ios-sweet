@@ -15,9 +15,13 @@ set -eu
 
 art=${1:?usage: sudo tools/install-userland.sh <artifact-dir>}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-img=${IMG:-$repo/ios-root/ios16-root-alioth.img}
-simg=${SIMG:-$repo/ios-root/ios16-root-alioth.simg}
-mnt=${MNT:-$repo/ios-root/mnt}
+# the image lives in ios-root/ of the workspace, which is either the repo root
+# or the directory above it (this repo is ios-sweet/ inside the workspace)
+root=$repo
+[ -f "$root/ios-root/ios16-root-alioth.img" ] || root=$(cd "$repo/.." && pwd)
+img=${IMG:-$root/ios-root/ios16-root-alioth.img}
+simg=${SIMG:-$root/ios-root/ios16-root-alioth.simg}
+mnt=${MNT:-$root/ios-root/mnt}
 
 [ "$(id -u)" = 0 ] || { echo "run me with sudo" >&2; exit 1; }
 [ -f "$img" ] || { echo "no image at $img" >&2; exit 1; }
