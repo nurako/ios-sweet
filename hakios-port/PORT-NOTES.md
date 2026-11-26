@@ -352,3 +352,17 @@ the core powered, which is what our own probe could not make work).
 Remaining to see it on the panel: `MiniIOMobileFramebufferShow()` is still an
 adapter log line; it must copy 1080x2400 rows (4352 bytes pitch) into the
 AppleCLCD framebuffer.
+
+## 2026-11-25/26: the GPU's picture is on the panel (Image HK2 `75abf042...`)
+
+CI run 45676272787 on `hakios-gpu` (panel bridge + GIC SPI 332). Boot cmdline
+`adreno=22 gpu_irq=0`, `sweetgpu=0`, `board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000`.
+
+```
+HAKIOS GPU: panel copy 1080x2400 row 4352 -> 1080x2400 row 4320 via the console
+            framebuffer mapping (vinfo 0xfffffe000b0b0000, phys 0x9c000000)
+adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top
+adreno: step 22: done
+```
+and the phone showed the three bands (orange / white / blue). The Adreno 650 draws
+on the panel from our kernel.
