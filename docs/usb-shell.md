@@ -14,6 +14,35 @@ Both need `usbhakios=1` (the master switch in `sweet_ufs.c`) and the shim's
 SMR0 write (`shim/loader.c`: `SMR0 = 0x80000000`), which is what makes the
 apps SMMU translate stream 0 for DWC3 DMA.
 
+### One owner, chosen before either program opens the port
+
+The two jobs can be installed together, but they must never race for
+`/dev/hakios-usb` (only one opener is allowed, and the loser would exit and
+leave the port silent for the whole boot). Each program reads `usb=` from
+`kern.bootargs` **before** opening anything:
+
+| boot arg | owner of `/dev/hakios-usb` | the other job |
+| --- | --- | --- |
+| `usb=2` | `usbsh` (kernel log first, then shell) | `usbmux` prints `usb=2, not usb=3` and exits 0 without opening |
+| `usb=3` | `usbmux` (iPhone/usbmux device side) | `usbsh` prints `usb=3, not usb=2` and exits 0 without opening |
+| anything else | nobody | both exit 0 |
+
+`usbsh` waits for the kernel's CDC-ACM bring-up: it retries `open()` once a
+second while the answer is `ENXIO`/`EBUSY`/`ENOENT` and logs every 30 s. The
+kernel prints these boot-log transitions, so a silent host link has a trace:
+
+```
+usb: owner thread started (level 2): /dev/hakios-usb is there
+usb: THE CONTROLLER IS THE KERNEL'S: a serial port ...
+usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now ...
+usb: a program (pid N) has the port (/dev/hakios-usb), level 2: ...
+```
+
+If the kernel cannot start the controller the thread says so; if another
+program already holds the port, the open prints `another program already has
+the port`. `usbsh` also prints `USBSH: ...` state lines to `/dev/console`
+(and so to the persistent ring); its shell I/O stays on the USB port.
+
 ## 1. `usb=2`: the serial shell
 
 The port carries the kernel log until the computer sends its first byte. After
@@ -55,10 +84,37 @@ tools/sweet-usbsh.sh -g /var/tmp/usbmux.log usbmux.log
 tools/sweet-usbsh.sh -g /etc/hosts -
 ```
 
-`tools/sweet-usbsh.sh` uses `stty raw`, sends a bare newline to take the port,
+`tools/sweet-usbsh.sh` uses `stty raw`, sends a bare `\r` to take the port,
 waits for the `ios:<cwd># ` prompt, and drops the echoed command + prompt from
 one-shot output. Options: `-d DEV`, `-b BAUD`, `-t SEC`, `-l` (keep the
 handshake log), `-g REMOTE [LOCAL]`.
+
+Exact host-side sequence (the order matters; DTR/RTS are not required by this
+gadget, but asserting them is harmless and matches a normal terminal):
+
+```sh
+# 1. boot: ... usbhakios=1 usb=2   and wait for this line in the boot log:
+#    usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now
+# 2. host sees 1209:316d "HakiOS K40" -> /dev/ttyACM0
+stty -F /dev/ttyACM0 115200 raw -echo -echoe -echok -crtscts clocal
+# 3. open, raise DTR/RTS (optional), then send ONE bare CR (not CRLF) to
+#    take the port; wait for:  --- usbsh: the log is paused ... ---  then  ios:/#
+# 4. send the command and a CR:  uname -a\r   wait for the next ios:/# prompt
+# 5. "log\r" gives the port back to the kernel log; the next byte returns
+tools/sweet-usbsh.sh 'uname -a'          # does 2-4 and prints only the answer
+```
+
+Do not send `\r\n` for the takeover: the shell treats the CR as the line end
+and the LF as an empty second line, which makes the prompt accounting off by
+one (the old script comment in this file is why it sends a bare CR).
+
+### `gl_test` markers
+
+The gl_test launchd job runs only when `/var/tmp/run-gl-test` exists. It now
+prints `GLTEST: start` before the 5 s delay and `GLTEST: exit N` after the
+client returns, so a screen photo or a `sweetlogdump` shows whether the client
+started at all. A panic after the start line and before the exit line is the
+client itself.
 
 ## 2. `usb=3`: the iPhone mux
 
@@ -117,8 +173,9 @@ IOS_SDK=~/theos/sdks/iPhoneOS16.5.sdk ./build.sh
 
 `install-root.sh` defaults to `/usr/local/bin` and `/System/Library/LaunchDaemons`
 (our root has no `/redwood` ramdisk); it rewrites the reference plists'
-`/redwood/bin` paths. Both jobs can be installed together — the one whose
-`usb=` argument is absent exits at once.
+`/redwood/bin` paths. Both jobs can be installed together: the job that does
+not own the port for this boot exits before opening it (see the ownership
+table above), so installing both is safe and is what the image does.
 
 Entitlements: none are required by the sources and miniamfi here does not
 enforce them. If a stricter AMFI path is ever used, `usbmux`'s

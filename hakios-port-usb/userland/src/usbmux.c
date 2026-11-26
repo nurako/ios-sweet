@@ -36,6 +36,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -512,12 +513,34 @@ udid(char *out, size_t size)
 	return ok ? 0 : -1;
 }
 
+/* The usb=N value from kern.bootargs, or -1. */
+static int
+usb_level(void)
+{
+	char args[1024] = "";
+	size_t len = sizeof(args) - 1;
+	const char *p;
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return -1;
+	}
+	args[len] = 0;
+	for (p = args; (p = strstr(p, "usb=")) != NULL; p += 4) {
+		if ((p == args || p[-1] == ' ') && p[4] >= '0' && p[4] <= '9') {
+			return atoi(p + 4);
+		}
+	}
+	return -1;
+}
+
 int
 main(int argc, char **argv)
 {
 	static uint8_t in[256 * 1024];
 	size_t used = 0;
 	struct hakios_usb_iphone ask;
+	int level;
+	unsigned tries = 0;
 
 	(void)argc;
 	(void)argv;
@@ -526,10 +549,32 @@ main(int argc, char **argv)
 	for (int i = 0; i < CONNS; i++) {
 		conns[i].fd = -1;
 	}
-	port = open("/dev/hakios-usb", O_RDWR);
-	if (port < 0) {
-		say("no /dev/hakios-usb (%s): the kernel has not got the controller (usb=3)", strerror(errno));
+	level = usb_level();
+	if (level != 3) {
+		/*
+		 * One owner per boot: usb=3 is this iPhone mux; usb=2 is the
+		 * CDC-ACM shell and belongs to usbsh. Opening the port here on
+		 * usb=2 made usbsh fail with EBUSY and exit, and the CDC port then
+		 * stayed silent for the whole boot.
+		 */
+		say("usb=%d, not usb=3: not opening /dev/hakios-usb (%s)",
+		    level, level == 2 ? "usbsh owns it" : "no owner on this boot");
 		return 0;
+	}
+	for (;;) {
+		port = open("/dev/hakios-usb", O_RDWR);
+		if (port >= 0) {
+			break;
+		}
+		if (errno != ENXIO && errno != EBUSY && errno != ENOENT) {
+			say("open /dev/hakios-usb: %s", strerror(errno));
+			return 1;
+		}
+		if (tries == 0 || tries % 30 == 29) {
+			say("/dev/hakios-usb not ready (%s), still waiting (%u s)", strerror(errno), tries + 1);
+		}
+		tries++;
+		sleep(1);
 	}
 	memset(&ask, 0, sizeof(ask));
 	if (udid(ask.serial, sizeof(ask.serial)) != 0) {

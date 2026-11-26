@@ -6,13 +6,10 @@
 	<string>com.hakios.gltest</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/gl_test</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; echo "GLTEST: start"; sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; /usr/local/bin/gl_test 2&gt;&amp;1; rc=$?; echo "GLTEST: exit $rc"; exit $rc; fi</string>
 	</array>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>DYLD_LIBRARY_PATH</key>
-		<string>/usr/local/lib</string>
-	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>

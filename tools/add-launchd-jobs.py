@@ -43,8 +43,10 @@ JOBS = {
         'ProgramArguments': [
             '/bin/sh', '-c',
             'if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; '
-            'sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; '
-            '/usr/local/bin/gl_test 2>&1; fi',
+            'echo "GLTEST: start"; sleep 5; '
+            'export DYLD_LIBRARY_PATH=/usr/local/lib; '
+            '/usr/local/bin/gl_test 2>&1; rc=$?; '
+            'echo "GLTEST: exit $rc"; exit $rc; fi',
         ],
         'RunAtLoad': True,
         'StandardOutPath': '/dev/console',
