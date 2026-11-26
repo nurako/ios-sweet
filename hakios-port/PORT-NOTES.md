@@ -328,6 +328,106 @@ hakios-port/ORIGIN.md                  provenance + licenses
 hakios-port/PORT-NOTES.md              this file
 ```
 
+## 10. Phase 2: HakiosGPU service and SweetSurface adaptation (2026-11-26)
+
+### Decision: adapt MiniIOSurface to SweetSurface, do not replace it
+
+The reference's `MiniIOSurface.cpp` defines a second `IOSurfaceRootUserClient`
+with the same C++ names as `SweetSurface.cpp`; building both is a link error,
+and replacing SweetSurface would put the working SpringBoard/AppleCLCD CPU path
+at risk. The adapter therefore keeps the header and implements only the calls
+`hakios.gpu.cpp` uses (`MiniIOSurfaceCopy`, `MiniIOSurfaceDrop`,
+`MiniIOSurfaceCreateSimple`, `MiniIOSurfaceMakeSendRight`) as a wrapper around
+the existing `SweetSurface`:
+
+* `MiniIOSurfaceCopy(id)` -> `sweet_surface_copy(id)`, fills `client` (the
+  SweetSurface pixels descriptor), `kpixels` (its kernel VA), `kbase` (the
+  SweetSurface state page, so `shared()->seed` is the same seed the IOSurface
+  lock path moves), geometry and `info.allocSize`.
+* buffer-backed surfaces present `clientAddress = 0`, `scanPhys = 0`; the
+  service's wrap path (`gpu_wrap`, now **default 1**) makes an
+  `IOSubMemoryDescriptor` from byte 0 and enters it into the GPU SMMU.
+* the physical panel surface (no `IOBufferMemoryDescriptor`) is marked with
+  `scanPhys != 0`, so `surfaceBuffer()` maps its physical memory from byte 0.
+* `MiniIOSurfaceDrop` releases the SweetSurface with the wrapper.
+
+The `MiniIOSurface` object is a normal `MiniIOSurface` with one extra
+`void *sweet_surface` field; no reference `MiniIOSurface.cpp` is built.
+
+### Service and user client
+
+`HakiosGPUStart()` is called only by the keep path (`adreno_keep=1`) and still
+publishes class `HakiosGPU` with `kIOUserClientClassKey =
+"HakiosGPUUserClient"`. Because `hakios_adreno_init()` runs inside
+`sweet_ufs_init()` before `IOKitBSDInit()` has started the platform expert, a
+first call with no `IOService::getPlatform()` now defers itself with a
+`thread_call` retry (100 ms) instead of dropping the service. Once the
+platform is up it publishes and logs. A client opens it with type 0; the
+factory base `IOService::newUserClient` reads the user-client class property.
+
+`kMsmGemNew` continues to allocate its own GPU buffers; `clientMemoryForType`
+returns that buffer's `IOMemoryDescriptor` for mapping; `surfaceBuffer` wraps a
+SweetSurface as above. Surface creation itself stays with the existing
+IOSurface framework/SweetSurface user client, so SpringBoard's CPU rendering
+is unchanged.
+
+### Interrupts
+
+No new submit code was needed: `hakios_gpu_submit()` already emits
+`CP_EVENT_WRITE(EVENT_CACHE_FLUSH | CP_EVENT_IRQ)` when `gpu_irq=1`, and
+`gpu_irq=0` leaves `gpu_irq_wanted` zero, so the service polls. The adapter's
+SPI 332 handler is the one that wakes the fence waits.
+
+### Boot cmdlines for the next evaluation
+
+Service + interrupt (`adreno_keep=1` is what starts HakiosGPU and `gpu_irq=1`
+what attaches SPI 332):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 sweetgpu=0 \
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
+adreno=22 adreno_keep=1 adreno_pause=0 gpu_irq=1
+```
+
+Plain/panel boot (no service, no IRQ; proves the normal path is unchanged):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 \
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 sweetgpu=0 \
+board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
+adreno=22 adreno_keep=0 adreno_pause=0 adreno_watch=30 gpu_irq=0
+```
+
+Proof lines in the service/IRQ boot:
+
+* `HakiosGPU: IOKit platform not up yet; service start deferred` (expected once)
+* `HakiosGPU: IOServiceMatching("HakiosGPU") will find this service; open it with type 0`
+* `HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient`
+* `HAKIOS GPU: GIC SPI 332 level attached, ...` and
+  `adreno: THE 3D CORE'S INTERRUPT (GIC 332, level) ...`
+* after a client asks for a surface:
+  `HakiosGPU: surface N wrapped as MiniIOSurface: WxH fmt 0x... bpr ... size ...`
+  and, with `gpu_wrap=1`, no `surface N wraps a program's memory` refusal.
+
+A plain boot must show no `HakiosGPU`/`GIC SPI` lines at all.
+
+### What userland still needs
+
+* the reference's `tools/mesa/hakios-drm` equivalent (Mesa freedreno's
+  `msm` ioctl transport: `kMsmGetParam`, `GemNew`, `GemInfo`, `GemCpuPrep`,
+  `Submit`, `WaitFence`, `SubmitQueue*`, `surfaceBuffer`), built for iOS;
+* Mesa's freedreno/iRP (or their prebuilt) plus `libhakios.metal`/`eagl.c`
+  for Metal and OpenGL ES; neither is in this branch;
+* a client submission that names a SweetSurface (then the new wrapper path
+  and the interrupt fence should be visible). Until then Metal/IOAccelerator
+  is not claimed: the kernel service and surface bridge exist, the userland
+  DRM emulation does not.
+
 ## 2026-11-25: first evaluation boot (Image HK1 `b0e2d767...`)
 
 Kernel from CI run 45670566657 on branch `hakios-gpu`; ADT regenerated with
