@@ -13,6 +13,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach_time.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,41 @@ struct show {
 	uint64_t pixels;
 	uint32_t width, height, row_bytes, pad;
 };
+
+/*
+ * Every step says itself before it can block, written straight out (no stdio buffer), and a watchdog
+ * ends the program if one takes longer than GL_TEST_TIMEOUT seconds: a hung client must leave a line
+ * saying which call it was in, not an empty console. The launchd job's "GLTEST: start"/"GLTEST: exit"
+ * lines bracket these.
+ */
+#define GL_TEST_TIMEOUT 20
+
+static volatile sig_atomic_t gStep;
+
+static void
+step(const char *what)
+{
+	gStep++;
+	printf("gl_test: step %d: %s\n", (int)gStep, what);
+	fflush(stdout);
+}
+
+static void
+on_alarm(int signal)
+{
+	static const char lead[] = "gl_test: WATCHDOG: no progress at step ";
+	char digit = (char)('0' + ((int)gStep % 10));
+	static const char tail[] = " (see the previous gl_test: step line)\n";
+
+	(void)signal;
+	(void)write(STDOUT_FILENO, lead, sizeof(lead) - 1);
+	(void)write(STDOUT_FILENO, &digit, 1);
+	(void)write(STDOUT_FILENO, tail, sizeof(tail) - 1);
+	(void)write(STDERR_FILENO, lead, sizeof(lead) - 1);
+	(void)write(STDERR_FILENO, &digit, 1);
+	(void)write(STDERR_FILENO, tail, sizeof(tail) - 1);
+	_exit(124);
+}
 
 static uint64_t
 now_us(void)
@@ -267,24 +303,42 @@ main(int argc, char **argv)
 	OSMesaContext context;
 	int good = 0;
 
+	/* Nothing is buffered and nothing can hang: a line and an alarm from the first instruction. */
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+	signal(SIGALRM, on_alarm);
+	alarm(GL_TEST_TIMEOUT);
+	step("start (unbuffered; watchdog 20 s); opening the GPU service and making the DRM screen");
+
 	context = OSMesaCreateContextAttribs(attributes, NULL);
-	if (context == NULL || !OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
+	if (context == NULL) {
 		printf("gl_test: no OpenGL ES context\n");
 		return 1;
 	}
+	step("OSMesaCreateContextAttribs returned (this is where the DRM screen is made)");
+	if (!OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
+		printf("gl_test: the OpenGL ES context cannot be made current\n");
+		return 1;
+	}
+	step("OSMesaMakeCurrent returned");
 	printf("gl_test: %s; %s; %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_VERSION));
+	fflush(stdout);
+	step("glGetString returned (a non-softpipe renderer means freedreno is talking to HakiosGPU)");
 	if (argc > 1 && strcmp(argv[1], "fill") == 0) {
+		alarm(GL_TEST_TIMEOUT * 3);     /* many frames, each still bounded */
 		fill(argc > 3 ? atoi(argv[2]) : 1125, argc > 3 ? atoi(argv[3]) : 2436);
 		return 0;
 	}
 
 	began = now_ms();
+	step("creating the colour texture (MSM_GEM_NEW 0x42, then mapping it)");
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	step("texture allocated; creating the framebuffer");
 	glGenFramebuffers(1, &framebuffer);
 	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
@@ -292,6 +346,7 @@ main(int argc, char **argv)
 		printf("gl_test: the framebuffer is not complete\n");
 		return 1;
 	}
+	step("framebuffer complete; building the shaders");
 	program = glCreateProgram();
 	glAttachShader(program, shader(GL_VERTEX_SHADER,
 	    "attribute vec2 where; attribute vec3 colour; varying vec3 c;\n"
@@ -315,18 +370,23 @@ main(int argc, char **argv)
 	glVertexAttribPointer(1, 3, GL_FLOAT, 0, 5 * sizeof(float), corners + 2);
 	glEnableVertexAttribArray(0);
 	glEnableVertexAttribArray(1);
+	step("drawing the triangle and waiting (MSM_GEM_SUBMIT 0x46, then CPU_PREP/WAIT_FENCE)");
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glFinish();
 	drew = now_ms();
+	step("glFinish returned");
 
 	drawn = malloc((size_t)width * (size_t)height * 4);
 	shown = malloc((size_t)width * (size_t)height * 4);
 	if (drawn == NULL || shown == NULL) {
+		printf("gl_test: no memory to read the picture back into\n");
 		return 1;
 	}
 	memset(drawn, 0x55, (size_t)width * (size_t)height * 4);
+	step("reading the picture back (glReadPixels: another submit and fence wait)");
 	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, drawn);
 	read = now_ms();
+	step("glReadPixels returned");
 	/* the panel's rows go down and its pixels are blue first */
 	for (int y = 0; y < height; y++) {
 		const uint8_t *from = drawn + (size_t)(height - 1 - y) * (size_t)width * 4;
@@ -349,6 +409,8 @@ main(int argc, char **argv)
 	    PIXEL(width * 85 / 100, height * 22 / 100), PIXEL(width / 2, height * 80 / 100), coloured,
 	    (unsigned)(width * height), (unsigned)((uint64_t)coloured * 100 / (uint64_t)(width * height)));
 
+	step("opening the GPU service again to put the picture on the panel (kHakiosShow 0x7f)");
+	alarm(GL_TEST_TIMEOUT);
 	service = IOServiceGetMatchingService(0, IOServiceMatching("HakiosGPU"));
 	if (service == 0 || IOServiceOpen(service, mach_task_self(), 0, &connection) != 0) {
 		printf("gl_test: no GPU service in this kernel to put the picture on the panel with\n");
@@ -359,9 +421,12 @@ main(int argc, char **argv)
 		kern_return_t result = IOConnectCallStructMethod(connection, 0x7f, &show, sizeof(show), NULL, NULL);
 
 		if (i == 0) {
+			step(result == 0 ? "the picture is on the panel" : "the panel copy was refused");
 			printf("gl_test: the picture is on the panel (%#x), for %d seconds\n", result, seconds);
+			fflush(stdout);
 		}
 		usleep(200000);
 	}
+	step("done");
 	return 0;
 }

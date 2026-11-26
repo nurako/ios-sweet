@@ -1,4 +1,24 @@
 
+## 2026-11-26 (gpu2): Mesa client path traced and bounded
+
+Branch `hakios-gpu2` (from `hakios-integrate`). The userland `gl_test` client is
+now observable and cannot hang silently:
+
+- `gl_test` is unbuffered, prints `gl_test: step N: ...` before each phase, and
+  has a 20 s `SIGALRM` watchdog that prints the step and exits 124.
+- new boot arg `adreno_loud=1` (default off): one kernel line per user-client
+  request with selector/key parameters/result, plus every fence wait and the
+  `CP_EVENT_IRQ`/`CP_CACHE_FLUSH_TS` wake path.
+- client waits (`0x44`, `0x47`) are capped at 2 s; `0x44` now waits on the named
+  buffer's fence, not the newest submission of any client; SMMU entry of one
+  buffer has a 250 ms budget. Existing waits were already bounded.
+- `0200-hakios-gpu.patch` regenerated: applies after `0119`, `0300` applies
+  after it, and it does not touch `bsd/dev/sweet_gpu.c`.
+- Details, expected lines and the ring-dump command: `hakios-port-gpu2/PORT-NOTES.md`.
+
+Not yet done: boot with `adreno_loud=1`, run the opt-in launchd job, and read
+the step where the first real fault is. No device work from this branch.
+
 ## 2026-11-26 (night) - one image with everything that works
 
 `hakios-integrate` + image HKN (`a43ed26f15b8`): Adreno 650 drawing on the panel

@@ -3454,6 +3454,7 @@ extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_detach(uint32_t intid);
 
 static uint32_t gpu_irq_wanted;                 /* boot-arg gpu_irq=1 (read when the GPU is kept) */
+static uint32_t adreno_loud;                    /* boot-arg adreno_loud=1: the client fence path, one line per completion */
 static volatile bool gpu_irq_live;              /* attached, the core powered and running: the handler may read RBBM */
 static bool gpu_irq_attached, gpu_irq_given_up;
 static uint32_t gpu_irq_still;                  /* handlers in a row that found the bit set again after the clear */
@@ -3580,6 +3581,10 @@ hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held)
 	result = thread_block(THREAD_CONTINUE_NULL);
 	uint64_t ran = mach_absolute_time();
 	lck_mtx_lock(held);
+	if (adreno_loud) {
+		printf("adreno: loud: fence %u: %s\n", fence,
+		    result == THREAD_AWAKENED ? "the 3D core's interrupt woke the wait" : "the wait's deadline came first");
+	}
 	if (result != THREAD_AWAKENED) {
 		/* (11-19, census c24: the looks after a timed-out sleep came 1.1-3.4 ms after the deadline) where that goes:
 		 * back on a core, then the lock -- counted under it */
@@ -4735,6 +4740,10 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	if (adreno_loud) {
+		printf("adreno: loud: submission %u queued: %u command buffers, completion interrupt %s\n", gpu_fence, count,
+		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)");
+	}
 	return gpu_fence;
 }
 
@@ -5320,6 +5329,7 @@ hakios_adreno_init(void)
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+			PE_parse_boot_argn("adreno_loud", &adreno_loud, sizeof(adreno_loud));
 			PE_parse_boot_argn("gpu_irq", &gpu_irq_wanted, sizeof(gpu_irq_wanted));
 			gpu_kept = true;
 			gpu_irq_on();                   /* (11-19: boot-arg gpu_irq=1) */

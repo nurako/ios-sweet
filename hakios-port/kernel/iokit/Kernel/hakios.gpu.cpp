@@ -196,10 +196,16 @@ struct hakios_show {
 #define GPU_SUBMIT_CMDS         128
 #define GPU_SUBMIT_BOS          8192
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+#define GPU_CLIENT_PATIENCE_MS  2000            /* boot-arg adreno_loud=1 or not: a client-triggered wait never outlasts this */
+#define GPU_MAP_BUDGET_MS       250             /* how long one buffer may take to enter into the GPU's address space */
 #define GPU_ASK_AGAIN_US        50              /* while waiting for the core: how long between two looks at how far it is
 	                                                 * (200 put idle frames on two peaks 220 us apart: 0.1 ms on average
 	                                                 * of every frame's way to the flip, work/research/gpu-120hz.md) */
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+
+/* boot-arg adreno_loud=1: one line per user-client request and per fence wait/completion (the userland bring-up) */
+static TUNABLE(uint32_t, gGPULoud, "adreno_loud", 0);
+#define GPU_LOUD(...) do { if (gGPULoud) { IOLog(__VA_ARGS__); } } while (0)
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
@@ -341,14 +347,23 @@ static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
 {
 	uint64_t began = mach_absolute_time(), patience;
+	uint64_t loudBegan = gGPULoud ? began : 0;
 	bool soon = false;                      /* (11-19) the next sleep a short one: woken, and the fence not there yet */
 
+	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms\n", fence, milliseconds);
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		if (hakios_gpu_done(fence)) {
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
+			}
+			if (gGPULoud) {
+				uint64_t ns;
+
+				absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
+				IOLog("HakiosGPU: loud: fence %u DONE after %llu us (waited %s)\n", fence, ns / NSEC_PER_USEC,
+				    waited ? "yes" : "no");
 			}
 			return true;
 		}
@@ -431,6 +446,13 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	if (milliseconds >= 1000 && !gGPUReported) {
 		gGPUReported = true;
 		hakios_gpu_report("no answer");
+	}
+	if (gGPULoud) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
+		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms, %s)\n", fence, ns / NSEC_PER_USEC,
+		    milliseconds, gGPUReported ? "the GPU was reported" : "timeout");
 	}
 	return false;
 }
@@ -1094,6 +1116,9 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	 * range called phystokv_range() and panicked the kernel. Refuse it here,
 	 * while it is still a request.
 	 */
+	uint64_t mapBegan = mach_absolute_time(), mapBudget, pages = 0;
+
+	nanoseconds_to_absolutetime((uint64_t) GPU_MAP_BUDGET_MS * NSEC_PER_MSEC, &mapBudget);
 	for (uint64_t offset = 0; offset < size && mapped;) {
 		IOByteCount length = 0;
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
@@ -1109,6 +1134,18 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 			break;
 		}
 		for (uint64_t k = 0; k < run && mapped; k += 4096) {
+			if ((++pages & 0xff) == 0 && mach_absolute_time() - mapBegan >= mapBudget) {
+				/* A client's buffer taking longer than any real one must not hold gGPULock (and every
+				 * GPU wait) for as long as it likes: refuse the rest and let the mapping roll back. */
+				static uint32_t slow;
+
+				if (slow++ < 8 || gGPULoud) {
+					IOLog("HakiosGPU: a buffer of %llu bytes did not enter the GPU's address space in %u ms "
+					    "(%llu pages so far): refused\n", size, GPU_MAP_BUDGET_MS, pages);
+				}
+				mapped = false;
+				break;
+			}
 			mapped = hakios_gpu_map_in(fSpace, b->address + offset + k, phys + k, flags & MSM_BO_GPU_READONLY);
 		}
 		offset += run;
@@ -1855,6 +1892,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
+	uint32_t waitFence;
 
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
@@ -1869,6 +1907,53 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	}
 	bzero(&r, sizeof(r));
 	memcpy(&r, args->structureInput, size);
+	uint64_t loudBegan = gGPULoud ? mach_absolute_time() : 0;
+
+	if (gGPULoud) {
+		switch (selector) {
+		case kMsmGetParam:
+			IOLog("HakiosGPU: loud: request 0x40 GET_PARAM %u (pipe %u), %zu bytes\n", r.param.param, r.param.pipe, size);
+			break;
+		case kMsmSetParam:
+			IOLog("HakiosGPU: loud: request 0x41 SET_PARAM %u, %zu bytes\n", r.param.param, size);
+			break;
+		case kMsmGemNew:
+			IOLog("HakiosGPU: loud: request 0x42 GEM_NEW %llu bytes, flags %#x\n",
+			    (unsigned long long) r.gemNew.size, r.gemNew.flags);
+			break;
+		case kMsmGemInfo:
+			IOLog("HakiosGPU: loud: request 0x43 GEM_INFO handle %u, info %u\n", r.gemInfo.handle, r.gemInfo.info);
+			break;
+		case kMsmGemCpuPrep:
+			IOLog("HakiosGPU: loud: request 0x44 GEM_CPU_PREP handle %u, op %#x, timeout %lld.%09lld\n", r.cpuPrep.handle,
+			    r.cpuPrep.op, r.cpuPrep.timeout.seconds, r.cpuPrep.timeout.nanoseconds);
+			break;
+		case kMsmGemSubmit:
+			IOLog("HakiosGPU: loud: request 0x46 GEM_SUBMIT %u buffers, %u commands, flags %#x, queue %u\n",
+			    r.submit.nr_bos, r.submit.nr_cmds, r.submit.flags, r.submit.queueid);
+			break;
+		case kMsmWaitFence:
+			IOLog("HakiosGPU: loud: request 0x47 WAIT_FENCE %u, flags %#x, timeout %lld.%09lld\n", r.waitFence.fence,
+			    r.waitFence.flags, r.waitFence.timeout.seconds, r.waitFence.timeout.nanoseconds);
+			break;
+		case kMsmGemMadvise:
+			IOLog("HakiosGPU: loud: request 0x48 GEM_MADVISE handle %u, madv %u\n", r.madvise.handle, r.madvise.madv);
+			break;
+		case kDrmGemClose:
+			IOLog("HakiosGPU: loud: request 0x09 GEM_CLOSE handle %u\n", r.close.handle);
+			break;
+		case kHakiosSurface:
+			IOLog("HakiosGPU: loud: request 0x7e SURFACE %u, handle %#x\n", r.surface.surface, r.surface.handle);
+			break;
+		case kHakiosShow:
+			IOLog("HakiosGPU: loud: request 0x7f SHOW %u x %u, %u bytes a row\n", r.show.width, r.show.height,
+			    r.show.rowBytes);
+			break;
+		default:
+			IOLog("HakiosGPU: loud: request %#x, %zu bytes\n", selector, size);
+			break;
+		}
+	}
 
 	switch (selector) {
 	case kMsmGetParam:
@@ -1888,10 +1973,27 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
-		if (!gpuWait(hakios_gpu_last(), patience)) {
+		if (patience > GPU_CLIENT_PATIENCE_MS) {
+			GPU_LOUD("HakiosGPU: loud: CPU_PREP handle %u asked to wait %llu ms: bounded to %u\n", r.cpuPrep.handle,
+			    patience, GPU_CLIENT_PATIENCE_MS);
+			patience = GPU_CLIENT_PATIENCE_MS;
+		}
+		/*
+		 * Wait for the fence of THIS buffer, not for whatever the GPU was given last: one client's
+		 * hung submission must not make another client's first map wait (and then fail) at all.
+		 * A buffer that has never been submitted has fence 0, which is done.
+		 */
+		b = buffer(r.cpuPrep.handle);
+		if (b == NULL) {
+			IOLockUnlock(gGPULock);
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		waitFence = b->fence != 0 ? b->fence : hakios_gpu_last();
+		if (!gpuWait(waitFence, patience)) {
 			ret = kIOReturnBusy;
 			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
-				waitOver(&r.cpuPrep.timeout, hakios_gpu_last());
+				waitOver(&r.cpuPrep.timeout, waitFence);
 			}
 		}
 		IOLockUnlock(gGPULock);
@@ -1910,6 +2012,11 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			break;
 		}
 		patience = millisecondsUntil(&r.waitFence.timeout);
+		if (patience > GPU_CLIENT_PATIENCE_MS) {
+			GPU_LOUD("HakiosGPU: loud: WAIT_FENCE %u asked to wait %llu ms: bounded to %u\n", r.waitFence.fence,
+			    patience, GPU_CLIENT_PATIENCE_MS);
+			patience = GPU_CLIENT_PATIENCE_MS;
+		}
 		if (!gpuWait(r.waitFence.fence, patience)) {
 			ret = kIOReturnTimeout;
 			if (patience == 0) {
@@ -1972,6 +2079,23 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			args->structureOutputSize = (uint32_t) size;
 		}
 		memcpy(args->structureOutput, &r, args->structureOutputSize);
+	}
+	if (gGPULoud) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
+		if (selector == kMsmGemSubmit) {
+			IOLog("HakiosGPU: loud: request 0x46 -> %#x in %llu us: fence %u\n", ret, ns / NSEC_PER_USEC,
+			    r.submit.fence);
+		} else if (selector == kMsmGemNew) {
+			IOLog("HakiosGPU: loud: request 0x42 -> %#x in %llu us: handle %u\n", ret, ns / NSEC_PER_USEC,
+			    r.gemNew.handle);
+		} else if (selector == kHakiosSurface) {
+			IOLog("HakiosGPU: loud: request 0x7e -> %#x in %llu us: handle %u, %llu bytes\n", ret, ns / NSEC_PER_USEC,
+			    r.surface.handle, (unsigned long long) r.surface.size);
+		} else {
+			IOLog("HakiosGPU: loud: request %#x -> %#x in %llu us\n", selector, ret, ns / NSEC_PER_USEC);
+		}
 	}
 	return ret;
 }
