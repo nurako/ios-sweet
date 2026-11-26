@@ -126,9 +126,9 @@ if [ ! -f "$BDIR/build.ninja" ]; then
 		-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=enabled \
 		-Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= \
 		-Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled -Dgallium-xa=disabled \
-		-Dlmsensors=disabled -Dbuild-tests=false > "$BUILD/meson-setup.log"
+		-Dlmsensors=disabled -Dbuild-tests=false 2>&1 | tee "$BUILD/meson-setup.log"
 fi
-ninja -C "$BDIR" > "$BUILD/ninja.log"
+ninja -C "$BDIR" 2>&1 | tee "$BUILD/ninja.log"
 
 LIB=$BDIR/src/gallium/targets/osmesa/libOSMesa.8.dylib
 "$STRIP" -x -o "$OUT/libOSMesa.8.dylib" "$LIB"
