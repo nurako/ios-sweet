@@ -14,42 +14,55 @@ Both need `usbhakios=1` (the master switch in `sweet_ufs.c`) and the shim's
 SMR0 write (`shim/loader.c`: `SMR0 = 0x80000000`), which is what makes the
 apps SMMU translate stream 0 for DWC3 DMA.
 
-### One owner, chosen before either program opens the port
+### The log is the invariant; the shell is the exception
 
 The two jobs can be installed together, but they must never race for
-`/dev/hakios-usb` (only one opener is allowed, and the loser would exit and
-leave the port silent for the whole boot). Each program reads `usb=` from
-`kern.bootargs` **before** opening anything:
+`/dev/hakios-usb`. Each program reads `usb=` from `kern.bootargs` **before**
+opening anything:
 
 | boot arg | owner of `/dev/hakios-usb` | the other job |
 | --- | --- | --- |
-| `usb=2` | `usbsh` (kernel log first, then shell) | `usbmux` prints `usb=2, not usb=3` and exits 0 without opening |
+| `usb=2` | the kernel log; `usbsh` only after an explicit host request | `usbmux` prints `usb=2, not usb=3` and exits 0 without opening |
 | `usb=3` | `usbmux` (iPhone/usbmux device side) | `usbsh` prints `usb=3, not usb=2` and exits 0 without opening |
 | anything else | nobody | both exit 0 |
 
-`usbsh` waits for the kernel's CDC-ACM bring-up: it retries `open()` once a
-second while the answer is `ENXIO`/`EBUSY`/`ENOENT` and logs every 30 s. The
-kernel prints these boot-log transitions, so a silent host link has a trace:
+On `usb=2` the kernel log always flows whenever no program has attached.
+`usbsh` does **not** open `/dev/hakios-usb` at boot; it blocks on
+`/dev/hakios-usb-shell`. A shell is requested by this magic line (the bytes
+`1d 1d 53 48 45 4c 4c 0a`; control characters that cannot occur in console
+text):
 
 ```
-usb: owner thread started (level 2): /dev/hakios-usb is there
-usb: THE CONTROLLER IS THE KERNEL'S: a serial port ...
-usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now ...
-usb: a program (pid N) has the port (/dev/hakios-usb), level 2: ...
+\x1d\x1dSHELL\n
 ```
 
-If the kernel cannot start the controller the thread says so; if another
-program already holds the port, the open prints `another program already has
-the port`. `usbsh` also prints `USBSH: ...` state lines to `/dev/console`
-(and so to the persistent ring); its shell I/O stays on the USB port.
+While in log mode the kernel watches for it. On a match it:
+
+1. stops feeding the log (`usb: host asked for a shell`),
+2. writes `--- usbsh: log paused; 'log' resumes it ---` to the port,
+3. wakes `usbsh` through `/dev/hakios-usb-shell`.
+
+`usbsh` then opens `/dev/hakios-usb` (`usb: shell took the port`) and prints
+`ios:<cwd># `. Reading the port without a request is refused, so an accidental
+open cannot silence the log. If no program attaches within 10 s the kernel
+returns to log mode. The shell's `log` command, or 120 s with no shell input,
+also returns to log mode (`usb: log mode again`). The kernel prints exactly
+one transition line per change, and `usbsh` writes `USBSH: ...` state lines to
+`/dev/console` (so the persistent ring):
+
+```
+usb: log mode
+usb: host asked for a shell
+usb: shell took the port
+usb: log mode again
+```
 
 ## 1. `usb=2`: the serial shell
 
-The port carries the kernel log until the computer sends its first byte. After
-that `usbsh` takes over:
+The port carries the kernel log until the host sends the magic line. Then:
 
 ```
---- usbsh: the log is paused; 'help' for commands, 'log' to resume it ---
+--- usbsh: log paused; 'log' resumes it ---
 ios:/# ls /
 ```
 
@@ -61,8 +74,8 @@ ios:/# ls /
   in `/redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec`. On our root
   that means it finds the stock iOS programs and whatever is in
   `/usr/local/bin`.
-* `log` gives the port back to the kernel log; the next typed byte returns to
-  the shell.
+* `log` gives the port back to the kernel log. Send the magic line again to
+  return to the shell; 120 s without shell input also returns to the log.
 * `b64 FILE` prints:
   ```
   b64: BEGIN <size>
@@ -78,35 +91,34 @@ Host commands:
 
 ```sh
 sudo usermod -aG dialout "$USER"     # once, if /dev/ttyACM0 is not accessible
-tools/sweet-usbsh.sh                 # interactive
+tools/sweet-usbsh.sh                 # interactive (requests the shell, else shows the log)
 tools/sweet-usbsh.sh 'uname; ls /usr/local/bin'
 tools/sweet-usbsh.sh -g /var/tmp/usbmux.log usbmux.log
 tools/sweet-usbsh.sh -g /etc/hosts -
 ```
 
-`tools/sweet-usbsh.sh` uses `stty raw`, sends a bare `\r` to take the port,
-waits for the `ios:<cwd># ` prompt, and drops the echoed command + prompt from
-one-shot output. Options: `-d DEV`, `-b BAUD`, `-t SEC`, `-l` (keep the
-handshake log), `-g REMOTE [LOCAL]`.
+`tools/sweet-usbsh.sh` sets the port raw, sends the magic line, and waits up
+to `-a` seconds (default 3) for the banner. If the banner does not come it
+prints the log stream for `-t` seconds and exits 1, so it is never silent.
+Once acknowledged it sends the command, waits for the prompt, and drops the
+echoed command + prompts from one-shot output. Options: `-d DEV`, `-b BAUD`,
+`-t SEC`, `-a SEC`, `-l` (keep the log during the handshake),
+`-g REMOTE [LOCAL]`.
 
-Exact host-side sequence (the order matters; DTR/RTS are not required by this
-gadget, but asserting them is harmless and matches a normal terminal):
+Exact host-side sequence (DTR/RTS are not required by this gadget, but
+asserting them is harmless and matches a normal terminal):
 
 ```sh
-# 1. boot: ... usbhakios=1 usb=2   and wait for this line in the boot log:
-#    usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now
+# 1. boot: ... usbhakios=1 usb=2   the port is already streaming the kernel log
 # 2. host sees 1209:316d "HakiOS K40" -> /dev/ttyACM0
 stty -F /dev/ttyACM0 115200 raw -echo -echoe -echok -crtscts clocal
-# 3. open, raise DTR/RTS (optional), then send ONE bare CR (not CRLF) to
-#    take the port; wait for:  --- usbsh: the log is paused ... ---  then  ios:/#
-# 4. send the command and a CR:  uname -a\r   wait for the next ios:/# prompt
-# 5. "log\r" gives the port back to the kernel log; the next byte returns
+# 3. request a shell: send the 8 magic bytes (printf's \035 is 0x1d)
+printf '\035\035SHELL\n' > /dev/ttyACM0
+#    wait for: --- usbsh: log paused; 'log' resumes it ---  then  ios:/#
+# 4. send the command and CR:  uname -a\r   wait for the next ios:/# prompt
+# 5. "log\r" returns the port to the log; send the magic again for a shell
 tools/sweet-usbsh.sh 'uname -a'          # does 2-4 and prints only the answer
 ```
-
-Do not send `\r\n` for the takeover: the shell treats the CR as the line end
-and the LF as an empty second line, which makes the prompt accounting off by
-one (the old script comment in this file is why it sends a bare CR).
 
 ### `gl_test` markers
 
@@ -174,8 +186,8 @@ IOS_SDK=~/theos/sdks/iPhoneOS16.5.sdk ./build.sh
 `install-root.sh` defaults to `/usr/local/bin` and `/System/Library/LaunchDaemons`
 (our root has no `/redwood` ramdisk); it rewrites the reference plists'
 `/redwood/bin` paths. Both jobs can be installed together: the job that does
-not own the port for this boot exits before opening it (see the ownership
-table above), so installing both is safe and is what the image does.
+not own the port for this boot exits before opening it, and on `usb=2` even
+`usbsh` waits for the host's magic line (see the ownership table above).
 
 Entitlements: none are required by the sources and miniamfi here does not
 enforce them. If a stricter AMFI path is ever used, `usbmux`'s

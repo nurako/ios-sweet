@@ -1,5 +1,35 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Agent handoff / active work (2026-11-26 #2, log-first USB shell)
+
+### >>> UPDATE 2026-11-26 #2 (branch `hakios-console`): USB port is log-first;
+###     shell only on the magic line; usbsh no longer opens at boot <<<
+
+Hardware showed the previous `usb=2` rule (usbsh owns the port from boot) could
+leave the CDC-ACM port with no log and no shell. Reworked:
+
+* Kernel `usb=2` is in **log mode** from bring-up; the log always flows when no
+  program is attached. `usbsh` opens only `/dev/hakios-usb-shell` at boot.
+* Host magic line `1d 1d 53 48 45 4c 4c 0a` (`"\x1d\x1dSHELL\n"`) is matched
+  in `shell_input()` while in log mode. The kernel stops the log, queues
+  `--- usbsh: log paused; 'log' resumes it ---`, sets `shell_wanted`, wakes the
+  control node. `usbdev_open` refuses `/dev/hakios-usb` unless a request is
+  pending, so an accidental open cannot silence the log.
+* `usbdev_open` sets `shell_active`; `HAKIOS_USB_LOG` / the shell's `log` /
+  120 s with no shell input / 10 s with no attach all call `shell_to_log()`.
+* Kernel prints exactly `usb: log mode`, `usb: host asked for a shell`,
+  `usb: shell took the port`, `usb: log mode again`. Ring dump shows the last
+  transition, so a silent port is diagnosable.
+* `tools/sweet-usbsh.sh` sends the magic, waits `-a` (3 s) for the banner, then
+  runs the command; on no ack it prints `-t` seconds of the log and exits 1.
+  `usb=3`/`usbmux` is unchanged (boot-arg gate still there).
+
+Compile: run 45868317204 log + buildtree, overlaid patched files:
+`XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-con2.log /tmp/bt2
+bsd/dev/sweet_ufs.c osfmk/console/serial_console.c bsd/dev/hakios.usb.c` ->
+0 of 3 failed. `usbsh.c` host syntax check with clang + stub sysctl/sockaddr
+headers -> clean. Patch series `0119 -> 0200 -> 0300` applies on 0001..0118.
+
 ## Agent handoff / active work (2026-11-26, console + USB ownership)
 
 ### >>> UPDATE 2026-11-26 (branch `hakios-console`): userland console in the ring;

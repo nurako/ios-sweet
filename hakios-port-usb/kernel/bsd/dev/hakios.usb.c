@@ -282,6 +282,20 @@ static uint32_t rx_head, rx_tail;       /* (under usb_lock; free-running counter
 static uint32_t usb_generation, seen_rx_generation;
 static volatile UInt32 user_open;
 static volatile bool log_mode = true;   /* the log goes to the port: until the computer sends something to the program that has it */
+/*
+ * usb=2 shell request/attach (the log is the invariant, the shell the exception). The host sends a magic line that cannot
+ * occur in console text; the kernel stops the log, prints the banner and wakes usbsh through /dev/hakios-usb-shell. usbsh
+ * then opens /dev/hakios-usb. While no program is attached the log always flows.
+ */
+static const char shell_magic[] = "\x1d\x1dSHELL\n";
+#define SHELL_MAGIC_LEN         (sizeof(shell_magic) - 1)
+#define SHELL_REQUEST_NS        (10ull * NSEC_PER_SEC)  /* magic seen but usbsh did not attach */
+#define SHELL_IDLE_NS           (120ull * NSEC_PER_SEC) /* attached shell with no input */
+static volatile bool shell_wanted;      /* magic seen, waiting for usbsh to open the port */
+static volatile bool shell_active;      /* usbsh has the port: the log is stopped */
+static uint64_t shell_requested_at, shell_last_input;
+static unsigned shell_match;            /* bytes of shell_magic matched so far (in log mode) */
+static struct selinfo shell_rsel;
 static struct selinfo usb_rsel, usb_wsel;
 static int usb_wchan;
 static char usb_name[32] = "HakiOS K40";        /* boot-arg usb_name=Your_Name: what the computer calls the port ('_' for a space) */
@@ -480,6 +494,87 @@ feed_log(void)
 	}
 }
 
+static uint64_t
+ustime_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+/*
+ * Back to the log (usb_lock held): the shell is gone, its timeout expired, or the host asked with HAKIOS_USB_LOG. Only
+ * this function prints the transition, so each change appears once.
+ */
+static void
+shell_to_log(const char *why)
+{
+	if (level != 2) {
+		return;
+	}
+	if (log_mode && !shell_active && !shell_wanted) {
+		return;
+	}
+	shell_wanted = false;
+	shell_active = false;
+	log_mode = true;
+	shell_match = 0;
+	uint64_t at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
+	say("usb: log mode again%s%s\n", why != NULL && why[0] != 0 ? ": " : "", why != NULL ? why : "");
+	log_at = at;   /* (the transition line goes out on the port too) */
+	wakeup(rx_ring);
+	selwakeup(&usb_rsel);
+}
+
+/* The magic line: stop the log, say the banner, wake usbsh (usb_lock held). */
+static void
+shell_request(void)
+{
+	static const char banner[] = "--- usbsh: log paused; 'log' resumes it ---\r\n";
+
+	if (level != 2 || shell_wanted || shell_active) {
+		return;
+	}
+	rx_head = rx_tail = 0;
+	shell_match = 0;
+	shell_wanted = true;
+	log_mode = false;
+	shell_requested_at = ustime_ns();
+	say("usb: host asked for a shell\n");
+	if (usb_owned) {
+		(void)dwc3_queue(usb_dev, banner, sizeof(banner) - 1);
+	}
+	wakeup((void *)&shell_wanted);
+	selwakeup(&shell_rsel);
+}
+
+/*
+ * What the host sent while no program has the port: before the magic it is dropped (as it always was), after it it is
+ * kept for usbsh, which is about to open. The magic itself is not passed on (usb_lock held).
+ */
+static void
+shell_input(const uint8_t *buf, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (shell_wanted) {
+			if (rx_head - rx_tail < RX_RING) {
+				rx_ring[rx_head++ % RX_RING] = buf[i];
+			}
+			shell_last_input = ustime_ns();
+			continue;
+		}
+		if (buf[i] == (uint8_t)shell_magic[shell_match]) {
+			if (++shell_match == SHELL_MAGIC_LEN) {
+				shell_match = 0;
+				shell_request();
+			}
+		} else {
+			shell_match = (buf[i] == (uint8_t)shell_magic[0]) ? 1 : 0;
+		}
+	}
+}
+
 /* The device side from scratch (the shared core's init and start), with the VBUS override; usb_lock held. */
 static int
 bring_up(void)
@@ -555,6 +650,9 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 		say("usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now (usbsh retries until it is)\n");
 	}
 	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
+	if (level == 2) {
+		say("usb: log mode\n");
+	}
 	/*
 	 * Boot-arg usb_bounce=SECS (a test, usb_bounce_every=SECS, three times): the port leaves and comes back at that
 	 * many seconds of uptime, as the computer sees a cable pulled and put back -- for what happens above the port
@@ -578,6 +676,8 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 				say("usb: test (usb_bounce): the port leaves and comes back (%u of 3)\n", bounces);
 			}
 		}
+		uint64_t now = ustime_ns();
+
 		lck_mtx_lock(&usb_lock);
 		if (usb_stopping) {
 			lck_mtx_unlock(&usb_lock);
@@ -612,13 +712,19 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 				say("usb: a new session of the port (%u): what came before it is dropped\n", usb_generation);
 			}
 		}
-		if (!user_open) {
+		bool attached = level == 2 ? shell_active : user_open != 0;
+
+		if (!attached) {
 			static uint32_t dropped_said;
 
-			log_mode = level != 3;
+			if (level != 2) {
+				log_mode = level != 3;
+			}
 			while ((n = dwc3_read(usb_dev, buf, sizeof(buf))) > 0) {
-				/* what the computer sends with no program to take it is dropped */
-				if (level == 3 && dropped_said != usb_generation) {
+				if (level == 2) {
+					shell_input(buf, (size_t)n);
+				} else if (dropped_said != usb_generation) {
+					/* what the computer sends with no program to take it is dropped */
 					dropped_said = usb_generation;
 					say("usb: session %u: %zu bytes from the computer dropped: no program has the port\n", usb_generation, n);
 				}
@@ -641,8 +747,19 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 					rx_ring[rx_head++ % RX_RING] = buf[i];
 				}
 				readable = true;
+				if (level == 2) {
+					shell_last_input = ustime_ns();
+				}
 				/* the computer talks to the program: the log stops (the program can start it again) */
 				log_mode = false;
+			}
+		}
+		if (level == 2) {
+			now = ustime_ns();
+			if (shell_wanted && !shell_active && now - shell_requested_at > SHELL_REQUEST_NS) {
+				shell_to_log("no program attached");
+			} else if (shell_active && now - shell_last_input > SHELL_IDLE_NS) {
+				shell_to_log("no shell input");
 			}
 		}
 		if (log_mode) {
@@ -680,6 +797,34 @@ usbdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused 
 		say("usb: open /dev/hakios-usb: the controller is not up yet (level %u)\n", level);
 		return ENXIO;
 	}
+	if (level == 2) {
+		/* The log is the invariant: only the host's magic line (through /dev/hakios-usb-shell) lets usbsh in. */
+		if (!shell_wanted) {
+			say("usb: open /dev/hakios-usb: no shell request while the port is in log mode\n");
+			return EBUSY;
+		}
+		if (!OSCompareAndSwap(0, 1, &user_open)) {
+			say("usb: open /dev/hakios-usb: another program already has the port (level 2)\n");
+			return EBUSY;
+		}
+		lck_mtx_lock(&usb_lock);
+		if (!shell_wanted) {
+			/* The request expired between the check above and the lock. */
+			lck_mtx_unlock(&usb_lock);
+			user_open = 0;
+			say("usb: open /dev/hakios-usb: the shell request expired\n");
+			return EBUSY;
+		}
+		/* Keep what the host sent after the magic: it is the first command (rx_ring was cleared at request). */
+		shell_wanted = false;
+		shell_active = true;
+		shell_requested_at = 0;
+		shell_last_input = ustime_ns();
+		log_mode = false;
+		lck_mtx_unlock(&usb_lock);
+		say("usb: shell took the port (pid %d)\n", proc_selfpid());
+		return 0;
+	}
 	if (!OSCompareAndSwap(0, 1, &user_open)) {
 		say("usb: open /dev/hakios-usb: another program already has the port (level %u)\n", level);
 		return EBUSY;
@@ -700,8 +845,24 @@ usbdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused
 		hakios_usbmux_host(false);
 	}
 	mux_pid = -1;
-	log_mode = level != 3;
-	say("usb: the program let the port go%s\n", level == 3 ? "" : ": the log again");
+	lck_mtx_lock(&usb_lock);
+	if (level == 2) {
+		/*
+		 * Closing after an idle timeout is normal and shell_to_log() already said so; closing while still
+		 * active (the shell's "log" command or an error) is the transition to report.
+		 */
+		if (shell_active || !log_mode) {
+			shell_to_log(NULL);
+		} else {
+			shell_wanted = false;
+		}
+	} else {
+		log_mode = true;
+	}
+	lck_mtx_unlock(&usb_lock);
+	if (level == 3) {
+		say("usb: the program let the port go\n");
+	}
 	return 0;
 }
 
@@ -712,7 +873,7 @@ usbdev_read(__unused dev_t dev, struct uio *uio, int ioflag)
 
 	lck_mtx_lock(&usb_lock);
 	while (rx_head == rx_tail) {
-		if (usb_stopping || (!usb_owned && level != 3)) {
+		if (usb_stopping || (!usb_owned && level != 3) || (level == 2 && !shell_active)) {
 			lck_mtx_unlock(&usb_lock);
 			return EIO;
 		}
@@ -821,6 +982,9 @@ usbdev_write(__unused dev_t dev, struct uio *uio, int ioflag)
 	if (level == 3) {
 		return usbdev_write_packet(uio, ioflag);
 	}
+	if (level == 2 && !shell_active) {
+		return EIO;
+	}
 	while (uio_resid(uio) > 0 && error == 0) {
 		uint8_t buf[512];
 		size_t n = (size_t)MIN((user_ssize_t)sizeof(buf), uio_resid(uio)), done = 0;
@@ -853,7 +1017,7 @@ usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
 	int ready = 0;
 
 	lck_mtx_lock(&usb_lock);
-	if (usb_stopping || (!usb_owned && level != 3)) {
+	if (usb_stopping || (!usb_owned && level != 3) || (level == 2 && !shell_active)) {
 		ready = 1;
 	} else if (which == FREAD) {
 		ready = rx_head != rx_tail;
@@ -880,8 +1044,12 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		return 0;
 	case HAKIOS_USB_LOG:
 		lck_mtx_lock(&usb_lock);
-		log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
-		log_mode = true;
+		if (level == 2) {
+			shell_to_log(NULL);
+		} else {
+			log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
+			log_mode = true;
+		}
 		lck_mtx_unlock(&usb_lock);
 		return 0;
 	case FIONREAD:
@@ -967,6 +1135,73 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 	}
 }
 
+/* ---- /dev/hakios-usb-shell: usb=2 waits here until the host sends the magic line ----------------- */
+
+static int
+shell_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static int
+shell_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static int
+shelldev_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	int error = 0;
+
+	lck_mtx_lock(&usb_lock);
+	while (!shell_wanted) {
+		if (usb_stopping || !usb_taken) {
+			lck_mtx_unlock(&usb_lock);
+			return EIO;
+		}
+		if (ioflag & IO_NDELAY) {
+			lck_mtx_unlock(&usb_lock);
+			return EWOULDBLOCK;
+		}
+		error = msleep((void *)&shell_wanted, &usb_lock, PZERO | PCATCH, "hakios-usb-sh", NULL);
+		if (error) {
+			lck_mtx_unlock(&usb_lock);
+			return error;
+		}
+	}
+	if (uio_resid(uio) > 0) {
+		char c = 'S';
+
+		error = uiomove(&c, 1, uio);
+	}
+	lck_mtx_unlock(&usb_lock);
+	return error;
+}
+
+static int
+shelldev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
+{
+	int ready;
+
+	if (which != FREAD) {
+		return 1;
+	}
+	lck_mtx_lock(&usb_lock);
+	ready = shell_wanted || usb_stopping || !usb_taken;
+	if (!ready) {
+		selrecord(p, &shell_rsel, wql);
+	}
+	lck_mtx_unlock(&usb_lock);
+	return ready;
+}
+
+static const struct cdevsw shell_cdevsw = {
+	.d_open = shell_open, .d_close = shell_close, .d_read = shelldev_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = shelldev_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
 static const struct cdevsw usb_cdevsw = {
 	.d_open = usbdev_open, .d_close = usbdev_close, .d_read = usbdev_read, .d_write = usbdev_write,
 	.d_ioctl = usbdev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = usbdev_select,
@@ -1051,6 +1286,14 @@ take_controller(void)
 	major = cdevsw_add(-1, &usb_cdevsw);
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-usb") == NULL) {
 		say("usb: /dev/hakios-usb cannot be made\n");
+	}
+	if (level == 2) {
+		int shell_major = cdevsw_add(-1, &shell_cdevsw);
+
+		if (shell_major < 0 || devfs_make_node(makedev(shell_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600,
+		    "hakios-usb-shell") == NULL) {
+			say("usb: /dev/hakios-usb-shell cannot be made\n");
+		}
 	}
 	if (kernel_thread_start(usb_thread, NULL, &thread) != KERN_SUCCESS) {
 		say("usb: no thread: not taken\n");
