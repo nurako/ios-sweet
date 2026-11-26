@@ -1,3 +1,23 @@
+
+## 2026-11-26 (night) - one image with everything that works
+
+`hakios-integrate` + image HKN (`a43ed26f15b8`): Adreno 650 drawing on the panel
+with interrupts and `HakiosGPU` published; USB DWC3 enumerating as 1209:316d with
+the CDC-ACM console (usbreplay); SWEETBOX mailbox; real battery percentage from the
+PM8150B fuel gauge. Verified on the phone: home screen, touch, keys, live battery.
+
+Left out and why: `haptichakios` (AW8697 over GENI SE11): even with every wait
+bounded the boot still reset before the probe's first print, so the chip is almost
+certainly not on SE11 on alioth - needs the live DT checked for the real I2C engine
+and reset/INT GPIOs. `torchstep`: the flash module reports type 0x18/subtype 0x0000,
+not PM8150L, so the torch driver refuses; a different module driver is needed.
+`sweetloggrep` also did not filter in the last two dump boots (whole ring printed);
+check the argument parse before relying on it again.
+
+Known-good boot args:
+`sweettouch=1 sweetkeys=1 sweetgpu=22 sweetgpukeep=1 usbhakios=1 usb=2 usbreplay=1
+sweetbox=1 batteryhakios=1` plus board_pil_gpu/board_pil_gpu_size and the usual UI line.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## UPDATE 2026-11-26 (hakios-integrate): one branch for all current work
