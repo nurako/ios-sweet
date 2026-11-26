@@ -173,11 +173,14 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	smmu_stream0_bypass();
-	/* Hold the answer on screen long enough to be photographed: the kernel clears it. */
+	/* Hold the answer on screen a few seconds so it can be photographed (the kernel clears it). */
 	{
-		volatile uint64_t n = 300000000ull;
-		while (n--)
-			__asm__ volatile("nop");
+		uint64_t freq, start, now_v;
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+		do {
+			__asm__ volatile("mrs %0, cntpct_el0" : "=r"(now_v));
+		} while (now_v - start < 4ull * freq);
 	}
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
