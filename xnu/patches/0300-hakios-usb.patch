@@ -1,0 +1,3079 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index dee13fe..8795482 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,9 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/hakios.usb.c			standard
++bsd/dev/hakios.dwc3.c			standard
++bsd/dev/hakios_usb_adapter.c		standard
+ bsd/dev/alioth_keys.c			standard
+ bsd/dev/alioth_touch.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/hakios.dwc3.c b/bsd/dev/hakios.dwc3.c
+new file mode 100644
+index 0000000..971fdb8
+--- /dev/null
++++ b/bsd/dev/hakios.dwc3.c
+@@ -0,0 +1,949 @@
++/* hakios: FFT-infra/QcomXnuUsbDebug usb/Dwc3.c at ab6e363; changed: the include names, and EP0 across a bus
++ * reset (device_event(): an armed SETUP stays armed; see the "hakios:" comments there). */
++/* SPDX-License-Identifier: MIT
++ * Derived from Asahi Linux m1n1 v1.4.17 usb_dwc3.c. See LICENSE.m1n1 and
++ * ../docs/architecture.md. DART, allocation, Apple platform and the second CDC port removed.
++ */
++#include "hakios.dwc3.h"
++#include "hakios.dwc3regs.h"
++
++#define EP_COUNT 6u
++#define EP_NOTIFY 3u
++#define EP_OUT 4u
++#define EP_IN 5u
++#define EVENT_BYTES 4096u
++#define TRB_OFFSET 4096u
++#define BUFFER_OFFSET 8192u
++#define EP_BUFFER_BYTES 4096u
++#define TX_BYTES DWC3_TX_BYTES
++#define COMMAND_POLLS 10000u
++#define CONFIG_ACTION_MODIFY (2u << 30)
++
++enum control_state {
++    CTRL_SETUP, CTRL_IN_WAIT, CTRL_IN_ACTIVE, CTRL_OUT_WAIT, CTRL_OUT_ACTIVE,
++    CTRL_STATUS_IN_WAIT, CTRL_STATUS_IN_ACTIVE, CTRL_STATUS_OUT_WAIT,
++    CTRL_STATUS_OUT_ACTIVE
++};
++
++struct dwc3 {
++    struct dwc3_platform io;
++    uint8_t *dma_cpu;
++    uint64_t dma_device;
++    uint32_t event_offset, tx_head, tx_tail, tx_used, in_length;
++    uint32_t rx_head, rx_tail, rx_used, rx_generation;
++    uint64_t rx_overflow;
++    uint32_t packet_size;
++    uint32_t resource[EP_COUNT];
++    uint8_t active[EP_COUNT];
++    uint8_t tx[TX_BYTES], rx[DWC3_RX_BYTES], line_coding[7], control_reply[256];
++    uint16_t control_length;
++    uint8_t control_state, control_three_stage, configured, dtr;
++    uint8_t zlp_pending, running, initialized, full_speed, usb31;
++    int failed;
++    uint32_t events, commands, last_event;
++    uint32_t events_dropped;    /* hakios: events left in a ring at a stop and acknowledged unread (wait_halted) */
++    uint64_t dropped;
++    uint8_t device_descriptor[18], manufacturer[130], product[130], serial[130];
++    uint8_t mux;                /* hakios: the iPhone's usbmux interface, packets (see dwc3_identity) */
++    /* hakios: fastboot (DWC3_FASTBOOT): the caller's bulk transfers, [0] out, [1] in -- asked, moved, over, running */
++    uint8_t fastboot, bulk_over[2], bulk_running[2];
++    uint32_t bulk_asked[2], bulk_moved[2];
++    /* hakios: requests since the last CONNECTDONE, and bus resets in a row that came with none (device_event()) */
++    uint32_t setups_since_conn, empty_sessions, unconfigured_resets;
++    uint8_t conn_seen;
++    uint8_t qualifier[10];
++};
++
++_Static_assert(sizeof(struct dwc3) <= DWC3_CONTEXT_BYTES,
++               "DWC3 context exceeds the public storage budget");
++
++static const uint8_t device_descriptor[] = {
++    18, 1, 0, 2, 2, 0, 0, 64, 0, 0, 0, 0,
++    0, 1, 1, 2, 3, 1
++};
++static const uint8_t qualifier[] = {10, 6, 0, 2, 2, 0, 0, 64, 1, 0};
++#define CONFIG_BYTES(mpslo, mpshi, dtype) \
++    9, dtype, 67, 0, 2, 1, 0, 0x80, 50, \
++    9, 4, 0, 0, 1, 2, 2, 1, 0, \
++    5, 0x24, 0, 0x10, 1, \
++    5, 0x24, 1, 0, 1, \
++    4, 0x24, 2, 2, \
++    5, 0x24, 6, 0, 1, \
++    7, 5, 0x81, 3, 16, 0, 10, \
++    9, 4, 1, 0, 2, 0x0a, 0, 0, 0, \
++    7, 5, 0x02, 2, mpslo, mpshi, 0, \
++    7, 5, 0x82, 2, mpslo, mpshi, 0
++static const uint8_t config_hs[] = {CONFIG_BYTES(0, 2, 2)};
++static const uint8_t config_fs[] = {CONFIG_BYTES(64, 0, 2)};
++static const uint8_t other_hs[] = {CONFIG_BYTES(0, 2, 7)};
++static const uint8_t other_fs[] = {CONFIG_BYTES(64, 0, 7)};
++/* hakios: what an iPhone shows to a computer's usbmux (usbmuxd, Apple Mobile Device Service): its interface 1,
++ * vendor class 0xff, subclass 0xfe, protocol 2, two bulk endpoints; Windows' Apple driver takes ...&MI_01.
++ * Interface 0 (an iPhone's PTP camera) is there empty, to keep the mux at number 1. Four configurations
++ * alike, as an iPhone has four and the computer's side may choose any. */
++#define MUX_CONFIG_BYTES(mpslo, mpshi, dtype, value) \
++    9, dtype, 41, 0, 2, value, 0, 0xc0, 250, \
++    9, 4, 0, 0, 0, 0xff, 0, 0, 0, \
++    9, 4, 1, 0, 2, 0xff, 0xfe, 2, 0, \
++    7, 5, 0x02, 2, mpslo, mpshi, 0, \
++    7, 5, 0x82, 2, mpslo, mpshi, 0
++static const uint8_t mux_config[2][2][4][41] = {
++    { { {MUX_CONFIG_BYTES(0, 2, 2, 1)}, {MUX_CONFIG_BYTES(0, 2, 2, 2)}, {MUX_CONFIG_BYTES(0, 2, 2, 3)}, {MUX_CONFIG_BYTES(0, 2, 2, 4)} },
++      { {MUX_CONFIG_BYTES(64, 0, 2, 1)}, {MUX_CONFIG_BYTES(64, 0, 2, 2)}, {MUX_CONFIG_BYTES(64, 0, 2, 3)}, {MUX_CONFIG_BYTES(64, 0, 2, 4)} } },
++    { { {MUX_CONFIG_BYTES(0, 2, 7, 1)}, {MUX_CONFIG_BYTES(0, 2, 7, 2)}, {MUX_CONFIG_BYTES(0, 2, 7, 3)}, {MUX_CONFIG_BYTES(0, 2, 7, 4)} },
++      { {MUX_CONFIG_BYTES(64, 0, 7, 1)}, {MUX_CONFIG_BYTES(64, 0, 7, 2)}, {MUX_CONFIG_BYTES(64, 0, 7, 3)}, {MUX_CONFIG_BYTES(64, 0, 7, 4)} } },
++};
++#define MUX_CONFIGS 4u
++/* hakios: fastboot, as the stock bootloader's: one configuration, one interface (0xff, 0x42, 3), its two endpoints */
++#define FASTBOOT_CONFIG_BYTES(mpslo, mpshi, dtype) \
++    9, dtype, 32, 0, 1, 1, 0, 0x80, 250, \
++    9, 4, 0, 0, 2, 0xff, 0x42, 3, 0, \
++    7, 5, 0x02, 2, mpslo, mpshi, 0, \
++    7, 5, 0x82, 2, mpslo, mpshi, 0
++static const uint8_t fastboot_config[2][2][32] = {
++    { {FASTBOOT_CONFIG_BYTES(0, 2, 2)}, {FASTBOOT_CONFIG_BYTES(64, 0, 2)} },
++    { {FASTBOOT_CONFIG_BYTES(0, 2, 7)}, {FASTBOOT_CONFIG_BYTES(64, 0, 7)} },
++};
++static const uint8_t language[] = {4, 3, 9, 4};
++/* Per-instance fixed storage; identity does not retain caller pointers. */
++static size_t identity_chars(const char *text)
++{
++    size_t n;
++    if (!text) return 0;
++    for (n = 0; n < 64u; ++n) {
++        unsigned char c = (unsigned char)text[n];
++        if (!c) return n;
++        if (c < 32u || c > 126u) return 0;
++    }
++    return 0;
++}
++static void string_descriptor(uint8_t *out, const char *text, size_t chars)
++{
++    size_t i;
++    out[0] = (uint8_t)(2 + 2 * chars); out[1] = 3;
++    for (i = 0; i < chars; ++i) {
++        out[2 + 2 * i] = (uint8_t)text[i]; out[3 + 2 * i] = 0;
++    }
++}
++
++static void zero(void *p, size_t n)
++{
++    uint8_t *d = p;
++    while (n--) *d++ = 0;
++}
++static void copy(void *to, const void *from, size_t n)
++{
++    uint8_t *d = to;
++    const uint8_t *s = from;
++    while (n--) *d++ = *s++;
++}
++static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
++static uint32_t rd(struct dwc3 *d, uint32_t r) { return d->io.read32(d->io.cookie, r); }
++static void wr(struct dwc3 *d, uint32_t r, uint32_t v) { d->io.write32(d->io.cookie, r, v); }
++static void trace(struct dwc3 *d, enum dwc3_trace e, uint32_t a, uint32_t b)
++{
++    if (d->io.trace) d->io.trace(d->io.cookie, e, a, b);
++}
++static void sync(struct dwc3 *d, void *p, size_t n, enum dwc3_sync_direction dir)
++{
++    d->io.dma_sync(d->io.cookie, p, n, dir);
++    d->io.barrier(d->io.cookie);
++}
++static uint8_t *buffer(struct dwc3 *d, unsigned ep)
++{
++    return d->dma_cpu + BUFFER_OFFSET + ep * EP_BUFFER_BYTES;
++}
++static struct dwc3_trb *trb(struct dwc3 *d, unsigned ep)
++{
++    return (struct dwc3_trb *)(void *)(d->dma_cpu + TRB_OFFSET + ep * 64u);
++}
++static void rx_reset(struct dwc3 *d)
++{
++    zero(d->rx, sizeof(d->rx));
++    d->rx_head = d->rx_tail = d->rx_used = 0;
++    d->rx_generation++;
++}
++static void rx_push(struct dwc3 *d, const uint8_t *bytes, size_t count)
++{
++    size_t i, accepted = count;
++    if (accepted > DWC3_RX_BYTES - d->rx_used)
++        accepted = DWC3_RX_BYTES - d->rx_used;
++    for (i = 0; i < accepted; i++) {
++        d->rx[d->rx_head] = bytes[i];
++        d->rx_head = (d->rx_head + 1u) % DWC3_RX_BYTES;
++    }
++    d->rx_used += (uint32_t)accepted;
++    d->rx_overflow += count - accepted;
++}
++static int wait_mask(struct dwc3 *d, uint32_t reg, uint32_t mask, uint32_t want)
++{
++    unsigned i;
++    for (i = 0; i < COMMAND_POLLS; i++) {
++        if ((rd(d, reg) & mask) == want) return 0;
++        d->io.delay_us(d->io.cookie, 1);
++    }
++    trace(d, DWC3_TRACE_TIMEOUT, reg, rd(d, reg));
++    return -3;
++}
++/* hakios: the device controller halts only once no event waits for its driver (the DWC_usb3 databook; Linux's
++ * dwc3_gadget_soft_disconnect lets its interrupt handler take them while it polls DSTS.DEVCTRLHLT). A stop that left
++ * events in a ring waited in vain: the loader lent the controller with 8 bytes pending, and the kernel's usb=3 said
++ * "TIMEOUT waiting on register 0xc70c" and "could not be made ours (-3)", and the loader's own link did not come back
++ * after the run (2026-11-06). So while waiting, whatever waits in any interrupter's ring is acknowledged -- dropped:
++ * whoever stops the controller does not want it. Ring 0's bytes, if it is this driver's (`own`), are stepped over. */
++static int wait_halted(struct dwc3 *d, int own)
++{
++    unsigned i, ep, interrupters = (rd(d, DWC3_GHWPARAMS1) >> 15) & 63u;
++    if (interrupters > 32) interrupters = 32;
++    for (i = 0; i < COMMAND_POLLS; i++) {
++        if (rd(d, DWC3_DSTS) & DWC3_DSTS_DEVCTRLHLT) return 0;
++        for (ep = 0; ep < interrupters; ep++) {
++            uint32_t n = rd(d, DWC3_GEVNTCOUNT(ep)) & DWC3_GEVNTCOUNT_MASK;
++            if (!n) continue;
++            wr(d, DWC3_GEVNTCOUNT(ep), n);
++            if (ep == 0 && own) d->event_offset = (d->event_offset + n) % EVENT_BYTES;
++            d->events_dropped += n / 4;
++        }
++        d->io.delay_us(d->io.cookie, 1);
++    }
++    trace(d, DWC3_TRACE_TIMEOUT, DWC3_DSTS, rd(d, DWC3_DSTS));
++    return -3;
++}
++static int ep_command(struct dwc3 *d, unsigned ep, uint32_t cmd,
++                      uint32_t p0, uint32_t p1, uint32_t p2)
++{
++    uint32_t result;
++    uint32_t phy = rd(d, DWC3_GUSB2PHYCFG(0));
++    uint32_t suspend = DWC3_GUSB2PHYCFG_SUSPHY | (1u << 8); /* ENBLSLPM */
++    int ret = 0;
++    d->commands++;
++    /* DWC_usb31 1.90a guide 3.2.2, also Linux dwc3_send_gadget_ep_cmd:
++     * HS/FS endpoint commands require both PHY suspend controls disabled. */
++    if (phy & suspend) wr(d, DWC3_GUSB2PHYCFG(0), phy & ~suspend);
++    wr(d, DWC3_DEPCMDPAR0(ep), p0);
++    wr(d, DWC3_DEPCMDPAR1(ep), p1);
++    wr(d, DWC3_DEPCMDPAR2(ep), p2);
++    wr(d, DWC3_DEPCMD(ep), cmd | DWC3_DEPCMD_CMDACT);
++    /* USB31 cannot use CMDACT polling to guarantee ENDTRANSFER completion.
++     * The documented no-IOC sequence waits 1ms before buffer reuse. */
++    if (d->usb31 && (cmd & 15u) == DWC3_DEPCMD_ENDTRANSFER) {
++        d->io.delay_us(d->io.cookie, 1000);
++        goto out;
++    }
++    if (wait_mask(d, DWC3_DEPCMD(ep), DWC3_DEPCMD_CMDACT, 0)) { ret = -3; goto out; }
++    result = rd(d, DWC3_DEPCMD(ep));
++    /* Command status is a four-bit field, unlike the old m1n1 header. */
++    if ((result >> 12) & 15u) {
++        trace(d, DWC3_TRACE_COMMAND, (ep << 16) | cmd, result);
++        ret = -4; goto out;
++    }
++    if ((cmd & 15u) == DWC3_DEPCMD_STARTTRANSFER)
++        d->resource[ep] = DWC3_DEPCMD_GET_RSC_IDX(result);
++out:
++    if (phy & suspend) wr(d, DWC3_GUSB2PHYCFG(0), phy);
++    return ret;
++}
++static int end_transfer(struct dwc3 *d, unsigned ep)
++{
++    if (!d->active[ep]) return 0;
++    if (ep_command(d, ep, DWC3_DEPCMD_ENDTRANSFER | DWC3_DEPCMD_HIPRI_FORCERM |
++                   DWC3_DEPCMD_PARAM(d->resource[ep]), 0, 0, 0)) return -4;
++    d->active[ep] = 0;
++    return 0;
++}
++static int end_noncontrol(struct dwc3 *d)
++{
++    unsigned ep;
++    for (ep = EP_NOTIFY; ep < EP_COUNT; ep++) if (end_transfer(d, ep)) return -4;
++    d->zlp_pending = 0;
++    return 0;
++}
++/* modify: 0 initialized, with its transfer resource (dwc3_init); 1 modified (its state kept); 2 (hakios)
++ * initialized again, the resource it has kept -- see set_configuration() */
++static int configure_ep(struct dwc3 *d, unsigned ep, unsigned type,
++                        unsigned packet, int modify)
++{
++    uint32_t p0 = DWC3_DEPCFG_EP_TYPE(type) | DWC3_DEPCFG_MAX_PACKET_SIZE(packet);
++    uint32_t p1 = DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN |
++                  DWC3_DEPCFG_EP_NUMBER(ep);
++    /* FIFO number is the USB IN endpoint number, not physical endpoint index. */
++    if (ep & 1u) p0 |= DWC3_DEPCFG_FIFO_NUMBER(ep >> 1);
++    if (type == DWC3_DEPCMD_TYPE_INTR) p1 |= DWC3_DEPCFG_BINTERVAL_M1(9);
++    if (modify == 1) p0 |= CONFIG_ACTION_MODIFY;
++    if (ep_command(d, ep, DWC3_DEPCMD_SETEPCONFIG, p0, p1, 0)) return -4;
++    if (!modify && ep_command(d, ep, DWC3_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) return -4;
++    return 0;
++}
++static int transfer(struct dwc3 *d, unsigned ep, uint32_t type, unsigned bytes)
++{
++    struct dwc3_trb *t = trb(d, ep);
++    uint64_t data_dma = d->dma_device + BUFFER_OFFSET + ep * EP_BUFFER_BYTES;
++    uint64_t trb_dma = d->dma_device + TRB_OFFSET + ep * 64u;
++    if (d->active[ep] || bytes > EP_BUFFER_BYTES) return -5;
++    t->bpl = (uint32_t)data_dma;
++    t->bph = (uint32_t)(data_dma >> 32);
++    t->size = bytes;
++    t->ctrl = type | DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_LST |
++              DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_IOC;
++    sync(d, buffer(d, ep), EP_BUFFER_BYTES, DWC3_TO_DEVICE);
++    sync(d, t, 64, DWC3_TO_DEVICE);
++    if (ep_command(d, ep, DWC3_DEPCMD_STARTTRANSFER,
++                   (uint32_t)(trb_dma >> 32), (uint32_t)trb_dma, 0)) return -4;
++    d->active[ep] = 1;
++    return 0;
++}
++static int setup_phase(struct dwc3 *d)
++{
++    d->control_state = CTRL_SETUP;
++    return transfer(d, 0, DWC3_TRBCTL_CONTROL_SETUP, 8);
++}
++static int stall(struct dwc3 *d)
++{
++    trace(d, DWC3_TRACE_UNSUPPORTED, buffer(d, 0)[0], buffer(d, 0)[1]);
++    if (ep_command(d, 0, DWC3_DEPCMD_SETSTALL, 0, 0, 0)) return -4;
++    return setup_phase(d);
++}
++
++const void *dwc3_descriptor(const struct dwc3 *d, unsigned type, unsigned index, int fs, size_t *length)
++{
++    const uint8_t *p = 0;
++    size_t n = 0;
++    if (!d || !d->initialized) { if (length) *length = 0; return 0; }
++    if (d->mux && (type == 2 || type == 7) && index < MUX_CONFIGS) {
++        /* (other-speed: the descriptor of the speed we are not at) */
++        p = mux_config[type == 7][type == 7 ? !fs : !!fs][index]; n = sizeof(mux_config[0][0][0]);
++    } else if (d->fastboot && (type == 2 || type == 7) && index == 0) {
++        p = fastboot_config[type == 7][type == 7 ? !fs : !!fs]; n = sizeof(fastboot_config[0][0]);
++    } else if (index == 0) {
++        switch (type) {
++        case 1: p = d->device_descriptor; n = sizeof(d->device_descriptor); break;
++        case 2: p = fs ? config_fs : config_hs; n = sizeof(config_hs); break;
++        case 6: p = d->qualifier; n = sizeof(d->qualifier); break;
++        case 7: p = fs ? other_hs : other_fs; n = sizeof(other_hs); break;
++        }
++    }
++    if (type == 3) {
++        switch (index) {
++        case 0: p = language; n = sizeof(language); break;
++        case 1: p = d->manufacturer; n = p[0]; break;
++        case 2: p = d->product; n = p[0]; break;
++        case 3: p = d->serial; n = p[0]; break;
++        }
++    }
++    if (length) *length = n;
++    return p;
++}
++
++static int set_configuration(struct dwc3 *d, unsigned value)
++{
++    if (value > (d->mux ? MUX_CONFIGS : 1u)) return -1;
++    if (d->configured && end_noncontrol(d)) return -4;
++    /*
++     * hakios: the data endpoints initialized again, as Linux's dwc3 enables an endpoint at SET_CONFIGURATION: that
++     * puts their data sequence (DATA0/DATA1) back to DATA0, where the host starts it after a configuration. CONNECTDONE
++     * only modifies them, which keeps the sequence of the session before -- after a cable was put back, half the time
++     * the first packet either way had the toggle the other side took for a repeat: acknowledged and dropped. The
++     * computer's usbmux version packet vanished on its way in, or the answer on its way out, and Windows never listed
++     * the iPhone again (2026-11-02, the K40: "the mux's first packet to the computer", then nothing more from it).
++     */
++    if (value && (configure_ep(d, EP_OUT, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
++                  configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 2) ||
++                  (!d->mux && !d->fastboot && configure_ep(d, EP_NOTIFY, DWC3_DEPCMD_TYPE_INTR, 16, 2)))) return -4;
++    d->configured = (uint8_t)value;
++    d->dtr = 0;
++    trace(d, DWC3_TRACE_CONFIGURED, value, d->mux | d->fastboot << 1);
++    if (d->fastboot) {
++        /* (the caller's transfers of the session before were ended with it: end_noncontrol() above) */
++        wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_OUT) | (1u << EP_IN)) : 0u));
++        return 0;
++    }
++    if (d->mux) {
++        /* (a new configuration is a new session: what was queued for the last one is not sent) */
++        d->tx_head = d->tx_tail = d->tx_used = 0;
++        wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_OUT) | (1u << EP_IN)) : 0u));
++        return 0;
++    }
++    wr(d, DWC3_DALEPENA, 3u | (value ? ((1u << EP_NOTIFY) | (1u << EP_OUT) |
++                                       (1u << EP_IN)) : 0u));
++    return 0;
++}
++static int setup_request(struct dwc3 *d)
++{
++    const uint8_t *s = buffer(d, 0), *reply = 0;
++    uint16_t value = le16(s + 2), index = le16(s + 4), length = le16(s + 6);
++    size_t n = 0;
++    int ok = 0;
++    d->setups_since_conn++;
++    trace(d, DWC3_TRACE_SETUP, ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | value,
++          ((uint32_t)index << 16) | length);
++    d->control_three_stage = length != 0;
++    d->control_length = 0;
++    if (s[0] == 0x80 && s[1] == 6) {
++        reply = dwc3_descriptor(d, value >> 8, value & 255, d->full_speed, &n);
++        ok = reply != 0;
++    } else if ((s[0] == 0x80 || s[0] == 0x81 || s[0] == 0x82) && s[1] == 0 &&
++               value == 0 && length == 2 && ((s[0] == 0x80 && index == 0) ||
++               (s[0] == 0x81 && index < 2) ||
++               (s[0] == 0x82 && (index == 0 || index == 0x80 || index == 0x81 ||
++                                  index == 2 || index == 0x82)))) {
++        d->control_reply[0] = 0; d->control_reply[1] = 0;
++        reply = d->control_reply; n = 2; ok = 1;
++    } else if (s[0] == 0 && s[1] == 5 && value <= 127 && index == 0 && length == 0) {
++        wr(d, DWC3_DCFG, (rd(d, DWC3_DCFG) & ~DWC3_DCFG_DEVADDR_MASK) |
++                         DWC3_DCFG_DEVADDR(value));
++        ok = 1;
++    } else if (s[0] == 0 && s[1] == 9 && index == 0 && length == 0 && value <= (d->mux ? MUX_CONFIGS : 1u)) {
++        int ret = set_configuration(d, value);
++        if (ret) return ret;
++        ok = 1;
++    } else if (s[0] == 0x80 && s[1] == 8 && value == 0 && index == 0 && length == 1) {
++        d->control_reply[0] = d->configured; reply = d->control_reply; n = 1; ok = 1;
++    } else if (s[0] == 0x81 && s[1] == 10 && value == 0 && index < 2 && length == 1) {
++        d->control_reply[0] = 0; reply = d->control_reply; n = 1; ok = 1;
++    } else if (s[0] == 1 && s[1] == 11 && value == 0 && index < 2 && length == 0) {
++        ok = 1;
++    } else if (s[0] == 0x21 && s[1] == 0x22 && index == 0 && length == 0 && value <= 3) {
++        d->dtr = (uint8_t)(value & 1);
++        trace(d, DWC3_TRACE_READY, d->configured, d->dtr); ok = 1;
++    } else if (s[0] == 0xa1 && s[1] == 0x21 && index == 0 && value == 0 && length == 7) {
++        reply = d->line_coding; n = 7; ok = 1;
++    } else if (s[0] == 0x21 && s[1] == 0x20 && index == 0 && value == 0 && length == 7) {
++        d->control_length = 7; d->control_state = CTRL_OUT_WAIT; return 0;
++    } else if (s[0] == 2 && s[1] == 1 && value == 0 && length == 0 &&
++               (index == 0x81 || index == 2 || index == 0x82)) {
++        unsigned ep = ((index & 15u) << 1) | ((index >> 7) & 1u);
++        ok = ep_command(d, ep, DWC3_DEPCMD_CLEARSTALL, 0, 0, 0) == 0;
++    }
++    if (!ok) return stall(d);
++    if (length) {
++        if (!(s[0] & 0x80) || !reply) return stall(d);
++        if (n > length) n = length;
++        if (n > sizeof(d->control_reply)) return stall(d);
++        copy(buffer(d, 1), reply, n);
++        d->control_length = (uint16_t)n;
++        d->control_state = CTRL_IN_WAIT;
++    } else d->control_state = CTRL_STATUS_IN_WAIT;
++    return 0;
++}
++
++static int control_not_ready(struct dwc3 *d, unsigned ep, unsigned status)
++{
++    uint32_t status_type = d->control_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3 :
++                                                  DWC3_TRBCTL_CONTROL_STATUS2;
++    switch (d->control_state) {
++    case CTRL_IN_WAIT:
++        if (ep != 1 || status != DEPEVT_STATUS_CONTROL_DATA) return 0;
++        d->control_state = CTRL_IN_ACTIVE;
++        return transfer(d, 1, DWC3_TRBCTL_CONTROL_DATA, d->control_length);
++    case CTRL_OUT_WAIT:
++        if (ep != 0 || status != DEPEVT_STATUS_CONTROL_DATA) return 0;
++        d->control_state = CTRL_OUT_ACTIVE;
++        return transfer(d, 0, DWC3_TRBCTL_CONTROL_DATA, 64);
++    case CTRL_STATUS_IN_WAIT:
++        if (ep != 1 || status != DEPEVT_STATUS_CONTROL_STATUS) return 0;
++        d->control_state = CTRL_STATUS_IN_ACTIVE;
++        return transfer(d, 1, status_type, 0);
++    case CTRL_STATUS_OUT_WAIT:
++        if (ep != 0 || status != DEPEVT_STATUS_CONTROL_STATUS) return 0;
++        d->control_state = CTRL_STATUS_OUT_ACTIVE;
++        return transfer(d, 0, status_type, 0);
++    default: return 0;
++    }
++}
++static int control_complete(struct dwc3 *d, unsigned ep, uint32_t residual)
++{
++    switch (d->control_state) {
++    case CTRL_SETUP:
++        if (ep != 0 || residual) return stall(d);
++        sync(d, buffer(d, 0), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
++        return setup_request(d);
++    case CTRL_IN_ACTIVE:
++        if (ep != 1 || residual) return stall(d);
++        d->control_state = CTRL_STATUS_OUT_WAIT; return 0;
++    case CTRL_OUT_ACTIVE:
++        if (ep != 0 || residual != 64u - d->control_length) return stall(d);
++        sync(d, buffer(d, 0), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
++        copy(d->line_coding, buffer(d, 0), 7);
++        d->control_state = CTRL_STATUS_IN_WAIT; return 0;
++    case CTRL_STATUS_IN_ACTIVE:
++    case CTRL_STATUS_OUT_ACTIVE: return setup_phase(d);
++    default: return stall(d);
++    }
++}
++/* hakios: a byte of the TX ring, i bytes past its tail */
++static uint8_t tx_at(const struct dwc3 *d, uint32_t i) { return d->tx[(d->tx_tail + i) % TX_BYTES]; }
++/* hakios, mux mode: the OUT endpoint armed only with room for a whole transfer in the RX ring (nothing the
++ * host sends is dropped: it waits, NAKed, until the reader has taken some); one queued packet per IN
++ * transfer, its length the 2 bytes before it in the ring; a zero-length transfer after a packet that is
++ * a multiple of the packet size, which is how the host knows where it ends. */
++static int pump_mux(struct dwc3 *d)
++{
++    uint32_t n, i;
++    if (!d->active[EP_OUT] && DWC3_RX_BYTES - d->rx_used >= EP_BUFFER_BYTES) {
++        if (transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
++        trace(d, DWC3_TRACE_ARMED, EP_OUT, d->rx_used);
++    }
++    if (d->active[EP_IN]) return 0;
++    if (d->zlp_pending) {
++        d->zlp_pending = 0;
++        d->in_length = 0;
++        return transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, 0);
++    }
++    if (d->tx_used < 2) return 0;
++    n = (uint32_t)tx_at(d, 0) | ((uint32_t)tx_at(d, 1) << 8);
++    if (n == 0 || n > DWC3_PACKET_MAX || n + 2 > d->tx_used) return -8;
++    for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = tx_at(d, 2 + i);
++    if (transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, n)) return -4;
++    d->in_length = n;
++    return 0;
++}
++static int pump(struct dwc3 *d)
++{
++    uint32_t n, i;
++    if (!d->configured) return 0;
++    if (d->fastboot) return 0;     /* hakios: nothing armed but what the caller starts (dwc3_bulk()) */
++    if (d->mux) return pump_mux(d);
++    /* Keep one bulk-OUT transfer armed. Completed bytes are copied into the
++     * finite RX ring by handle_event before this function rearms it. */
++    if (!d->active[EP_OUT] && transfer(d, EP_OUT, DWC3_TRBCTL_NORMAL, EP_BUFFER_BYTES)) return -4;
++    if (!d->dtr || d->active[EP_IN]) return 0;
++    n = d->tx_used < EP_BUFFER_BYTES ? d->tx_used : EP_BUFFER_BYTES;
++    if (!n && !d->zlp_pending) return 0;
++    for (i = 0; i < n; i++) buffer(d, EP_IN)[i] = d->tx[(d->tx_tail + i) % TX_BYTES];
++    if (transfer(d, EP_IN, DWC3_TRBCTL_NORMAL, n)) return -4;
++    d->in_length = n;
++    return 0;
++}
++static int device_event(struct dwc3 *d, unsigned event)
++{
++    unsigned i, speed;
++    trace(d, DWC3_TRACE_DEVICE_EVENT, event, rd(d, DWC3_DSTS));
++    /*
++     * hakios: the cable pulled and put back. With VBUS overridden to valid (the phone has no OTG block telling the
++     * controller), the device side never sees the cable go, and after it comes back EP0 answered nothing: the computer
++     * reset the port eight times without a single request getting through, then called it an unknown device
++     * ("Device Descriptor Request Failed", 2026-11-01). A bus reset after a connection that saw no request, three
++     * times in a row -- which a computer enumerating never does -- has the device side started again from scratch
++     * (-9: hakios.usb.c stops and brings it up, the computer sees it leave and come back), as Linux does when VBUS
++     * goes and comes.
++     */
++    if (event == DWC3_DEVT_USBRST && d->conn_seen) {
++        if (d->setups_since_conn != 0) {
++            d->empty_sessions = 0;
++        } else if (++d->empty_sessions >= 3) {
++            trace(d, DWC3_TRACE_STUCK, d->empty_sessions, d->control_state);
++            d->empty_sessions = 0;
++            return -9;
++        }
++        /* ... and four in a row that never got as far as a configuration: after a restart the computer once read a
++         * device descriptor that said no configuration (it asked for configuration 255) and reset the port over and
++         * over; the next restart from scratch enumerated at once. A computer enumerating resets twice at most. */
++        if (d->configured) {
++            d->unconfigured_resets = 0;
++        } else if (++d->unconfigured_resets >= 4) {
++            trace(d, DWC3_TRACE_STUCK, d->unconfigured_resets, 0x100u | d->control_state);
++            d->unconfigured_resets = 0;
++            return -9;
++        }
++    }
++    if (event == DWC3_DEVT_USBRST || event == DWC3_DEVT_DISCONN) {
++        d->configured = d->dtr = d->zlp_pending = 0;
++        rx_reset(d);
++        if (d->mux) d->tx_head = d->tx_tail = d->tx_used = 0;  /* hakios: packets of a session that is over */
++        if (end_noncontrol(d)) return -4;
++        /* EP0 SETUP/STATUS have special hardware rules; only an active DATA
++         * transfer needs ENDTRANSFER before resetting the control state. */
++        if (d->control_state == CTRL_IN_ACTIVE && end_transfer(d, 1)) return -4;
++        if (d->control_state == CTRL_OUT_ACTIVE && end_transfer(d, 0)) return -4;
++        /* hakios: a status stage in flight is ended too, and an armed SETUP is left armed and still
++         * counted as active: clearing its flag made CONNECTDONE start a second SETUP transfer on
++         * EP0, which the controller refuses (DEPCMD status 1, "endpoint command 0x6 FAILED: 0x1006"
++         * on the Redmi K40 after a host's suspend and reset), and the port never came back. */
++        if (d->control_state == CTRL_STATUS_IN_ACTIVE && end_transfer(d, 1)) return -4;
++        if (d->control_state == CTRL_STATUS_OUT_ACTIVE && end_transfer(d, 0)) return -4;
++        for (i = 2; i < EP_COUNT; i++) d->active[i] = 0;
++        if (d->control_state != CTRL_SETUP) d->active[0] = 0;
++        d->active[1] = 0;
++        wr(d, DWC3_DALEPENA, 3);
++        wr(d, DWC3_DCFG, rd(d, DWC3_DCFG) & ~DWC3_DCFG_DEVADDR_MASK);
++        d->control_state = CTRL_SETUP;
++        /* The next CONNECTDONE arms a new SETUP transfer. */
++        return 0;
++    }
++    if (event == DWC3_DEVT_CONNECTDONE) {
++        speed = rd(d, DWC3_DSTS) & DWC3_DSTS_CONNECTSPD;
++        if (speed != DWC3_DSTS_HIGHSPEED && speed != DWC3_DSTS_FULLSPEED1 &&
++            speed != DWC3_DSTS_FULLSPEED2) return -6;
++        d->full_speed = speed != DWC3_DSTS_HIGHSPEED;
++        d->packet_size = d->full_speed ? 64 : 512;
++        d->conn_seen = 1;
++        d->setups_since_conn = 0;
++        if (configure_ep(d, 0, DWC3_DEPCMD_TYPE_CONTROL, 64, 1) ||
++            configure_ep(d, 1, DWC3_DEPCMD_TYPE_CONTROL, 64, 1) ||
++            configure_ep(d, EP_IN, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1) ||
++            configure_ep(d, EP_OUT, DWC3_DEPCMD_TYPE_BULK, d->packet_size, 1)) return -4;
++        /* hakios: only if no SETUP is armed already (it stays armed across a reset) */
++        if (d->active[0]) { d->control_state = CTRL_SETUP; return 0; }
++        return setup_phase(d);
++    }
++    if (event == DWC3_DEVT_EVNTOVERFLOW || event == DWC3_DEVT_ERRTICERR) return -7;
++    return 0;
++}
++static int handle_event(struct dwc3 *d, uint32_t event)
++{
++    unsigned ep, type, status;
++    uint32_t residual;
++    if (event & 1u) {
++        if (((event >> 1) & 127u) == 0) return device_event(d, (event >> 8) & 15u);
++        trace(d, DWC3_TRACE_BAD_EVENT, event, 0); return 0;
++    }
++    ep = (event >> 1) & 31u;
++    type = (event >> 6) & 15u;
++    status = (event >> 12) & 15u;
++    if (ep >= EP_COUNT || ep == 2) {
++        trace(d, DWC3_TRACE_BAD_EVENT, event, 1); return 0;
++    }
++    if (type == DWC3_DEPEVT_XFERCOMPLETE) {
++        if (!d->active[ep]) return 0;
++        sync(d, trb(d, ep), 64, DWC3_FROM_DEVICE);
++        residual = trb(d, ep)->size & DWC3_TRB_SIZE_MASK;
++        d->active[ep] = 0;
++        if (status & DEPEVT_STATUS_BUSERR) return -8;
++        if (ep < 2 && DWC3_TRB_SIZE_TRBSTS(trb(d, ep)->size) == DWC3_TRBSTS_SETUP_PENDING)
++            return setup_phase(d);
++        if (ep < 2) return control_complete(d, ep, residual);
++        if (DWC3_TRB_SIZE_TRBSTS(trb(d, ep)->size) != DWC3_TRBSTS_OK) return -8;
++        if (d->fastboot && (ep == EP_OUT || ep == EP_IN)) {
++            /* hakios: the caller's transfer over (an OUT one ended early by a short packet: less was moved) */
++            unsigned in = ep == EP_IN;
++            if (residual > d->bulk_asked[in]) return -8;
++            d->bulk_moved[in] = d->bulk_asked[in] - residual;
++            d->bulk_over[in] = 1;
++            return 0;
++        }
++        if (ep == EP_OUT) {
++            if (residual > EP_BUFFER_BYTES) return -8;
++            sync(d, buffer(d, EP_OUT), EP_BUFFER_BYTES, DWC3_FROM_DEVICE);
++            rx_push(d, buffer(d, EP_OUT), EP_BUFFER_BYTES - residual);
++        }
++        if (ep == EP_IN && d->mux) {
++            /* a packet is sent whole or the transfer fails; a zero-length one carried nothing of the ring */
++            if (residual) return -8;
++            if (d->in_length) {
++                d->tx_tail = (d->tx_tail + 2u + d->in_length) % TX_BYTES;
++                d->tx_used -= 2u + d->in_length;
++                d->zlp_pending = (d->in_length % d->packet_size) == 0;
++            }
++            d->in_length = 0;
++        } else if (ep == EP_IN) {
++            if (residual > d->in_length) return -8;
++            d->tx_tail = (d->tx_tail + d->in_length - residual) % TX_BYTES;
++            d->tx_used -= d->in_length - residual;
++            d->zlp_pending = d->in_length != 0 && residual == 0 &&
++                             (d->in_length % d->packet_size) == 0;
++        }
++    } else if (type == DWC3_DEPEVT_XFERNOTREADY && !d->active[ep] && ep < 2) {
++        return control_not_ready(d, ep, status);
++    } else if (type == DWC3_DEPEVT_XFERNOTREADY && ep >= 2) {
++        /* hakios: the host tried a bulk endpoint with nothing there (after a cable was put back, the computer's usbmux
++         * never got through: was its first packet refused here, 2026-11-02?) */
++        trace(d, DWC3_TRACE_NOT_READY, ep, (uint32_t)d->active[ep] | (uint32_t)d->configured << 8 |
++              (d->rx_used < 0xffffu ? d->rx_used : 0xffffu) << 16);
++    }
++    return 0;
++}
++
++size_t dwc3_context_bytes(void) { return sizeof(struct dwc3); }
++int dwc3_init(void *context, size_t context_bytes,
++                  const struct dwc3_platform *platform,
++                  const struct dwc3_identity *identity,
++                  void *dma_cpu, uint64_t dma_device, size_t dma_bytes)
++{
++    struct dwc3 *d = context;
++    unsigned ep, interrupts, total_eps, in_eps;
++    uint32_t id, params;
++    size_t manufacturer_chars, product_chars, serial_chars;
++    if (!context || ((uintptr_t)context & 7u) || context_bytes < sizeof(*d) ||
++        !platform || !platform->read32 || !platform->write32 || !platform->delay_us ||
++        !platform->dma_sync || !platform->barrier || !dma_cpu ||
++        ((uintptr_t)dma_cpu & (DWC3_DMA_ALIGNMENT - 1)) ||
++        (dma_device & (DWC3_DMA_ALIGNMENT - 1)) ||
++        dma_device > UINT64_MAX - DWC3_DMA_BYTES || dma_bytes < DWC3_DMA_BYTES)
++        return -1;
++    if (!identity || !identity->vid || !identity->pid ||
++        !(manufacturer_chars = identity_chars(identity->manufacturer)) ||
++        !(product_chars = identity_chars(identity->product)) ||
++        !(serial_chars = identity_chars(identity->serial))) return -1;
++    zero(d, sizeof(*d)); copy(&d->io, platform, sizeof(*platform));
++    copy(d->device_descriptor, device_descriptor, sizeof(device_descriptor));
++    copy(d->qualifier, qualifier, sizeof(qualifier));
++    d->device_descriptor[8] = (uint8_t)identity->vid;
++    d->device_descriptor[9] = (uint8_t)(identity->vid >> 8);
++    d->device_descriptor[10] = (uint8_t)identity->pid;
++    d->device_descriptor[11] = (uint8_t)(identity->pid >> 8);
++    if (identity->mux == DWC3_FASTBOOT) {
++        /* hakios: class per interface, the device's release, one configuration */
++        d->fastboot = 1;
++        d->device_descriptor[4] = 0;
++        d->device_descriptor[12] = (uint8_t)identity->bcd_device;
++        d->device_descriptor[13] = (uint8_t)(identity->bcd_device >> 8);
++        d->qualifier[4] = 0;
++    } else if (identity->mux) {
++        /* hakios: class per interface (not the CDC device class), the device's release, four configurations */
++        d->mux = 1;
++        d->device_descriptor[4] = 0;
++        d->device_descriptor[12] = (uint8_t)identity->bcd_device;
++        d->device_descriptor[13] = (uint8_t)(identity->bcd_device >> 8);
++        d->device_descriptor[17] = (uint8_t)MUX_CONFIGS;
++        d->qualifier[4] = 0;
++        d->qualifier[8] = (uint8_t)MUX_CONFIGS;
++    }
++    string_descriptor(d->manufacturer, identity->manufacturer, manufacturer_chars);
++    string_descriptor(d->product, identity->product, product_chars);
++    string_descriptor(d->serial, identity->serial, serial_chars);
++    d->dma_cpu = dma_cpu; d->dma_device = dma_device;
++    d->packet_size = 512;
++    d->line_coding[0] = 0; d->line_coding[1] = 0xc2;
++    d->line_coding[2] = 1; d->line_coding[6] = 8;
++    id = rd(d, DWC3_GSNPSID); trace(d, DWC3_TRACE_ID, id, 0);
++    if ((id & 0xffff0000u) != 0x55330000u && (id & 0xffff0000u) != 0x33310000u)
++        return -2;
++    d->usb31 = (id & 0xffff0000u) == 0x33310000u;
++    params = rd(d, DWC3_GHWPARAMS3);
++    total_eps = (params >> 12) & 63u;
++    in_eps = (params >> 18) & 31u;
++    if (total_eps < EP_COUNT || in_eps < 3 || in_eps > total_eps || total_eps - in_eps < 3)
++        return -2;
++    interrupts = (rd(d, DWC3_GHWPARAMS1) >> 15) & 63u;
++    if (!interrupts || interrupts > 32) return -2;
++    wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
++    if (wait_halted(d, 0)) return -3;  /* (the rings are the previous owner's) */
++    wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) | DWC3_DCTL_CSFTRST);
++    if (wait_mask(d, DWC3_DCTL, DWC3_DCTL_CSFTRST, 0)) return -3;
++    wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0);
++    /* A previous USB owner may have left other interrupters and unacknowledged
++     * event counts. Halt precedes replacing any event-DMA mapping. */
++    for (ep = 0; ep < interrupts; ep++) {
++        wr(d, DWC3_GEVNTSIZ(ep), 1u << 31);
++        params = rd(d, DWC3_GEVNTCOUNT(ep)) & DWC3_GEVNTCOUNT_MASK;
++        wr(d, DWC3_GEVNTCOUNT(ep), params);
++        wr(d, DWC3_GEVNTADRLO(ep), 0); wr(d, DWC3_GEVNTADRHI(ep), 0);
++    }
++    zero(dma_cpu, DWC3_DMA_BYTES);
++    sync(d, dma_cpu, DWC3_DMA_BYTES, DWC3_TO_DEVICE);
++    wr(d, DWC3_GCTL, (rd(d, DWC3_GCTL) & ~(DWC3_GCTL_PRTCAPDIR(3) |
++         DWC3_GCTL_GBLHIBERNATIONEN)) | DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE));
++    wr(d, DWC3_DCFG, (rd(d, DWC3_DCFG) & ~(DWC3_DCFG_SPEED_MASK | DWC3_DCFG_DEVADDR_MASK |
++         DWC3_DCFG_LPM_CAP)) | DWC3_DCFG_HIGHSPEED);
++    wr(d, DWC3_GEVNTADRLO(0), (uint32_t)dma_device);
++    wr(d, DWC3_GEVNTADRHI(0), (uint32_t)(dma_device >> 32));
++    /* Mask the event IRQ; status still accumulates for polling. */
++    wr(d, DWC3_GEVNTSIZ(0), EVENT_BYTES | (1u << 31));
++    wr(d, DWC3_GEVNTCOUNT(0), 0);
++    wr(d, DWC3_DEVTEN, DWC3_DEVTEN_DISCONNEVTEN | DWC3_DEVTEN_USBRSTEN |
++         DWC3_DEVTEN_CONNECTDONEEN | DWC3_DEVTEN_EVNTOVERFLOWEN | DWC3_DEVTEN_ERRTICERREN);
++    if (ep_command(d, 0, DWC3_DEPCMD_DEPSTARTCFG, 0, 0, 0)) goto fail;
++    for (ep = 0; ep < EP_COUNT; ep++) {
++        if (ep == 2) continue;
++        unsigned type = ep < 2 ? DWC3_DEPCMD_TYPE_CONTROL :
++                        ep == EP_NOTIFY ? DWC3_DEPCMD_TYPE_INTR : DWC3_DEPCMD_TYPE_BULK;
++        unsigned mps = ep < 2 ? 64 : ep == EP_NOTIFY ? 16 : 512;
++        if (configure_ep(d, ep, type, mps, 0)) goto fail;
++    }
++    wr(d, DWC3_DALEPENA, 3);
++    d->initialized = 1;
++    return 0;
++fail:
++    wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0); return -4;
++}
++int dwc3_start(struct dwc3 *d)
++{
++    if (!d || !d->initialized || d->failed) return -1;
++    wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++    d->running = 1; return 0;
++}
++int dwc3_poll(struct dwc3 *d, unsigned budget)
++{
++    uint32_t bytes, event;
++    unsigned done = 0;
++    int ret = 0;
++    if (!d || !d->running || d->failed) return -1;
++    if (budget > 256) budget = 256;
++    bytes = rd(d, DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
++    if (bytes > EVENT_BYTES) { d->failed = -7; return -7; }
++    while (bytes >= 4 && done < budget) {
++        uint8_t *p = d->dma_cpu + d->event_offset;
++        sync(d, p, 4, DWC3_FROM_DEVICE);
++        event = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++                ((uint32_t)p[3] << 24);
++        d->event_offset = (d->event_offset + 4) % EVENT_BYTES;
++        ret = handle_event(d, event);
++        d->events++; d->last_event = event;
++        wr(d, DWC3_GEVNTCOUNT(0), 4);
++        done++; bytes -= 4;
++        if (ret) { d->failed = ret; return ret; }
++    }
++    ret = pump(d);
++    if (ret) { d->failed = ret; return ret; }
++    return (int)done;
++}
++/* One DWC3 error used to end the console for the rest of the boot. dwc3_poll() latches
++ * d->failed on an event-ring overflow or on any handle_event/pump error and nothing in this
++ * file clears it, so every later poll returns -1 at its first line; the debug layer turns that
++ * into IO_FAILED, its worker thread exits on the next status read, nothing drains the event
++ * ring or answers IN tokens, and the host resets the port. Observed 2026-10-28 as the CDC
++ * device leaving the USB bus at t=5 s, 35 s and 110 s in different boots, while the system
++ * kept running. Bring the controller back instead of giving up: acknowledge whatever is
++ * outstanding in the event ring so the device re-arms, restart the ring pointer, and clear
++ * the latch. dwc3_init() is not needed: the configuration, the endpoints and the DMA buffers
++ * are all still valid, only the event bookkeeping and the latch are not. */
++int dwc3_recover(struct dwc3 *d)
++{
++    unsigned ep;
++    uint32_t pending;
++    if (!d || !d->initialized) return -1;
++    d->failed = 0;
++    pending = rd(d, DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
++    if (pending) wr(d, DWC3_GEVNTCOUNT(0), pending);
++    d->event_offset = 0;
++    /* Re-run the endpoint configuration exactly as dwc3_init does. Clearing the latch alone
++     * leaves the controller on the bus with stalled endpoints: a DEPCFG or DEPSTARTCFG that
++     * never completed, or a transfer nothing ever ended. That state recovers on paper and
++     * carries no data, which is worse than the failure it hides. */
++    (void)ep_command(d, 0, DWC3_DEPCMD_DEPSTARTCFG, 0, 0, 0);
++    for (ep = 0; ep < EP_COUNT; ep++) {
++        unsigned type, mps;
++        if (ep == 2) continue;
++        type = ep < 2 ? DWC3_DEPCMD_TYPE_CONTROL :
++               ep == EP_NOTIFY ? DWC3_DEPCMD_TYPE_INTR : DWC3_DEPCMD_TYPE_BULK;
++        mps = ep < 2 ? 64 : ep == EP_NOTIFY ? 16 : 512;
++        (void)configure_ep(d, ep, type, mps, 0);
++    }
++    wr(d, DWC3_DALEPENA, 3);
++    if (!d->running) {
++        wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) | DWC3_DCTL_RUN_STOP);
++        d->running = 1;
++    }
++    d->failed = 0;
++    return 0;
++}
++size_t dwc3_queue(struct dwc3 *d, const void *bytes, size_t count)
++{
++    const uint8_t *p = bytes;
++    size_t n = count, i;
++    if (!d || !d->initialized || !bytes) return 0;
++    if (n > TX_BYTES - d->tx_used) n = TX_BYTES - d->tx_used;
++    for (i = 0; i < n; i++) { d->tx[d->tx_head] = p[i]; d->tx_head = (d->tx_head + 1) % TX_BYTES; }
++    d->tx_used += (uint32_t)n;
++    d->dropped += count - n;
++    return n;
++}
++size_t dwc3_read(struct dwc3 *d, void *bytes, size_t count)
++{
++    uint8_t *to = bytes;
++    size_t n, i;
++    if (!d || !bytes || !count) return 0;
++    n = count < d->rx_used ? count : d->rx_used;
++    for (i = 0; i < n; i++) {
++        to[i] = d->rx[d->rx_tail];
++        d->rx_tail = (d->rx_tail + 1u) % DWC3_RX_BYTES;
++    }
++    d->rx_used -= (uint32_t)n;
++    return n;
++}
++int dwc3_ready(const struct dwc3 *d)
++{
++    return d && d->running && !d->failed && d->configured && (d->dtr || d->mux || d->fastboot);
++}
++/* hakios, fastboot mode: the caller's bulk transfers (see hakios.dwc3.h) */
++int dwc3_bulk(struct dwc3 *d, int in, uint64_t dma, uint32_t bytes)
++{
++    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
++    struct dwc3_trb *t;
++    uint64_t trb_dma;
++    if (!d || !d->fastboot || !d->running || d->failed || !d->configured || d->active[ep] ||
++        bytes > DWC3_BULK_MAX || (!in && (bytes == 0 || bytes % d->packet_size))) return -1;
++    t = trb(d, ep);
++    trb_dma = d->dma_device + TRB_OFFSET + ep * 64u;
++    t->bpl = (uint32_t)dma;
++    t->bph = (uint32_t)(dma >> 32);
++    t->size = bytes;
++    t->ctrl = DWC3_TRBCTL_NORMAL | DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_ISP_IMI | DWC3_TRB_CTRL_IOC;
++    sync(d, t, 64, DWC3_TO_DEVICE);
++    d->bulk_asked[i] = bytes; d->bulk_moved[i] = 0; d->bulk_over[i] = 0;
++    if (ep_command(d, ep, DWC3_DEPCMD_STARTTRANSFER, (uint32_t)(trb_dma >> 32), (uint32_t)trb_dma, 0)) return -4;
++    d->active[ep] = 1;
++    d->bulk_running[i] = 1;
++    return 0;
++}
++int dwc3_bulk_done(struct dwc3 *d, int in, uint32_t *bytes)
++{
++    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
++    if (!d || !d->bulk_running[i]) return -1;
++    if (d->bulk_over[i]) {
++        d->bulk_running[i] = 0;
++        if (bytes) *bytes = d->bulk_moved[i];
++        return 1;
++    }
++    if (!d->active[ep]) { d->bulk_running[i] = 0; return -2; }     /* (a reset or a new configuration ended it) */
++    return 0;
++}
++int dwc3_bulk_cancel(struct dwc3 *d, int in)
++{
++    unsigned ep = in ? EP_IN : EP_OUT, i = in ? 1u : 0u;
++    if (!d) return -1;
++    d->bulk_running[i] = 0;
++    return end_transfer(d, ep);
++}
++uint32_t dwc3_packet_size(const struct dwc3 *d) { return d && d->configured ? d->packet_size : 0; }
++int dwc3_packet_room(const struct dwc3 *d, size_t count)
++{
++    return d && d->mux && count >= 1 && count <= DWC3_PACKET_MAX && TX_BYTES - d->tx_used >= count + 2u;
++}
++int dwc3_send_packet(struct dwc3 *d, const void *bytes, size_t count)
++{
++    const uint8_t *p = bytes;
++    size_t i;
++    if (!d || !d->initialized || !bytes || !dwc3_packet_room(d, count)) return -1;
++    d->tx[d->tx_head] = (uint8_t)count; d->tx_head = (d->tx_head + 1) % TX_BYTES;
++    d->tx[d->tx_head] = (uint8_t)(count >> 8); d->tx_head = (d->tx_head + 1) % TX_BYTES;
++    for (i = 0; i < count; i++) { d->tx[d->tx_head] = p[i]; d->tx_head = (d->tx_head + 1) % TX_BYTES; }
++    d->tx_used += (uint32_t)count + 2u;
++    return 0;
++}
++size_t dwc3_queued(const struct dwc3 *d) { return d ? d->tx_used : 0; }
++uint64_t dwc3_dropped(const struct dwc3 *d) { return d ? d->dropped : 0; }
++size_t dwc3_rx_pending(const struct dwc3 *d) { return d ? d->rx_used : 0; }
++uint64_t dwc3_rx_overflow(const struct dwc3 *d) { return d ? d->rx_overflow : 0; }
++uint32_t dwc3_rx_generation(const struct dwc3 *d) { return d ? d->rx_generation : 0; }
++void dwc3_snapshot(struct dwc3 *d, struct dwc3_snapshot *s)
++{
++    unsigned ep;
++    if (!d || !s) return;
++    zero(s, sizeof(*s));
++    s->events = d->events; s->commands = d->commands; s->last_event = d->last_event;
++    s->event_offset = d->event_offset; s->failed = d->failed;
++    s->snpsid = rd(d, DWC3_GSNPSID); s->gctl = rd(d, DWC3_GCTL);
++    s->dcfg = rd(d, DWC3_DCFG); s->dctl = rd(d, DWC3_DCTL); s->dsts = rd(d, DWC3_DSTS);
++    s->event_count = rd(d, DWC3_GEVNTCOUNT(0)); s->enabled_endpoints = rd(d, DWC3_DALEPENA);
++    s->configured = d->configured; s->dtr = d->dtr; s->queued = d->tx_used;
++    s->rx_pending = d->rx_used; s->rx_generation = d->rx_generation;
++    s->rx_overflow = d->rx_overflow;
++    for (ep = 0; ep < EP_COUNT; ep++) if (d->active[ep]) s->active_endpoints |= 1u << ep;
++}
++int dwc3_stop(struct dwc3 *d)
++{
++    unsigned ep;
++    if (!d || !d->initialized) return -1;
++    d->dtr = d->configured = 0;
++    rx_reset(d);
++    for (ep = 0; ep < EP_COUNT; ep++) {
++        if (ep < 2 && d->control_state != CTRL_IN_ACTIVE && d->control_state != CTRL_OUT_ACTIVE)
++            continue;
++        if (end_transfer(d, ep)) return -4;
++    }
++    wr(d, DWC3_DEVTEN, 0); wr(d, DWC3_DALEPENA, 0);
++    wr(d, DWC3_DCTL, rd(d, DWC3_DCTL) & ~DWC3_DCTL_RUN_STOP);
++    if (wait_halted(d, 1)) return -3;
++    d->running = 0; return 0;
++}
+diff --git a/bsd/dev/hakios.dwc3.h b/bsd/dev/hakios.dwc3.h
+new file mode 100644
+index 0000000..c0b6846
+--- /dev/null
++++ b/bsd/dev/hakios.dwc3.h
+@@ -0,0 +1,128 @@
++/* hakios: FFT-infra/QcomXnuUsbDebug usb/Dwc3.h at ab6e363, unchanged. */
++/* SPDX-License-Identifier: MIT */
++#ifndef DWC3_H
++#define DWC3_H
++#include <stddef.h>
++#include <stdint.h>
++
++/* One caller-owned, contiguous device-DMA mapping. Never assume DMA == PA. */
++#define DWC3_DMA_BYTES 32768u
++#define DWC3_DMA_ALIGNMENT 4096u
++#define DWC3_CONTEXT_ALIGNMENT 8u
++#define DWC3_CONTEXT_BYTES 40960u
++#define DWC3_TX_BYTES 16384u
++#define DWC3_RX_BYTES 16384u
++/* hakios: in mux mode one packet (what one dwc3_send_packet() gives) is one USB transfer, at most this long */
++#define DWC3_PACKET_MAX 4096u
++
++/* Copied at init; no SoC configuration, OS headers or platform IDs here.
++ * Each string must contain 1..63 printable ASCII characters (hakios: 63, for a 40-character UDID).
++ * hakios: mux != 0 -- not the serial port but what an iPhone shows: one vendor interface (class 0xff,
++ * subclass 0xfe, protocol 2: Apple's usbmux) as interface 1 beside an empty interface 0, bulk OUT 0x02
++ * and IN 0x82, configurations 1 to 4 alike, and packets (dwc3_send_packet()) instead of a byte stream. */
++struct dwc3_identity {
++    uint16_t vid, pid;
++    const char *manufacturer, *product, *serial;
++    int mux;
++    uint16_t bcd_device;
++};
++/* hakios: mux == DWC3_FASTBOOT -- Android's fastboot (the loader's link): one vendor interface (class 0xff, subclass
++ * 0x42, protocol 3), bulk OUT 0x02 and IN 0x82, one configuration. Nothing is armed by itself: each bulk transfer is
++ * started by the caller into or out of memory of its own (dwc3_bulk()) and seen to end (dwc3_bulk_done()). */
++#define DWC3_FASTBOOT 2
++/* one bulk transfer at most (a TRB's size field has 24 bits), a multiple of 4096 */
++#define DWC3_BULK_MAX 0x00fff000u
++
++enum dwc3_sync_direction {
++    DWC3_TO_DEVICE,
++    DWC3_FROM_DEVICE
++};
++
++enum dwc3_trace {
++    DWC3_TRACE_ID = 1,
++    DWC3_TRACE_TIMEOUT,
++    DWC3_TRACE_COMMAND,
++    DWC3_TRACE_DEVICE_EVENT,
++    DWC3_TRACE_SETUP,
++    DWC3_TRACE_UNSUPPORTED,
++    DWC3_TRACE_BAD_EVENT,
++    DWC3_TRACE_READY,
++    DWC3_TRACE_STUCK,      /* hakios: bus resets with no request between them: the device side from scratch */
++    DWC3_TRACE_CONFIGURED, /* hakios: SET_CONFIGURATION (a: the value, b: mux mode) */
++    DWC3_TRACE_ARMED,      /* hakios: a bulk OUT transfer started (a: the endpoint, b: bytes in the RX ring) */
++    DWC3_TRACE_NOT_READY   /* hakios: the host tried a bulk endpoint with no transfer there (a: the endpoint,
++                              b: active | configured << 8 | MIN(rx_used, 0xffff) << 16) */
++};
++
++struct dwc3_platform {
++    void *cookie;
++    uint32_t (*read32)(void *cookie, uint32_t offset);
++    void (*write32)(void *cookie, uint32_t offset, uint32_t value);
++    void (*delay_us)(void *cookie, uint32_t usec);
++    /* Must also handle noncoherent DMA. Event/TRB cache lines are separate. */
++    void (*dma_sync)(void *cookie, void *cpu, size_t bytes,
++                     enum dwc3_sync_direction direction);
++    void (*barrier)(void *cookie);
++    void (*trace)(void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b);
++};
++
++struct dwc3;
++size_t dwc3_context_bytes(void);
++/* Platform must have already established device role, PHY/clocks, power and
++ * SMMU mapping. This resets only the DWC device side; it never initializes PHY.
++ * Buffers must remain mapped at the same CPU/DMA addresses for this instance.
++ * Returns 0 or a negative code. On failure controller is left stopped. */
++int dwc3_init(void *context, size_t context_bytes,
++                  const struct dwc3_platform *platform,
++                  const struct dwc3_identity *identity,
++                  void *dma_cpu, uint64_t dma_device, size_t dma_bytes);
++int dwc3_start(struct dwc3 *dev);
++/* Each poll is bounded to min(budget, 256) events. Call from one CPU only;
++ * no interrupts, allocation, scheduler, EFI or platform-library calls occur. */
++int dwc3_poll(struct dwc3 *dev, unsigned int budget);
++/* Nonblocking ring; accepts early messages before the host opens the port. */
++size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
++/* hakios, mux mode: one packet (1..DWC3_PACKET_MAX bytes) queued whole, or not at all: returns 0 or -1 (no room). */
++int dwc3_send_packet(struct dwc3 *dev, const void *bytes, size_t count);
++/* hakios, mux mode: room for one more packet of that size */
++int dwc3_packet_room(const struct dwc3 *dev, size_t count);
++/* Nonblocking bulk-OUT receive ring. The caller must serialize this with poll
++ * on the same CPU. A device reset/disconnect clears pending RX bytes and
++ * advances rx_generation so a protocol parser can invalidate its state. */
++size_t dwc3_read(struct dwc3 *dev, void *bytes, size_t count);
++int dwc3_ready(const struct dwc3 *dev);
++size_t dwc3_queued(const struct dwc3 *dev);
++uint64_t dwc3_dropped(const struct dwc3 *dev);
++size_t dwc3_rx_pending(const struct dwc3 *dev);
++uint64_t dwc3_rx_overflow(const struct dwc3 *dev);
++uint32_t dwc3_rx_generation(const struct dwc3 *dev);
++struct dwc3_snapshot {
++    uint32_t events, commands, last_event, event_offset;
++    uint32_t snpsid, gctl, dcfg, dctl, dsts, event_count, enabled_endpoints;
++    uint32_t configured, dtr, queued, active_endpoints;
++    uint32_t rx_pending, rx_generation;
++    uint64_t rx_overflow;
++    int32_t failed;
++};
++/* Read-only diagnostics, for callers that already own powered MMIO access. */
++void dwc3_snapshot(struct dwc3 *dev, struct dwc3_snapshot *snapshot);
++/* hakios, fastboot mode: one bulk transfer started -- in (to the host) from `dma`, or out (from the host) into it;
++ * out, `bytes` is a multiple of the packet size, and a short packet ends it early. The memory stays the caller's
++ * to keep, and to clean or invalidate in its caches; it is not touched here. 0, or negative: one runs already in
++ * that direction, the device is not configured, or the size will not do. */
++int dwc3_bulk(struct dwc3 *dev, int in, uint64_t dma, uint32_t bytes);
++/* 1 and the bytes moved once it is over; 0 while it runs; negative if none runs or a reset ended it */
++int dwc3_bulk_done(struct dwc3 *dev, int in, uint32_t *bytes);
++/* A running one ended: its memory is the caller's again. */
++int dwc3_bulk_cancel(struct dwc3 *dev, int in);
++/* The packet size of the bulk endpoints now (512 at high speed, 64 at full); 0 while not configured. */
++uint32_t dwc3_packet_size(const struct dwc3 *dev);
++/* Stops DMA. Do not release mapping until this succeeds. */
++int dwc3_stop(struct dwc3 *dev);
++int dwc3_recover(struct dwc3 *dev);
++
++/* Descriptor view for host conformance tests and the firmware USB backend.
++ * type uses USB descriptor IDs; full_speed selects bulk wMaxPacketSize=64. */
++const void *dwc3_descriptor(const struct dwc3 *dev, unsigned int type, unsigned int index,
++                               int full_speed, size_t *length);
++#endif
+diff --git a/bsd/dev/hakios.dwc3regs.h b/bsd/dev/hakios.dwc3regs.h
+new file mode 100644
+index 0000000..8270f66
+--- /dev/null
++++ b/bsd/dev/hakios.dwc3regs.h
+@@ -0,0 +1,633 @@
++/* hakios: FFT-infra/QcomXnuUsbDebug usb/Dwc3Regs.h at ab6e363, unchanged. */
++/**
++ * core.h - DesignWare USB3 DRD Core Header
++ * linux commit 7bc5a6ba369217e0137833f5955cf0b0f08b0712 before
++ * the switch to GPLv2 only
++ *
++ * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
++ *
++ * Authors: Felipe Balbi <balbi@ti.com>,
++ *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the above-listed copyright holders may not be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") version 2, as published by the Free
++ * Software Foundation.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
++ * IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
++ * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef __DRIVERS_USB_DWC3_CORE_H
++#define __DRIVERS_USB_DWC3_CORE_H
++
++#include <stdint.h>
++typedef uint32_t u32;
++#ifndef PACKED
++#define PACKED __attribute__((packed))
++#endif
++#ifndef BIT
++#define BIT(n) (1u << (n))
++#endif
++
++/* Global constants */
++#define DWC3_EP0_BOUNCE_SIZE    512
++#define DWC3_ENDPOINTS_NUM      32
++#define DWC3_XHCI_RESOURCES_NUM 2
++
++#define DWC3_EVENT_SIZE         4  /* bytes */
++#define DWC3_EVENT_MAX_NUM      64 /* 2 events/endpoint */
++#define DWC3_EVENT_BUFFERS_SIZE (DWC3_EVENT_SIZE * DWC3_EVENT_MAX_NUM)
++#define DWC3_EVENT_TYPE_MASK    0xfe
++
++#define DWC3_EVENT_TYPE_DEV    0
++#define DWC3_EVENT_TYPE_CARKIT 3
++#define DWC3_EVENT_TYPE_I2C    4
++
++#define DWC3_DEVICE_EVENT_DISCONNECT         0
++#define DWC3_DEVICE_EVENT_RESET              1
++#define DWC3_DEVICE_EVENT_CONNECT_DONE       2
++#define DWC3_DEVICE_EVENT_LINK_STATUS_CHANGE 3
++#define DWC3_DEVICE_EVENT_WAKEUP             4
++#define DWC3_DEVICE_EVENT_HIBER_REQ          5
++#define DWC3_DEVICE_EVENT_EOPF               6
++#define DWC3_DEVICE_EVENT_SOF                7
++#define DWC3_DEVICE_EVENT_ERRATIC_ERROR      9
++#define DWC3_DEVICE_EVENT_CMD_CMPL           10
++#define DWC3_DEVICE_EVENT_OVERFLOW           11
++
++#define DWC3_GEVNTCOUNT_MASK 0xfffc
++#define DWC3_GSNPSID_MASK    0xffff0000
++#define DWC3_GSNPSREV_MASK   0xffff
++
++/* DWC3 registers memory space boundaries */
++#define DWC3_XHCI_REGS_START    0x0
++#define DWC3_XHCI_REGS_END      0x7fff
++#define DWC3_GLOBALS_REGS_START 0xc100
++#define DWC3_GLOBALS_REGS_END   0xc6ff
++#define DWC3_DEVICE_REGS_START  0xc700
++#define DWC3_DEVICE_REGS_END    0xcbff
++#define DWC3_OTG_REGS_START     0xcc00
++#define DWC3_OTG_REGS_END       0xccff
++
++/* Global Registers */
++#define DWC3_GSBUSCFG0     0xc100
++#define DWC3_GSBUSCFG1     0xc104
++#define DWC3_GTXTHRCFG     0xc108
++#define DWC3_GRXTHRCFG     0xc10c
++#define DWC3_GCTL          0xc110
++#define DWC3_GEVTEN        0xc114
++#define DWC3_GSTS          0xc118
++#define DWC3_GSNPSID       0xc120
++#define DWC3_GGPIO         0xc124
++#define DWC3_GUID          0xc128
++#define DWC3_GUCTL         0xc12c
++#define DWC3_GBUSERRADDR0  0xc130
++#define DWC3_GBUSERRADDR1  0xc134
++#define DWC3_GPRTBIMAP0    0xc138
++#define DWC3_GPRTBIMAP1    0xc13c
++#define DWC3_GHWPARAMS0    0xc140
++#define DWC3_GHWPARAMS1    0xc144
++#define DWC3_GHWPARAMS2    0xc148
++#define DWC3_GHWPARAMS3    0xc14c
++#define DWC3_GHWPARAMS4    0xc150
++#define DWC3_GHWPARAMS5    0xc154
++#define DWC3_GHWPARAMS6    0xc158
++#define DWC3_GHWPARAMS7    0xc15c
++#define DWC3_GDBGFIFOSPACE 0xc160
++#define DWC3_GDBGLTSSM     0xc164
++#define DWC3_GPRTBIMAP_HS0 0xc180
++#define DWC3_GPRTBIMAP_HS1 0xc184
++#define DWC3_GPRTBIMAP_FS0 0xc188
++#define DWC3_GPRTBIMAP_FS1 0xc18c
++
++#define DWC3_GUSB2PHYCFG(n) (0xc200 + (n * 0x04))
++#define DWC3_GUSB2I2CCTL(n) (0xc240 + (n * 0x04))
++
++#define DWC3_GUSB2PHYACC(n) (0xc280 + (n * 0x04))
++
++#define DWC3_GUSB3PIPECTL(n) (0xc2c0 + (n * 0x04))
++
++#define DWC3_GTXFIFOSIZ(n) (0xc300 + (n * 0x04))
++#define DWC3_GRXFIFOSIZ(n) (0xc380 + (n * 0x04))
++
++#define DWC3_GEVNTADRLO(n) (0xc400 + (n * 0x10))
++#define DWC3_GEVNTADRHI(n) (0xc404 + (n * 0x10))
++#define DWC3_GEVNTSIZ(n)   (0xc408 + (n * 0x10))
++#define DWC3_GEVNTCOUNT(n) (0xc40c + (n * 0x10))
++
++#define DWC3_GHWPARAMS8 0xc600
++
++/* Device Registers */
++#define DWC3_DCFG          0xc700
++#define DWC3_DCTL          0xc704
++#define DWC3_DEVTEN        0xc708
++#define DWC3_DSTS          0xc70c
++#define DWC3_DGCMDPAR      0xc710
++#define DWC3_DGCMD         0xc714
++#define DWC3_DALEPENA      0xc720
++#define DWC3_DEPCMDPAR2(n) (0xc800 + (n * 0x10))
++#define DWC3_DEPCMDPAR1(n) (0xc804 + (n * 0x10))
++#define DWC3_DEPCMDPAR0(n) (0xc808 + (n * 0x10))
++#define DWC3_DEPCMD(n)     (0xc80c + (n * 0x10))
++
++/* OTG Registers */
++#define DWC3_OCFG   0xcc00
++#define DWC3_OCTL   0xcc04
++#define DWC3_OEVT   0xcc08
++#define DWC3_OEVTEN 0xcc0C
++#define DWC3_OSTS   0xcc10
++
++/* Bit fields */
++
++/* Global Configuration Register */
++#define DWC3_GCTL_PWRDNSCALE(n) ((n) << 19)
++#define DWC3_GCTL_U2RSTECN      (1u << 16)
++#define DWC3_GCTL_RAMCLKSEL(x)  (((x) & DWC3_GCTL_CLK_MASK) << 6)
++#define DWC3_GCTL_CLK_BUS       (0)
++#define DWC3_GCTL_CLK_PIPE      (1)
++#define DWC3_GCTL_CLK_PIPEHALF  (2)
++#define DWC3_GCTL_CLK_MASK      (3)
++
++#define DWC3_GCTL_PRTCAP(n)     (((n) & (3u << 12)) >> 12)
++#define DWC3_GCTL_PRTCAPDIR(n)  ((n) << 12)
++#define DWC3_GCTL_PRTCAP_HOST   1
++#define DWC3_GCTL_PRTCAP_DEVICE 2
++#define DWC3_GCTL_PRTCAP_OTG    3
++
++#define DWC3_GCTL_CORESOFTRESET    (1u << 11)
++#define DWC3_GCTL_SCALEDOWN(n)     ((n) << 4)
++#define DWC3_GCTL_SCALEDOWN_MASK   DWC3_GCTL_SCALEDOWN(3)
++#define DWC3_GCTL_DISSCRAMBLE      (1u << 3)
++#define DWC3_GCTL_GBLHIBERNATIONEN (1u << 1)
++#define DWC3_GCTL_DSBLCLKGTNG      (1u << 0)
++
++/* Global USB2 PHY Configuration Register */
++#define DWC3_GUSB2PHYCFG_PHYSOFTRST (1u << 31)
++#define DWC3_GUSB2PHYCFG_SUSPHY     (1u << 6)
++
++/* Global USB3 PIPE Control Register */
++#define DWC3_GUSB3PIPECTL_PHYSOFTRST (1u << 31)
++#define DWC3_GUSB3PIPECTL_SUSPHY     (1u << 17)
++
++/* Global TX Fifo Size Register */
++#define DWC3_GTXFIFOSIZ_TXFDEF(n)    ((n) & 0xffff)
++#define DWC3_GTXFIFOSIZ_TXFSTADDR(n) ((n) & 0xffff0000)
++
++/* Global HWPARAMS1 Register */
++#define DWC3_GHWPARAMS1_EN_PWROPT(n)  (((n) & (3u << 24)) >> 24)
++#define DWC3_GHWPARAMS1_EN_PWROPT_NO  0
++#define DWC3_GHWPARAMS1_EN_PWROPT_CLK 1
++#define DWC3_GHWPARAMS1_EN_PWROPT_HIB 2
++#define DWC3_GHWPARAMS1_PWROPT(n)     ((n) << 24)
++#define DWC3_GHWPARAMS1_PWROPT_MASK   DWC3_GHWPARAMS1_PWROPT(3)
++
++/* Global HWPARAMS4 Register */
++#define DWC3_GHWPARAMS4_HIBER_SCRATCHBUFS(n) (((n) & (0x0fu << 13)) >> 13)
++#define DWC3_MAX_HIBER_SCRATCHBUFS           15
++
++/* Device Configuration Register */
++#define DWC3_DCFG_LPM_CAP       (1u << 22)
++#define DWC3_DCFG_DEVADDR(addr) ((addr) << 3)
++#define DWC3_DCFG_DEVADDR_MASK  DWC3_DCFG_DEVADDR(0x7f)
++
++#define DWC3_DCFG_SPEED_MASK (7u << 0)
++#define DWC3_DCFG_SUPERSPEED (4u << 0)
++#define DWC3_DCFG_HIGHSPEED  (0u << 0)
++#define DWC3_DCFG_FULLSPEED2 (1u << 0)
++#define DWC3_DCFG_LOWSPEED   (2u << 0)
++#define DWC3_DCFG_FULLSPEED1 (3u << 0)
++
++#define DWC3_DCFG_LPM_CAP (1u << 22)
++
++/* Device Control Register */
++#define DWC3_DCTL_RUN_STOP (1u << 31)
++#define DWC3_DCTL_CSFTRST  (1u << 30)
++#define DWC3_DCTL_LSFTRST  (1u << 29)
++
++#define DWC3_DCTL_HIRD_THRES_MASK (0x1fu << 24)
++#define DWC3_DCTL_HIRD_THRES(n)   ((n) << 24)
++
++#define DWC3_DCTL_APPL1RES (1u << 23)
++
++/* These apply for core versions 1.87a and earlier */
++#define DWC3_DCTL_TRGTULST_MASK     (0x0fu << 17)
++#define DWC3_DCTL_TRGTULST(n)       ((n) << 17)
++#define DWC3_DCTL_TRGTULST_U2       (DWC3_DCTL_TRGTULST(2))
++#define DWC3_DCTL_TRGTULST_U3       (DWC3_DCTL_TRGTULST(3))
++#define DWC3_DCTL_TRGTULST_SS_DIS   (DWC3_DCTL_TRGTULST(4))
++#define DWC3_DCTL_TRGTULST_RX_DET   (DWC3_DCTL_TRGTULST(5))
++#define DWC3_DCTL_TRGTULST_SS_INACT (DWC3_DCTL_TRGTULST(6))
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DCTL_KEEP_CONNECT (1u << 19)
++#define DWC3_DCTL_L1_HIBER_EN  (1u << 18)
++#define DWC3_DCTL_CRS          (1u << 17)
++#define DWC3_DCTL_CSS          (1u << 16)
++
++#define DWC3_DCTL_INITU2ENA    (1u << 12)
++#define DWC3_DCTL_ACCEPTU2ENA  (1u << 11)
++#define DWC3_DCTL_INITU1ENA    (1u << 10)
++#define DWC3_DCTL_ACCEPTU1ENA  (1u << 9)
++#define DWC3_DCTL_TSTCTRL_MASK (0xfu << 1)
++
++#define DWC3_DCTL_ULSTCHNGREQ_MASK (0x0fu << 5)
++#define DWC3_DCTL_ULSTCHNGREQ(n)   (((n) << 5) & DWC3_DCTL_ULSTCHNGREQ_MASK)
++
++#define DWC3_DCTL_ULSTCHNG_NO_ACTION   (DWC3_DCTL_ULSTCHNGREQ(0))
++#define DWC3_DCTL_ULSTCHNG_SS_DISABLED (DWC3_DCTL_ULSTCHNGREQ(4))
++#define DWC3_DCTL_ULSTCHNG_RX_DETECT   (DWC3_DCTL_ULSTCHNGREQ(5))
++#define DWC3_DCTL_ULSTCHNG_SS_INACTIVE (DWC3_DCTL_ULSTCHNGREQ(6))
++#define DWC3_DCTL_ULSTCHNG_RECOVERY    (DWC3_DCTL_ULSTCHNGREQ(8))
++#define DWC3_DCTL_ULSTCHNG_COMPLIANCE  (DWC3_DCTL_ULSTCHNGREQ(10))
++#define DWC3_DCTL_ULSTCHNG_LOOPBACK    (DWC3_DCTL_ULSTCHNGREQ(11))
++
++/* Device Event Enable Register */
++#define DWC3_DEVTEN_VNDRDEVTSTRCVEDEN   (1u << 12)
++#define DWC3_DEVTEN_EVNTOVERFLOWEN      (1u << 11)
++#define DWC3_DEVTEN_CMDCMPLTEN          (1u << 10)
++#define DWC3_DEVTEN_ERRTICERREN         (1u << 9)
++#define DWC3_DEVTEN_SOFEN               (1u << 7)
++#define DWC3_DEVTEN_EOPFEN              (1u << 6)
++#define DWC3_DEVTEN_HIBERNATIONREQEVTEN (1u << 5)
++#define DWC3_DEVTEN_WKUPEVTEN           (1u << 4)
++#define DWC3_DEVTEN_ULSTCNGEN           (1u << 3)
++#define DWC3_DEVTEN_CONNECTDONEEN       (1u << 2)
++#define DWC3_DEVTEN_USBRSTEN            (1u << 1)
++#define DWC3_DEVTEN_DISCONNEVTEN        (1u << 0)
++
++/* Device Status Register */
++#define DWC3_DSTS_DCNRD (1u << 29)
++
++/* This applies for core versions 1.87a and earlier */
++#define DWC3_DSTS_PWRUPREQ (1u << 24)
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DSTS_RSS (1u << 25)
++#define DWC3_DSTS_SSS (1u << 24)
++
++#define DWC3_DSTS_COREIDLE   (1u << 23)
++#define DWC3_DSTS_DEVCTRLHLT (1u << 22)
++
++#define DWC3_DSTS_USBLNKST_MASK (0x0fu << 18)
++#define DWC3_DSTS_USBLNKST(n)   (((n) & DWC3_DSTS_USBLNKST_MASK) >> 18)
++
++#define DWC3_DSTS_RXFIFOEMPTY (1u << 17)
++
++#define DWC3_DSTS_SOFFN_MASK (0x3fffu << 3)
++#define DWC3_DSTS_SOFFN(n)   (((n) & DWC3_DSTS_SOFFN_MASK) >> 3)
++
++#define DWC3_DSTS_CONNECTSPD (7u << 0)
++
++#define DWC3_DSTS_SUPERSPEED (4u << 0)
++#define DWC3_DSTS_HIGHSPEED  (0u << 0)
++#define DWC3_DSTS_FULLSPEED2 (1u << 0)
++#define DWC3_DSTS_LOWSPEED   (2u << 0)
++#define DWC3_DSTS_FULLSPEED1 (3u << 0)
++
++/* Device Generic Command Register */
++#define DWC3_DGCMD_SET_LMP          0x01
++#define DWC3_DGCMD_SET_PERIODIC_PAR 0x02
++#define DWC3_DGCMD_XMIT_FUNCTION    0x03
++
++/* These apply for core versions 1.94a and later */
++#define DWC3_DGCMD_SET_SCRATCHPAD_ADDR_LO 0x04
++#define DWC3_DGCMD_SET_SCRATCHPAD_ADDR_HI 0x05
++
++#define DWC3_DGCMD_SELECTED_FIFO_FLUSH  0x09
++#define DWC3_DGCMD_ALL_FIFO_FLUSH       0x0a
++#define DWC3_DGCMD_SET_ENDPOINT_NRDY    0x0c
++#define DWC3_DGCMD_RUN_SOC_BUS_LOOPBACK 0x10
++
++#define DWC3_DGCMD_STATUS(n) (((n) >> 15) & 1)
++#define DWC3_DGCMD_CMDACT    (1u << 10)
++#define DWC3_DGCMD_CMDIOC    (1u << 8)
++
++/* Device Generic Command Parameter Register */
++#define DWC3_DGCMDPAR_FORCE_LINKPM_ACCEPT (1u << 0)
++#define DWC3_DGCMDPAR_FIFO_NUM(n)         ((n) << 0)
++#define DWC3_DGCMDPAR_RX_FIFO             (0u << 5)
++#define DWC3_DGCMDPAR_TX_FIFO             (1u << 5)
++#define DWC3_DGCMDPAR_LOOPBACK_DIS        (0u << 0)
++#define DWC3_DGCMDPAR_LOOPBACK_ENA        (1u << 0)
++
++/* Device Endpoint Command Register */
++#define DWC3_DEPCMD_PARAM_SHIFT    16
++#define DWC3_DEPCMD_PARAM(x)       ((x) << DWC3_DEPCMD_PARAM_SHIFT)
++#define DWC3_DEPCMD_GET_RSC_IDX(x) (((x) >> DWC3_DEPCMD_PARAM_SHIFT) & 0x7f)
++#define DWC3_DEPCMD_STATUS(x)      (((x) >> 15) & 1)
++#define DWC3_DEPCMD_HIPRI_FORCERM  (1u << 11)
++#define DWC3_DEPCMD_CMDACT         (1u << 10)
++#define DWC3_DEPCMD_CMDIOC         (1u << 8)
++
++#define DWC3_DEPCMD_DEPSTARTCFG    (0x09u << 0)
++#define DWC3_DEPCMD_ENDTRANSFER    (0x08u << 0)
++#define DWC3_DEPCMD_UPDATETRANSFER (0x07u << 0)
++#define DWC3_DEPCMD_STARTTRANSFER  (0x06u << 0)
++#define DWC3_DEPCMD_CLEARSTALL     (0x05u << 0)
++#define DWC3_DEPCMD_SETSTALL       (0x04u << 0)
++/* This applies for core versions 1.90a and earlier */
++#define DWC3_DEPCMD_GETSEQNUMBER (0x03u << 0)
++/* This applies for core versions 1.94a and later */
++#define DWC3_DEPCMD_GETEPSTATE        (0x03u << 0)
++#define DWC3_DEPCMD_SETTRANSFRESOURCE (0x02u << 0)
++#define DWC3_DEPCMD_SETEPCONFIG       (0x01u << 0)
++
++/* The EP number goes 0..31 so ep0 is always out and ep1 is always in */
++#define DWC3_DALEPENA_EP(n) (1u << n)
++
++#define DWC3_DEPCMD_TYPE_CONTROL 0
++#define DWC3_DEPCMD_TYPE_ISOC    1
++#define DWC3_DEPCMD_TYPE_BULK    2
++#define DWC3_DEPCMD_TYPE_INTR    3
++
++#define DWC3_EVENT_PENDING BIT(0)
++
++#define DWC3_EP_FLAG_STALLED (1u << 0)
++#define DWC3_EP_FLAG_WEDGED  (1u << 1)
++
++#define DWC3_EP_DIRECTION_TX true
++#define DWC3_EP_DIRECTION_RX false
++
++#define DWC3_TRB_NUM  32
++#define DWC3_TRB_MASK (DWC3_TRB_NUM - 1)
++
++#define DWC3_EP_ENABLED         (1u << 0)
++#define DWC3_EP_STALL           (1u << 1)
++#define DWC3_EP_WEDGE           (1u << 2)
++#define DWC3_EP_BUSY            (1u << 4)
++#define DWC3_EP_PENDING_REQUEST (1u << 5)
++#define DWC3_EP_MISSED_ISOC     (1u << 6)
++
++/* This last one is specific to EP0 */
++#define DWC3_EP0_DIR_IN (1u << 31)
++
++enum dwc3_link_state {
++    /* In SuperSpeed */
++    DWC3_LINK_STATE_U0 = 0x00, /* in HS, means ON */
++    DWC3_LINK_STATE_U1 = 0x01,
++    DWC3_LINK_STATE_U2 = 0x02, /* in HS, means SLEEP */
++    DWC3_LINK_STATE_U3 = 0x03, /* in HS, means SUSPEND */
++    DWC3_LINK_STATE_SS_DIS = 0x04,
++    DWC3_LINK_STATE_RX_DET = 0x05, /* in HS, means Early Suspend */
++    DWC3_LINK_STATE_SS_INACT = 0x06,
++    DWC3_LINK_STATE_POLL = 0x07,
++    DWC3_LINK_STATE_RECOV = 0x08,
++    DWC3_LINK_STATE_HRESET = 0x09,
++    DWC3_LINK_STATE_CMPLY = 0x0a,
++    DWC3_LINK_STATE_LPBK = 0x0b,
++    DWC3_LINK_STATE_RESET = 0x0e,
++    DWC3_LINK_STATE_RESUME = 0x0f,
++    DWC3_LINK_STATE_MASK = 0x0f,
++};
++
++/* TRB Length, PCM and Status */
++#define DWC3_TRB_SIZE_MASK      (0x00ffffff)
++#define DWC3_TRB_SIZE_LENGTH(n) ((n) & DWC3_TRB_SIZE_MASK)
++#define DWC3_TRB_SIZE_PCM1(n)   (((n) & 0x03) << 24)
++#define DWC3_TRB_SIZE_TRBSTS(n) (((n) & (0x0fu << 28)) >> 28)
++
++#define DWC3_TRBSTS_OK            0
++#define DWC3_TRBSTS_MISSED_ISOC   1
++#define DWC3_TRBSTS_SETUP_PENDING 2
++#define DWC3_TRB_STS_XFER_IN_PROG 4
++
++/* TRB Control */
++#define DWC3_TRB_CTRL_HWO         (1u << 0)
++#define DWC3_TRB_CTRL_LST         (1u << 1)
++#define DWC3_TRB_CTRL_CHN         (1u << 2)
++#define DWC3_TRB_CTRL_CSP         (1u << 3)
++#define DWC3_TRB_CTRL_TRBCTL(n)   (((n) & 0x3f) << 4)
++#define DWC3_TRB_CTRL_ISP_IMI     (1u << 10)
++#define DWC3_TRB_CTRL_IOC         (1u << 11)
++#define DWC3_TRB_CTRL_SID_SOFN(n) (((n) & 0xffff) << 14)
++
++#define DWC3_TRBCTL_NORMAL            DWC3_TRB_CTRL_TRBCTL(1)
++#define DWC3_TRBCTL_CONTROL_SETUP     DWC3_TRB_CTRL_TRBCTL(2)
++#define DWC3_TRBCTL_CONTROL_STATUS2   DWC3_TRB_CTRL_TRBCTL(3)
++#define DWC3_TRBCTL_CONTROL_STATUS3   DWC3_TRB_CTRL_TRBCTL(4)
++#define DWC3_TRBCTL_CONTROL_DATA      DWC3_TRB_CTRL_TRBCTL(5)
++#define DWC3_TRBCTL_ISOCHRONOUS_FIRST DWC3_TRB_CTRL_TRBCTL(6)
++#define DWC3_TRBCTL_ISOCHRONOUS       DWC3_TRB_CTRL_TRBCTL(7)
++#define DWC3_TRBCTL_LINK_TRB          DWC3_TRB_CTRL_TRBCTL(8)
++
++/**
++ * struct dwc3_trb - transfer request block (hw format)
++ * @bpl: DW0-3
++ * @bph: DW4-7
++ * @size: DW8-B
++ * @trl: DWC-F
++ */
++struct dwc3_trb {
++    u32 bpl;
++    u32 bph;
++    u32 size;
++    u32 ctrl;
++} PACKED;
++
++/* HWPARAMS0 */
++#define DWC3_MODE(n) ((n) & 0x7)
++
++#define DWC3_MODE_DEVICE 0
++#define DWC3_MODE_HOST   1
++#define DWC3_MODE_DRD    2
++#define DWC3_MODE_HUB    3
++
++#define DWC3_MDWIDTH(n) (((n) & 0xff00) >> 8)
++
++/* HWPARAMS1 */
++#define DWC3_NUM_INT(n) (((n) & (0x3fu << 15)) >> 15)
++
++/* HWPARAMS3 */
++#define DWC3_NUM_IN_EPS_MASK (0x1fu << 18)
++#define DWC3_NUM_EPS_MASK    (0x3fu << 12)
++#define DWC3_NUM_EPS(p)      (((p)->hwparams3 & (DWC3_NUM_EPS_MASK)) >> 12)
++#define DWC3_NUM_IN_EPS(p)   (((p)->hwparams3 & (DWC3_NUM_IN_EPS_MASK)) >> 18)
++
++/* HWPARAMS7 */
++#define DWC3_RAM1_DEPTH(n) ((n) & 0xffff)
++
++#define DWC3_REVISION_173A 0x5533173a
++#define DWC3_REVISION_175A 0x5533175a
++#define DWC3_REVISION_180A 0x5533180a
++#define DWC3_REVISION_183A 0x5533183a
++#define DWC3_REVISION_185A 0x5533185a
++#define DWC3_REVISION_187A 0x5533187a
++#define DWC3_REVISION_188A 0x5533188a
++#define DWC3_REVISION_190A 0x5533190a
++#define DWC3_REVISION_194A 0x5533194a
++#define DWC3_REVISION_200A 0x5533200a
++#define DWC3_REVISION_202A 0x5533202a
++#define DWC3_REVISION_210A 0x5533210a
++#define DWC3_REVISION_220A 0x5533220a
++#define DWC3_REVISION_230A 0x5533230a
++#define DWC3_REVISION_240A 0x5533240a
++#define DWC3_REVISION_250A 0x5533250a
++
++/* -------------------------------------------------------------------------- */
++
++/* -------------------------------------------------------------------------- */
++
++struct dwc3_event_type {
++    u32 is_devspec : 1;
++    u32 type : 7;
++    u32 reserved8_31 : 24;
++} PACKED;
++
++#define DWC3_DEPEVT_XFERCOMPLETE   0x01
++#define DWC3_DEPEVT_XFERINPROGRESS 0x02
++#define DWC3_DEPEVT_XFERNOTREADY   0x03
++#define DWC3_DEPEVT_RXTXFIFOEVT    0x04
++#define DWC3_DEPEVT_STREAMEVT      0x06
++#define DWC3_DEPEVT_EPCMDCMPLT     0x07
++
++/**
++ * struct dwc3_event_depvt - Device Endpoint Events
++ * @one_bit: indicates this is an endpoint event (not used)
++ * @endpoint_number: number of the endpoint
++ * @endpoint_event: The event we have:
++ *	0x00	- Reserved
++ *	0x01	- XferComplete
++ *	0x02	- XferInProgress
++ *	0x03	- XferNotReady
++ *	0x04	- RxTxFifoEvt (IN->Underrun, OUT->Overrun)
++ *	0x05	- Reserved
++ *	0x06	- StreamEvt
++ *	0x07	- EPCmdCmplt
++ * @reserved11_10: Reserved, don't use.
++ * @status: Indicates the status of the event. Refer to databook for
++ *	more information.
++ * @parameters: Parameters of the current event. Refer to databook for
++ *	more information.
++ */
++struct dwc3_event_depevt {
++    u32 one_bit : 1;
++    u32 endpoint_number : 5;
++    u32 endpoint_event : 4;
++    u32 reserved11_10 : 2;
++    u32 status : 4;
++
++/* Within XferNotReady */
++#define DEPEVT_STATUS_TRANSFER_ACTIVE (1u << 3)
++
++/* Within XferComplete */
++#define DEPEVT_STATUS_BUSERR (1u << 0)
++#define DEPEVT_STATUS_SHORT  (1u << 1)
++#define DEPEVT_STATUS_IOC    (1u << 2)
++#define DEPEVT_STATUS_LST    (1u << 3)
++
++/* Stream event only */
++#define DEPEVT_STREAMEVT_FOUND    1
++#define DEPEVT_STREAMEVT_NOTFOUND 2
++
++/* Control-only Status */
++#define DEPEVT_STATUS_CONTROL_DATA   1
++#define DEPEVT_STATUS_CONTROL_STATUS 2
++
++    u32 parameters : 16;
++} PACKED;
++
++#define DWC3_DEVT_DISCONN         0x00
++#define DWC3_DEVT_USBRST          0x01
++#define DWC3_DEVT_CONNECTDONE     0x02
++#define DWC3_DEVT_ULSTCHNG        0x03
++#define DWC3_DEVT_WKUPEVT         0x04
++#define DWC3_DEVT_EOPF            0x06
++#define DWC3_DEVT_SOF             0x07
++#define DWC3_DEVT_ERRTICERR       0x09
++#define DWC3_DEVT_CMDCMPLT        0x0a
++#define DWC3_DEVT_EVNTOVERFLOW    0x0b
++#define DWC3_DEVT_VNDRDEVTSTRCVED 0x0c
++
++/**
++ * struct dwc3_event_devt - Device Events
++ * @one_bit: indicates this is a non-endpoint event (not used)
++ * @device_event: indicates it's a device event. Should read as 0x00
++ * @type: indicates the type of device event.
++ *	0	- DisconnEvt
++ *	1	- USBRst
++ *	2	- ConnectDone
++ *	3	- ULStChng
++ *	4	- WkUpEvt
++ *	5	- Reserved
++ *	6	- EOPF
++ *	7	- SOF
++ *	8	- Reserved
++ *	9	- ErrticErr
++ *	10	- CmdCmplt
++ *	11	- EvntOverflow
++ *	12	- VndrDevTstRcved
++ * @reserved15_12: Reserved, not used
++ * @event_info: Information about this event
++ * @reserved31_24: Reserved, not used
++ */
++struct dwc3_event_devt {
++    u32 one_bit : 1;
++    u32 device_event : 7;
++    u32 type : 4;
++    u32 reserved15_12 : 4;
++    u32 event_info : 8;
++    u32 reserved31_24 : 8;
++} PACKED;
++
++/**
++ * struct dwc3_event_gevt - Other Core Events
++ * @one_bit: indicates this is a non-endpoint event (not used)
++ * @device_event: indicates it's (0x03) Carkit or (0x04) I2C event.
++ * @phy_port_number: self-explanatory
++ * @reserved31_12: Reserved, not used.
++ */
++struct dwc3_event_gevt {
++    u32 one_bit : 1;
++    u32 device_event : 7;
++    u32 phy_port_number : 4;
++    u32 reserved31_12 : 20;
++} PACKED;
++
++union dwc3_event {
++    u32 raw;
++    struct dwc3_event_type type;
++    struct dwc3_event_depevt depevt;
++    struct dwc3_event_devt devt;
++    struct dwc3_event_gevt gevt;
++};
++
++#define DWC3_DEPCFG_EP_TYPE(n)         (((n) & 0x3) << 1)
++#define DWC3_DEPCFG_EP_NUMBER(n)       (((n) & 0x1f) << 25)
++#define DWC3_DEPCFG_FIFO_NUMBER(n)     (((n) & 0xf) << 17)
++#define DWC3_DEPCFG_MAX_PACKET_SIZE(n) (((n) & 0x7ff) << 3)
++
++#define DWC3_DEPCFG_INT_NUM(n)          (((n) & 0x1f) << 0)
++#define DWC3_DEPCFG_XFER_COMPLETE_EN    BIT(8)
++#define DWC3_DEPCFG_XFER_IN_PROGRESS_EN BIT(9)
++#define DWC3_DEPCFG_XFER_NOT_READY_EN   BIT(10)
++#define DWC3_DEPCFG_FIFO_ERROR_EN       BIT(11)
++#define DWC3_DEPCFG_STREAM_EVENT_EN     BIT(13)
++#define DWC3_DEPCFG_BINTERVAL_M1(n)     (((n) & 0xff) << 16)
++#define DWC3_DEPCFG_STREAM_CAPABLE      BIT(24)
++#define DWC3_DEPCFG_EP_NUMBER(n)        (((n) & 0x1f) << 25)
++#define DWC3_DEPCFG_BULK_BASED          BIT(30)
++#define DWC3_DEPCFG_FIFO_BASED          BIT(31)
++
++#endif /* __DRIVERS_USB_DWC3_CORE_H */
+diff --git a/bsd/dev/hakios.usb.c b/bsd/dev/hakios.usb.c
+new file mode 100644
+index 0000000..78f8e29
+--- /dev/null
++++ b/bsd/dev/hakios.usb.c
+@@ -0,0 +1,1086 @@
++/*
++ * The Redmi K40's USB controller (SM8250 usb_1: a Synopsys DWC3 at 0x0a600000 behind the apps
++ * SMMU as stream 0, its Qualcomm wrapper at 0x0a6f8800), for iOS.
++ *
++ *   usb=1   a look, reading only: the controller's clocks and power (GCC), the wrapper's VBUS
++ *           override, the DWC3's identity, role, device state and event buffer, and what the
++ *           apps SMMU does with stream 0 (which match, which context, bypass or translation).
++ *           Safe while the loader serves its own USB link on another core (bootcpu=7 cpus=7):
++ *           nothing is written.
++ *   usb=2   the controller is the kernel's: a USB serial port (CDC ACM, 1209:316d, named "HakiOS
++ *           K40" or usb_name=Your_Name with '_' for spaces, serial hakios-alioth) that carries the
++ *           kernel's log (what the loader's log gets) to the computer, and /dev/hakios-usb, through
++ *           which a program (userland usbsh) shares the port: the log flows until the computer
++ *           sends something, which goes to the program, and the log stops until the program
++ *           asks for it again (ioctl HAKIOS_USB_LOG) or lets the port go. Only when
++ *           the controller is free: the kernel has all the cores (bootcpu=0), or the loader on
++ *           its own core has stopped its link and lent the controller (it then adds usbfree=1);
++ *           otherwise it is the loader's link and is left alone. At the run's end the controller
++ *           is stopped (hakios_usb_quiesce()) and the loader restarts its own link
++ *           (devices/redmi-k40/loader: alioth_usb_take_back()).
++ *   usb=3   the same controller, but what an iPhone is to a computer: 05ac:12a8 "iPhone" by "Apple Inc.",
++ *           its serial the UDID, and Apple's usbmux interface (class 0xff/0xfe/2: hakios.dwc3.c), which
++ *           the computer's usbmuxd -- Apple Mobile Device Service on Windows, usbmuxd elsewhere -- talks to.
++ *           Nothing shows until a program (userland usbmux, which speaks the device's side of usbmux and
++ *           hands its connections to lockdownd and the rest on 127.0.0.1) opens /dev/hakios-usb and gives
++ *           the UDID (ioctl HAKIOS_USB_IPHONE); from then on the port carries its packets only: read()
++ *           gives what the computer sent as it came, each write() is one packet, one USB transfer.
++ *
++ * Addresses: Linux sm8250.dtsi (usb_1, usb_1_dwc3, apps_smmu), gcc-sm8250.c (USB30_PRIM
++ * branches and GDSC), dwc3-qcom.c (QSCRATCH), drivers/usb/dwc3/core.h (the DWC3's own
++ * registers); FFT-infra/QcomXnuUsbDebug soc/Sm8250.h has the same values for this phone.
++ * The device side (EP0, CDC ACM, events, TRBs) is QcomXnuUsbDebug's shared core
++ * (hakios.dwc3.c, from Asahi Linux m1n1). Its DMA: the firmware leaves stream 0 matched to
++ * a context bank with translation off (usb=1 shows SMR5 -> CB5, SCTLR.M 0: the firmware's
++ * own USB driver uses physical addresses), so the controller is given physical addresses of
++ * memory in the kernel's image, and the SMMU is not touched.
++ */
++#include <stdarg.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/fcntl.h>
++#include <sys/filio.h>
++#include <sys/vnode.h>
++#include <sys/errno.h>
++#include <miscfs/devfs/devfs.h>
++#include <mach/mach_types.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <sys/hakios.board.h>
++#include "hakios.dwc3.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t kvtophys(vm_offset_t);
++extern kern_return_t thread_terminate(thread_t);
++extern lck_mtx_t hakios_smmu_lock;
++extern char loader_log_tee[];
++extern volatile uint64_t loader_log_tee_total;
++#define LOADER_LOG_TEE          (64 * 1024)     /* (osfmk/arm64/loader_return.c) */
++
++#define GCC_BASE                0x00100000ull
++#define GCC_USB30_PRIM_BCR      0xf000
++#define GCC_USB30_PRIM_GDSCR    0xf004
++#define DWC3_BASE               0x0a600000ull   /* the core's window; the wrapper (QSCRATCH) at +0xf8800 */
++#define QSCRATCH_HS_PHY_CTRL    0xf8810
++#define SMMU_BASE               0x15000000ull
++#define USB_SID                 0x0u
++
++/* drivers/usb/dwc3/core.h */
++#define DWC3_GCTL               0xc110
++#define DWC3_GSTS               0xc118
++#define DWC3_GSNPSID            0xc120
++#define DWC3_GHWPARAMS0         0xc140
++#define DWC3_GUSB2PHYCFG0       0xc200
++#define DWC3_GUSB3PIPECTL0      0xc2c0
++#define DWC3_GEVNTADRLO0        0xc400
++#define DWC3_GEVNTADRHI0        0xc404
++#define DWC3_GEVNTSIZ0          0xc408
++#define DWC3_GEVNTCOUNT0        0xc40c
++#define DWC3_DCFG               0xc700
++#define DWC3_DCTL               0xc704
++#define DWC3_DEVTEN             0xc708
++#define DWC3_DSTS               0xc70c
++#define DWC3_DALEPENA           0xc720
++#define DWC3_DEPCMDPAR2(n)      (0xc800 + 0x10 * (n))
++#define DWC3_DEPCMD(n)          (0xc80c + 0x10 * (n))
++
++extern void loader_log_putc(char c);
++
++static uint32_t level;
++static vm_offset_t gcc, dwc, smmu;
++
++/*
++ * Into the loader's log (what the host reads over the loader's link) as well as the console -- but not the
++ * console at the run's end (hakios_usb_quiesce(), interrupts off): console output from there is a panic
++ * ("Console I/O from interrupt-disabled context"), which then skips the rest of the way back.
++ */
++static volatile bool usb_leaving;
++static void say(const char *format, ...) __printflike(1, 2);
++
++/*
++ * What was said, kept again in a ring of its own and said once more at the run's end (hakios_usb_quiesce()):
++ * a long run's log keeps its first 256 KB and its last 1 MB, and the port's first seconds -- the computer
++ * finding it -- fall in between (2026-10-30, usb=3). Each line here with the seconds since boot, and the mux's own
++ * lines too (HAKIOS_USB_NOTE): a cable pulled minutes into a run fell in that gap, the mux's console lines with it,
++ * and 8 KB without times held only the port's requests (2026-11-02).
++ */
++static char usb_history[128 * 1024];
++static uint32_t usb_history_at;
++
++static void
++say(const char *format, ...)
++{
++	char line[400], when[24];
++	va_list list;
++	uint64_t ns;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	snprintf(when, sizeof(when), "[%5llu.%02llu] ", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 100));
++	for (const char *c = when; *c != 0; c++) {
++		usb_history[usb_history_at++ % sizeof(usb_history)] = *c;
++	}
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++		usb_history[usb_history_at++ % sizeof(usb_history)] = *c;
++	}
++	if (!usb_leaving && ml_get_interrupts_enabled()) {
++		printf("%s", line);
++	}
++}
++
++static uint32_t
++rd(vm_offset_t base, uint32_t offset)
++{
++	uint32_t v = *(volatile uint32_t *)(base + offset);
++
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++look_power(void)
++{
++	static const struct { uint32_t offset; const char *name; } branches[] = {
++		{ 0xf010, "usb30_prim_master" }, { 0xf018, "usb30_prim_sleep" }, { 0xf01c, "usb30_prim_mock_utmi" },
++		{ 0xf054, "usb3_prim_phy_aux" }, { 0xf058, "usb3_prim_phy_com_aux" }, { 0xf05c, "usb3_prim_phy_pipe" },
++		{ 0xf00c, "usb30_prim_master RCG cmd" }, { 0xf024, "usb30_prim_mock_utmi RCG cmd" },
++	};
++	uint32_t gdscr = rd(gcc, GCC_USB30_PRIM_GDSCR);
++
++	say("usb: GCC USB30_PRIM GDSC %#x: %s%s; BCR %#x\n", gdscr, gdscr & (1u << 31) ? "powered" : "OFF",
++	    gdscr & 1 ? " (software collapse asked)" : "", rd(gcc, GCC_USB30_PRIM_BCR));
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		uint32_t v = rd(gcc, branches[i].offset);
++
++		say("usb: GCC %s (%#x) = %#x%s\n", branches[i].name, branches[i].offset, v,
++		    i < 6 ? (v & (1u << 31) ? ": clock OFF" : ": clock running") : "");
++	}
++}
++
++/* Readable only with its power and the master/sleep clocks on (else an external abort): checked first. */
++static bool
++dwc_readable(void)
++{
++	return (rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)) && !(rd(gcc, 0xf010) & (1u << 31)) && !(rd(gcc, 0xf018) & (1u << 31));
++}
++
++static void
++look_controller(void)
++{
++	uint32_t gctl, dsts, dctl, evlo, evhi, evsiz, hs;
++
++	if (!dwc_readable()) {
++		say("usb: the controller's power or clocks are off: its registers are not read\n");
++		return;
++	}
++	gctl = rd(dwc, DWC3_GCTL);
++	dsts = rd(dwc, DWC3_DSTS);
++	dctl = rd(dwc, DWC3_DCTL);
++	evlo = rd(dwc, DWC3_GEVNTADRLO0);
++	evhi = rd(dwc, DWC3_GEVNTADRHI0);
++	evsiz = rd(dwc, DWC3_GEVNTSIZ0);
++	hs = rd(dwc, QSCRATCH_HS_PHY_CTRL);
++	say("usb: DWC3 GSNPSID %#x, GHWPARAMS0 %#x; GCTL %#x (port role %u: %s), GSTS %#x\n", rd(dwc, DWC3_GSNPSID),
++	    rd(dwc, DWC3_GHWPARAMS0), gctl, (gctl >> 12) & 3,
++	    ((gctl >> 12) & 3) == 1 ? "host" : ((gctl >> 12) & 3) == 2 ? "device" : ((gctl >> 12) & 3) == 3 ? "OTG" : "?", rd(dwc, DWC3_GSTS));
++	say("usb: DCFG %#x (speed %u, address %u), DCTL %#x (%s%s), DEVTEN %#x, DSTS %#x (speed %u, link state %u%s), DALEPENA %#x\n",
++	    rd(dwc, DWC3_DCFG), rd(dwc, DWC3_DCFG) & 7, (rd(dwc, DWC3_DCFG) >> 3) & 0x7f, dctl, dctl & (1u << 31) ? "run" : "stopped",
++	    dctl & (1u << 30) ? ", soft reset" : "", rd(dwc, DWC3_DEVTEN), dsts, dsts & 7, (dsts >> 18) & 0xf,
++	    dsts & (1u << 22) ? ", halted" : "", rd(dwc, DWC3_DALEPENA));
++	say("usb: event buffer 0 at %#x:%08x, size %#x (interrupt %s), %u bytes of events pending\n", evhi, evlo, evsiz & 0xffff,
++	    evsiz & (1u << 31) ? "masked" : "on", rd(dwc, DWC3_GEVNTCOUNT0) & 0xffff);
++	say("usb: GUSB2PHYCFG %#x, GUSB3PIPECTL %#x, QSCRATCH HS_PHY_CTRL %#x (VBUS override %s)\n", rd(dwc, DWC3_GUSB2PHYCFG0),
++	    rd(dwc, DWC3_GUSB3PIPECTL0), hs, (hs & ((1u << 20) | (1u << 28))) == ((1u << 20) | (1u << 28)) ? "on" : "off");
++	for (unsigned ep = 0; ep < 6; ep++) {
++		say("usb: endpoint %u%s: DEPCMD %#x, DEPCMDPAR2 %#x%s\n", ep / 2, ep & 1 ? " IN" : " OUT", rd(dwc, DWC3_DEPCMD(ep)),
++		    rd(dwc, DWC3_DEPCMDPAR2(ep)), rd(dwc, DWC3_DALEPENA) & (1u << ep) ? " (enabled)" : "");
++	}
++}
++
++/* The apps SMMU (SMMU-500, SMMUv2 programming model): which matches take stream 0, and where they send it. */
++static void
++look_smmu(void)
++{
++	uint32_t scr0 = rd(smmu, 0), id0 = rd(smmu, 0x20), id1 = rd(smmu, 0x24);
++	unsigned page = (id1 >> 31) ? 0x10000 : 0x1000, pages = 2u << ((id1 >> 28) & 7);
++	unsigned matches = id0 & 255, contexts = id1 & 255, found = 0;
++	vm_offset_t gr1 = ml_io_map(SMMU_BASE + page, 0x1000);
++
++	say("usb: SMMU sCR0 %#x (unmatched streams %s), IDR0 %#x (%u matches), IDR1 %#x (%u contexts)\n", scr0,
++	    scr0 & (1u << 10) ? "FAULT" : "BYPASS", id0, matches, id1, contexts);
++	lck_mtx_lock(&hakios_smmu_lock);
++	for (unsigned i = 0; i < matches && i < 128; i++) {
++		uint32_t smr = rd(smmu, 0x800 + 4 * i), s2cr = rd(smmu, 0xc00 + 4 * i);
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++
++		if (!(smr & (1u << 31)) || ((id ^ USB_SID) & ~mask)) {
++			continue;
++		}
++		found++;
++		say("usb: SMR%u %#x (id %#x mask %#x) takes stream 0: S2CR %#x, type %u (%s), context %u\n", i, smr, id, mask, s2cr,
++		    (s2cr >> 16) & 3, ((s2cr >> 16) & 3) == 0 ? "translation" : ((s2cr >> 16) & 3) == 1 ? "BYPASS" : "FAULT", s2cr & 255);
++		if (((s2cr >> 16) & 3) == 0 && (s2cr & 255) < contexts && gr1) {
++			unsigned cb = s2cr & 255;
++			vm_offset_t ctx = ml_io_map(SMMU_BASE + (uint64_t)(pages + cb) * page, 0x1000);
++
++			say("usb:   CBAR%u %#x CBA2R %#x\n", cb, rd(gr1, 4 * cb), rd(gr1, 0x800 + 4 * cb));
++			if (ctx) {
++				say("usb:   CB%u SCTLR %#x TCR %#x TCR2 %#x TTBR0 %#x:%08x MAIR0 %#x FSR %#x FAR %#x:%08x\n", cb, rd(ctx, 0),
++				    rd(ctx, 0x30), rd(ctx, 0x10), rd(ctx, 0x24), rd(ctx, 0x20), rd(ctx, 0x38), rd(ctx, 0x58), rd(ctx, 0x64),
++				    rd(ctx, 0x60));
++			}
++		}
++	}
++	lck_mtx_unlock(&hakios_smmu_lock);
++	if (found == 0) {
++		say("usb: no SMMU match takes stream 0: the controller's DMA goes %s\n",
++		    scr0 & (1u << 10) ? "NOWHERE (unmatched streams fault)" : "straight to physical addresses (bypass)");
++	}
++}
++
++/* ---- usb=2: the controller is the kernel's ---------------------------------------------------- */
++
++#define USB_VID                 0x1209u         /* pid.codes' test VID with the PID m1n1 and QcomXnuUsbDebug use */
++#define USB_PID                 0x316du
++#define POLL_US                 1000            /* the controller is polled (its interrupt stays masked) */
++#define RX_RING                 65536           /* what the computer sent, kept for /dev/hakios-usb */
++#define LOG_BACKLOG             (16 * 1024)     /* how much of the log a newly opened port gets first */
++
++static uint8_t usb_dma[DWC3_DMA_BYTES] __attribute__((aligned(16384)));
++static uint64_t usb_context[DWC3_CONTEXT_BYTES / sizeof(uint64_t)];
++static struct dwc3 *usb_dev;
++static uint64_t usb_dma_pa;
++static LCK_GRP_DECLARE(usb_lck_grp, "hakios-usb");
++static LCK_MTX_DECLARE(usb_lock, &usb_lck_grp);
++static volatile bool usb_owned;         /* dwc3_init() done: the controller is ours until hakios_usb_quiesce() */
++static volatile bool usb_stopping;
++static uint64_t log_at;                 /* the next character of the log tee for the port */
++static uint64_t log_skipped;            /* characters of the log that came faster than the port took them */
++static uint32_t usb_failures;
++/* /dev/hakios-usb */
++static uint8_t rx_ring[RX_RING];
++static uint32_t rx_head, rx_tail;       /* (under usb_lock; free-running counters) */
++/*
++ * Sessions of the port: one more at every bus reset (the cable out and in again, the computer resetting the port) and
++ * at every restart of the controller. What the computer sent before is of a session that is over, and is dropped; the
++ * program asks for the number (HAKIOS_USB_GENERATION) and starts its side again when it changes -- the usbmux did not,
++ * kept half a packet of the old session in front of the new one's first, and the computer's usbmuxd, unanswered, let
++ * the iPhone go: no Trust, no photos after the cable was pulled once (2026-11-01).
++ */
++static uint32_t usb_generation, seen_rx_generation;
++static volatile UInt32 user_open;
++static volatile bool log_mode = true;   /* the log goes to the port: until the computer sends something to the program that has it */
++static struct selinfo usb_rsel, usb_wsel;
++static int usb_wchan;
++static char usb_name[32] = "HakiOS K40";        /* boot-arg usb_name=Your_Name: what the computer calls the port ('_' for a space) */
++
++/* ioctl on /dev/hakios-usb: the log to the port again (until the computer next sends something) */
++#define HAKIOS_USB_LOG          _IO('u', 1)
++/* usb=3: show the computer an iPhone with this serial (the UDID) and its usbmux interface */
++struct hakios_usb_iphone {
++	char serial[48];
++};
++#define HAKIOS_USB_IPHONE       _IOW('u', 2, struct hakios_usb_iphone)
++/* usb=3: the computer's usbmux has come (1) or gone (0) -- for AppleUSBDeviceMux's clients (iokit/Kernel/hakios.usbmux.cpp) */
++#define HAKIOS_USB_HOST         _IOW('u', 3, int)
++/* the port's session (see usb_generation) */
++#define HAKIOS_USB_GENERATION   _IOR('u', 4, uint32_t)
++/* usb=3: a line of the mux's own, into the loader's log and the port's history (see usb_history) */
++struct hakios_usb_note {
++	char text[160];
++};
++#define HAKIOS_USB_NOTE         _IOW('u', 5, struct hakios_usb_note)
++extern int hakios_usbmux_publish(void);
++extern void hakios_usbmux_host(bool connected);
++extern void thread_set_thread_name(thread_t thread, const char *name);
++static volatile bool usb_taken;         /* /dev/hakios-usb is there, the thread runs */
++static volatile bool mux_asked;         /* usb=3: a program gave the serial: the device side may start */
++static char mux_serial[48];
++static volatile int mux_pid = -1;       /* ... that program, the phone's USB mux, while it has the port */
++
++/*
++ * The process that is this phone's USB mux (usb=3), or -1: bsd/netinet/tcp_usrreq.c tells lockdownd that a
++ * connection of its is the kernel's (TCP_PEER_PID 0), as an iPhone's AppleUSBDeviceMux, in its kernel, is.
++ */
++int hakios_usb_mux_pid(void);
++
++int
++hakios_usb_mux_pid(void)
++{
++	return level == 3 ? mux_pid : -1;
++}
++
++static uint32_t
++io_read(__unused void *cookie, uint32_t offset)
++{
++	return rd(dwc, offset);
++}
++
++static void
++io_write(__unused void *cookie, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(dwc + offset) = value;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* A busy wait: the shared core's waits are microseconds, and the run's end (other processors off) has no scheduler to lean on. */
++static void
++io_delay(__unused void *cookie, uint32_t usec)
++{
++	uint64_t span, start = mach_absolute_time();
++
++	nanoseconds_to_absolutetime((uint64_t)usec * NSEC_PER_USEC, &span);
++	while (mach_absolute_time() - start < span) {
++		__asm__ volatile ("yield");
++	}
++}
++
++/* The controller does not snoop the processors' caches: the event ring, TRBs and buffers are cleaned before it reads them and invalidated before we do. */
++static void
++io_sync(__unused void *cookie, void *cpu, size_t bytes, enum dwc3_sync_direction direction)
++{
++	uintptr_t p = (uintptr_t)cpu & ~(uintptr_t)63, end = (uintptr_t)cpu + bytes;
++
++	for (; p < end; p += 64) {
++		if (direction == DWC3_TO_DEVICE) {
++			__asm__ volatile ("dc cvac, %0" :: "r" (p) : "memory");
++		} else {
++			__asm__ volatile ("dc civac, %0" :: "r" (p) : "memory");
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++io_barrier(__unused void *cookie)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static unsigned setups_said;
++
++static void
++io_trace(__unused void *cookie, enum dwc3_trace event, uint32_t a, uint32_t b)
++{
++	static const char *const devt[16] = { "disconnect", "USB reset", "connection done", "link state", "wake-up", "hibernation",
++		                              "suspend", "start of frame", "?", "erratic error", "command complete", "event overflow",
++		                              "?", "?", "?", "?" };
++
++	static unsigned session_said, said_all;
++
++	switch (event) {
++	case DWC3_TRACE_DEVICE_EVENT:
++		say("usb: event: %s (DSTS %#x)\n", devt[a & 15], b);
++		if ((a & 15) == 1) {
++			session_said = 0;       /* (a bus reset: the next session's first requests are said too) */
++		}
++		break;
++	case DWC3_TRACE_STUCK:
++		say("usb: the computer reset the port %u times %s: the device side from scratch\n", a,
++		    (b & 0x100) ? "without ever configuring it" : "and got no request through");
++		break;
++	case DWC3_TRACE_SETUP:
++		/* (40 a session: past the configuration, SET_CONFIGURATION being the 18th of a Windows enumeration) */
++		if (setups_said++ < 24 || (session_said++ < 40 && said_all++ < 1500)) {
++			say("usb: request %02x %02x value %#x index %#x length %u\n", a >> 24, (a >> 16) & 0xff, a & 0xffff, b >> 16, b & 0xffff);
++		}
++		break;
++	case DWC3_TRACE_READY:
++		say("usb: the computer has %s the port (configured %u)\n", b ? "OPENED" : "closed", a);
++		break;
++	case DWC3_TRACE_TIMEOUT:
++		say("usb: TIMEOUT waiting on register %#x (%#x)\n", a, b);
++		break;
++	case DWC3_TRACE_COMMAND:
++		say("usb: endpoint command %#x FAILED: %#x\n", a, b);
++		break;
++	case DWC3_TRACE_BAD_EVENT:
++		say("usb: event %#x not understood (%u)\n", a, b);
++		break;
++	case DWC3_TRACE_UNSUPPORTED:
++		if (setups_said < 24) {
++			say("usb: request %02x %02x answered with a stall\n", a, b);
++		}
++		break;
++	/* (the three below once a bus session each: the controller's count of resets, dwc3_rx_generation()) */
++	case DWC3_TRACE_CONFIGURED: {
++		static unsigned configured_said;
++
++		if (configured_said++ < 200) {
++			say("usb: bus session %u: the computer chose configuration %u%s\n", dwc3_rx_generation(usb_dev), a,
++			    b ? " (iPhone mode)" : "");
++		}
++		break;
++	}
++	case DWC3_TRACE_ARMED: {
++		static uint32_t armed_said = 0xffffffffu;
++
++		if (armed_said != dwc3_rx_generation(usb_dev)) {
++			armed_said = dwc3_rx_generation(usb_dev);
++			say("usb: bus session %u: endpoint %u ready for what the computer sends (%u bytes in the ring)\n",
++			    armed_said, a, b);
++		}
++		break;
++	}
++	case DWC3_TRACE_NOT_READY: {
++		static uint32_t not_ready_said[2] = { 0xffffffffu, 0xffffffffu };
++		uint32_t *said = &not_ready_said[a & 1];
++
++		if (*said != dwc3_rx_generation(usb_dev)) {
++			*said = dwc3_rx_generation(usb_dev);
++			say("usb: bus session %u: the computer tried endpoint %u (%s) with nothing there: active %u, configured %u, "
++			    "%u bytes in the ring\n", *said, a, (a & 1) ? "IN" : "OUT", b & 0xff, (b >> 8) & 0xff, b >> 16);
++		}
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++/* The log into the port, while no program has it: what came since the last time, as much as the port's queue takes. */
++static void
++feed_log(void)
++{
++	uint64_t total = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
++
++	if (total - log_at > LOADER_LOG_TEE - 4096) {
++		log_skipped += total - log_at - (LOADER_LOG_TEE - 4096);
++		log_at = total - (LOADER_LOG_TEE - 4096);
++	}
++	if (!dwc3_ready(usb_dev)) {
++		/* nobody reads the port: only a backlog's worth is kept for when someone does */
++		if (total - log_at > LOG_BACKLOG) {
++			log_at = total - LOG_BACKLOG;
++		}
++		return;
++	}
++	while (log_at < total) {
++		uint32_t at = (uint32_t)(log_at % LOADER_LOG_TEE);
++		uint32_t n = (uint32_t)MIN(total - log_at, (uint64_t)(LOADER_LOG_TEE - at));
++		size_t taken = dwc3_queue(usb_dev, &loader_log_tee[at], n);
++
++		log_at += taken;
++		if (taken < n) {
++			break;
++		}
++	}
++}
++
++/* The device side from scratch (the shared core's init and start), with the VBUS override; usb_lock held. */
++static int
++bring_up(void)
++{
++	struct dwc3_platform io = {
++		.cookie = NULL, .read32 = io_read, .write32 = io_write, .delay_us = io_delay, .dma_sync = io_sync,
++		.barrier = io_barrier, .trace = io_trace,
++	};
++	struct dwc3_identity identity = {
++		.vid = USB_VID, .pid = USB_PID, .manufacturer = "HakiOS", .product = usb_name, .serial = "hakios-alioth",
++	};
++	if (level == 3) {
++		/* an iPhone X (iPhone10,3: PID 0x12a8, as Apple's Windows driver lists it) */
++		identity = (struct dwc3_identity){
++			.vid = 0x05ac, .pid = 0x12a8, .manufacturer = "Apple Inc.", .product = "iPhone", .serial = mux_serial,
++			.mux = 1, .bcd_device = 0x1006,
++		};
++	}
++	int r = dwc3_init(usb_context, sizeof(usb_context), &io, &identity, usb_dma, usb_dma_pa, sizeof(usb_dma));
++
++	if (r == 0) {
++		/*
++		 * VBUS as the controller sees it: with no OTG block telling it, the Qualcomm wrapper's override
++		 * says the session is valid (dwc3-qcom.c dwc3_qcom_vbus_override_enable()). The firmware's link
++		 * sets it, and its stop clears it (usb=1 then reads HS_PHY_CTRL 0): without it the device
++		 * never pulls up and the computer sees nothing.
++		 */
++		uint32_t hs = rd(dwc, QSCRATCH_HS_PHY_CTRL), vbus = (1u << 20) | (1u << 28);
++
++		if ((hs & vbus) != vbus) {
++			io_write(NULL, QSCRATCH_HS_PHY_CTRL, hs | vbus);
++			say("usb: the wrapper's VBUS override on: HS_PHY_CTRL %#x -> %#x\n", hs, rd(dwc, QSCRATCH_HS_PHY_CTRL));
++		}
++		usb_dev = (struct dwc3 *)(void *)usb_context;
++		usb_owned = true;
++		r = dwc3_start(usb_dev);
++	}
++	return r;
++}
++
++static void
++usb_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	int r;
++
++	if (level == 3) {
++		say("usb: usb=3: an iPhone to the computer once a program gives its UDID on /dev/hakios-usb\n");
++		while (!mux_asked && !usb_stopping) {
++			(void)tsleep((void *)&mux_asked, PZERO, "hakios-usb-mux", 100);       /* (ticks: a second or so) */
++		}
++		if (usb_stopping) {
++			thread_terminate(current_thread());
++			return;
++		}
++	}
++	lck_mtx_lock(&usb_lock);
++	r = bring_up();
++	lck_mtx_unlock(&usb_lock);
++	if (r != 0) {
++		say("usb: the controller could not be made ours (%d): %s\n", r, usb_owned ? "left stopped" : "not touched past its stop");
++		thread_terminate(current_thread());
++		return;
++	}
++	if (level == 3) {
++		say("usb: THE CONTROLLER IS THE KERNEL'S: an iPhone (05ac:12a8, serial %s) with Apple's usbmux interface; DMA at %#llx\n",
++		    mux_serial, usb_dma_pa);
++		log_mode = false;
++		r = hakios_usbmux_publish();
++		say("usb: AppleUSBDeviceMux for lockdownd: %s (%d)\n", r == 0 ? "published" : "NOT PUBLISHED", r);
++	} else {
++		say("usb: THE CONTROLLER IS THE KERNEL'S: a serial port (%04x:%04x \"%s\") from here on; its DMA at %#llx\n",
++		    USB_VID, USB_PID, usb_name, usb_dma_pa);
++	}
++	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
++	/*
++	 * Boot-arg usb_bounce=SECS (a test, usb_bounce_every=SECS, three times): the port leaves and comes back at that
++	 * many seconds of uptime, as the computer sees a cable pulled and put back -- for what happens above the port
++	 * then (the usbmux's new session) to be tried with nobody at the cable.
++	 */
++	uint32_t bounce_at = 0, bounce_every = 60, bounces = 0;
++	PE_parse_boot_argn("usb_bounce", &bounce_at, sizeof(bounce_at));
++	PE_parse_boot_argn("usb_bounce_every", &bounce_every, sizeof(bounce_every));
++	while (!usb_stopping) {
++		bool readable = false, writable, restarted = false, bounce = false;
++		uint8_t buf[2048];
++		size_t n;
++
++		if (bounce_at != 0 && bounces < 3) {
++			uint64_t ns;
++
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			if (ns / NSEC_PER_SEC >= bounce_at + (uint64_t)bounces * bounce_every) {
++				bounces++;
++				bounce = true;
++				say("usb: test (usb_bounce): the port leaves and comes back (%u of 3)\n", bounces);
++			}
++		}
++		lck_mtx_lock(&usb_lock);
++		if (usb_stopping) {
++			lck_mtx_unlock(&usb_lock);
++			break;
++		}
++		r = bounce ? -10 : dwc3_poll(usb_dev, 64);
++		if (r < 0) {
++			restarted = true;
++			/*
++			 * The device side from scratch: stopped, reset and started again (the computer sees the port
++			 * leave and come back), not the shared core's dwc3_recover(), which reconfigures the endpoints
++			 * but leaves its idea of what is armed as it was, and EP0 then never gets a SETUP again.
++			 */
++			(void)dwc3_stop(usb_dev);
++			r = bring_up();
++			if (++usb_failures <= 20) {
++				say("usb: the controller failed, started again from scratch (%d; %u so far)\n", r, usb_failures);
++			}
++			if (r != 0) {
++				usb_owned = false;
++				lck_mtx_unlock(&usb_lock);
++				say("usb: the controller does not start again: the port is gone until the run ends\n");
++				break;
++			}
++		}
++		if (restarted || dwc3_rx_generation(usb_dev) != seen_rx_generation) {
++			static unsigned told;
++
++			seen_rx_generation = dwc3_rx_generation(usb_dev);
++			rx_head = rx_tail = 0;
++			if (usb_generation++ != 0 && told++ < 200) {
++				say("usb: a new session of the port (%u): what came before it is dropped\n", usb_generation);
++			}
++		}
++		if (!user_open) {
++			static uint32_t dropped_said;
++
++			log_mode = level != 3;
++			while ((n = dwc3_read(usb_dev, buf, sizeof(buf))) > 0) {
++				/* what the computer sends with no program to take it is dropped */
++				if (level == 3 && dropped_said != usb_generation) {
++					dropped_said = usb_generation;
++					say("usb: session %u: %zu bytes from the computer dropped: no program has the port\n", usb_generation, n);
++				}
++			}
++		} else {
++			/* usb=3: each session's first bytes for the mux (its version packet -- did it come at all?) */
++			static uint32_t first_in_said;
++
++			while (rx_head - rx_tail <= RX_RING - sizeof(buf) && (n = dwc3_read(usb_dev, buf, sizeof(buf))) > 0) {
++				if (level == 3 && first_in_said != usb_generation) {
++					char hex[3 * 16 + 1] = "";
++
++					first_in_said = usb_generation;
++					for (size_t i = 0; i < n && i < 16; i++) {
++						snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", buf[i]);
++					}
++					say("usb: session %u: the computer's first %zu bytes for the mux:%s\n", usb_generation, n, hex);
++				}
++				for (size_t i = 0; i < n; i++) {
++					rx_ring[rx_head++ % RX_RING] = buf[i];
++				}
++				readable = true;
++				/* the computer talks to the program: the log stops (the program can start it again) */
++				log_mode = false;
++			}
++		}
++		if (log_mode) {
++			feed_log();
++		} else {
++			/* (what is not sent while the program has the port is not sent later either) */
++			log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
++		}
++		writable = level == 3 ? dwc3_packet_room(usb_dev, DWC3_PACKET_MAX) : dwc3_queued(usb_dev) < DWC3_TX_BYTES / 2;
++		/*
++		 * Under the lock that usbdev_select() records the waiters under: selwakeup() of this XNU also tears the
++		 * select queue down (waitq_deinit), and one that ran while the usbmux was in selrecord() met a link half
++		 * made -- "waitq.c:1771 Assertion failed: waitq_sellinks.next == NULL", a panic the moment the cable was
++		 * pulled, when the usbmux selects most often (2026-11-01 16:12).
++		 */
++		if (readable) {
++			wakeup(rx_ring);
++			selwakeup(&usb_rsel);
++		}
++		if (writable && user_open) {
++			wakeup(&usb_wchan);
++			selwakeup(&usb_wsel);
++		}
++		lck_mtx_unlock(&usb_lock);
++		delay(POLL_US);
++	}
++	thread_terminate(current_thread());
++}
++
++static int
++usbdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	/* (usb=3: before the device side is up too -- the program that opens it is what starts it) */
++	if (!usb_owned && !(level == 3 && usb_taken && !usb_stopping)) {
++		return ENXIO;
++	}
++	if (!OSCompareAndSwap(0, 1, &user_open)) {
++		return EBUSY;
++	}
++	lck_mtx_lock(&usb_lock);
++	rx_head = rx_tail = 0;
++	lck_mtx_unlock(&usb_lock);
++	say("usb: a program has the port (/dev/hakios-usb): the log goes on until the computer sends something\n");
++	return 0;
++}
++
++static int
++usbdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	user_open = 0;
++	if (level == 3 && mux_pid >= 0) {
++		hakios_usbmux_host(false);
++	}
++	mux_pid = -1;
++	log_mode = level != 3;
++	say("usb: the program let the port go%s\n", level == 3 ? "" : ": the log again");
++	return 0;
++}
++
++static int
++usbdev_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	int error = 0;
++
++	lck_mtx_lock(&usb_lock);
++	while (rx_head == rx_tail) {
++		if (usb_stopping || (!usb_owned && level != 3)) {
++			lck_mtx_unlock(&usb_lock);
++			return EIO;
++		}
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&usb_lock);
++			return EWOULDBLOCK;
++		}
++		error = msleep(rx_ring, &usb_lock, PZERO | PCATCH, "hakios-usb", NULL);
++		if (error) {
++			lck_mtx_unlock(&usb_lock);
++			return error;
++		}
++	}
++	while (rx_head != rx_tail && uio_resid(uio) > 0 && error == 0) {
++		uint8_t buf[256];
++		uint32_t n = 0;
++
++		while (n < sizeof(buf) && rx_tail != rx_head && (user_ssize_t)n < uio_resid(uio)) {
++			buf[n++] = rx_ring[rx_tail++ % RX_RING];
++		}
++		lck_mtx_unlock(&usb_lock);
++		error = uiomove((caddr_t)buf, (int)n, uio);
++		lck_mtx_lock(&usb_lock);
++	}
++	lck_mtx_unlock(&usb_lock);
++	return error;
++}
++
++/* usb=3: the write is one packet, sent as one transfer (the computer's usbmux takes a transfer as a packet) */
++static int
++usbdev_write_packet(struct uio *uio, int ioflag)
++{
++	static uint8_t packet[DWC3_PACKET_MAX];         /* (under usb_write_lock) */
++	static LCK_MTX_DECLARE(usb_write_lock, &usb_lck_grp);
++	/* (said once a session: its first packet out, a packet the computer has not taken for 2 s) */
++	static uint32_t first_out_said, wait_said;
++	static unsigned reset_said;
++	user_ssize_t n = uio_resid(uio);
++	int error;
++	unsigned waits = 0;
++
++	uint32_t session;
++
++	if (n <= 0 || n > (user_ssize_t)DWC3_PACKET_MAX) {
++		return EMSGSIZE;
++	}
++	lck_mtx_lock(&usb_write_lock);
++	lck_mtx_lock(&usb_lock);
++	session = usb_generation;
++	lck_mtx_unlock(&usb_lock);
++	error = uiomove((caddr_t)packet, (int)n, uio);
++	while (error == 0) {
++		bool sent;
++
++		lck_mtx_lock(&usb_lock);
++		if (!usb_owned || usb_stopping) {
++			lck_mtx_unlock(&usb_lock);
++			error = EIO;
++			break;
++		}
++		/*
++		 * A packet of a session that ended while it waited for room (the cable pulled with the queue full) is not
++		 * sent into the next: it went out first there, half a TCP segment of the old session where the computer's
++		 * usbmuxd waited for the answer to its version packet. The program learns of the new session from this.
++		 */
++		if (usb_generation != session) {
++			uint32_t now = usb_generation;
++
++			lck_mtx_unlock(&usb_lock);
++			if (reset_said++ < 50) {
++				say("usb: session %u: a packet of %lld bytes of session %u not sent (ENETRESET)\n", now, (long long)n, session);
++			}
++			error = ENETRESET;
++			break;
++		}
++		sent = dwc3_send_packet(usb_dev, packet, (size_t)n) == 0;
++		lck_mtx_unlock(&usb_lock);
++		if (sent) {
++			if (level == 3 && first_out_said != session) {
++				first_out_said = session;
++				say("usb: session %u: the mux's first packet to the computer, %lld bytes\n", session, (long long)n);
++			}
++			break;
++		}
++		/* (a tick a wait: 200 of them about 2 s) */
++		if (++waits == 200 && wait_said != session) {
++			wait_said = session;
++			say("usb: session %u: a packet of %lld bytes has waited 2 s for the computer to take it\n", session, (long long)n);
++		}
++		if (ioflag & IO_NDELAY) {
++			error = EWOULDBLOCK;
++			break;
++		}
++		error = tsleep(&usb_wchan, PZERO | PCATCH, "hakios-usb-w", 1);
++		error = error == EWOULDBLOCK ? 0 : error;
++	}
++	lck_mtx_unlock(&usb_write_lock);
++	return error;
++}
++
++static int
++usbdev_write(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	int error = 0;
++
++	if (level == 3) {
++		return usbdev_write_packet(uio, ioflag);
++	}
++	while (uio_resid(uio) > 0 && error == 0) {
++		uint8_t buf[512];
++		size_t n = (size_t)MIN((user_ssize_t)sizeof(buf), uio_resid(uio)), done = 0;
++
++		error = uiomove((caddr_t)buf, (int)n, uio);
++		while (error == 0 && done < n) {
++			lck_mtx_lock(&usb_lock);
++			if (!usb_owned || usb_stopping) {
++				error = EIO;
++			} else {
++				done += dwc3_queue(usb_dev, buf + done, n - done);
++			}
++			lck_mtx_unlock(&usb_lock);
++			if (error == 0 && done < n) {
++				/* the port's queue is full: wait for the computer to take some (a tick at most, then look again) */
++				if (ioflag & IO_NDELAY) {
++					return done > 0 ? 0 : EWOULDBLOCK;
++				}
++				error = tsleep(&usb_wchan, PZERO | PCATCH, "hakios-usb-w", 1);
++				error = error == EWOULDBLOCK ? 0 : error;
++			}
++		}
++	}
++	return error;
++}
++
++static int
++usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
++{
++	int ready = 0;
++
++	lck_mtx_lock(&usb_lock);
++	if (usb_stopping || (!usb_owned && level != 3)) {
++		ready = 1;
++	} else if (which == FREAD) {
++		ready = rx_head != rx_tail;
++		if (!ready) {
++			selrecord(p, &usb_rsel, wql);
++		}
++	} else if (which == FWRITE) {
++		ready = !usb_owned ? 0 : level == 3 ? dwc3_packet_room(usb_dev, DWC3_PACKET_MAX) :
++		    dwc3_queued(usb_dev) < DWC3_TX_BYTES - 512;
++		if (!ready) {
++			selrecord(p, &usb_wsel, wql);
++		}
++	}
++	lck_mtx_unlock(&usb_lock);
++	return ready;
++}
++
++static int
++usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	switch (cmd) {
++	case FIONBIO:
++	case FIOASYNC:
++		return 0;
++	case HAKIOS_USB_LOG:
++		lck_mtx_lock(&usb_lock);
++		log_at = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
++		log_mode = true;
++		lck_mtx_unlock(&usb_lock);
++		return 0;
++	case FIONREAD:
++		lck_mtx_lock(&usb_lock);
++		*(int *)data = (int)(rx_head - rx_tail);
++		lck_mtx_unlock(&usb_lock);
++		return 0;
++	case HAKIOS_USB_GENERATION:
++		lck_mtx_lock(&usb_lock);
++		*(uint32_t *)(void *)data = usb_generation;
++		lck_mtx_unlock(&usb_lock);
++		return 0;
++	case HAKIOS_USB_HOST: {
++		/*
++		 * Only the changes said, with how often the state before was said again: the mux says "come" at every
++		 * connection to lockdownd, and 24 of a boot's first minute used up the 40 lines there were before the
++		 * cable was ever pulled (2026-11-02).
++		 */
++		static int host_was = -1;
++		static unsigned changes, again;
++		int here = *(const int *)(const void *)data != 0;
++
++		if (level != 3 || mux_pid != proc_selfpid()) {
++			return level != 3 ? ENOTSUP : EPERM;
++		}
++		if (here != host_was) {
++			if (changes++ < 400) {
++				if (again != 0) {
++					say("usb: session %u: the mux says the computer's usbmux has %s (\"%s\" said %u times more before)\n",
++					    usb_generation, here ? "come" : "gone", here ? "gone" : "come", again);
++				} else {
++					say("usb: session %u: the mux says the computer's usbmux has %s\n", usb_generation, here ? "come" : "gone");
++				}
++			}
++			host_was = here;
++			again = 0;
++		} else {
++			again++;
++		}
++		hakios_usbmux_host(here);
++		return 0;
++	}
++	case HAKIOS_USB_NOTE: {
++		static unsigned notes;
++		const struct hakios_usb_note *note = (const struct hakios_usb_note *)(const void *)data;
++
++		if (level != 3 || mux_pid != proc_selfpid()) {
++			return level != 3 ? ENOTSUP : EPERM;
++		}
++		if (notes++ < 3000) {
++			say("usbmux: %.*s\n", (int)strnlen(note->text, sizeof(note->text)), note->text);
++		}
++		return 0;
++	}
++	case HAKIOS_USB_IPHONE: {
++		const struct hakios_usb_iphone *ask = (const struct hakios_usb_iphone *)(void *)data;
++		size_t len = strnlen(ask->serial, sizeof(ask->serial));
++
++		if (level != 3) {
++			return ENOTSUP;
++		}
++		if (mux_asked && len != 0 && len < sizeof(ask->serial) && strcmp(ask->serial, mux_serial) == 0) {
++			mux_pid = proc_selfpid();       /* (the mux again, after it has ended and been started anew) */
++			return EALREADY;
++		}
++		if (len == 0 || len >= sizeof(ask->serial) || mux_asked) {
++			return mux_asked ? EALREADY : EINVAL;
++		}
++		for (size_t i = 0; i < len; i++) {
++			if (ask->serial[i] < 0x21 || ask->serial[i] > 0x7e) {
++				return EINVAL;
++			}
++		}
++		strlcpy(mux_serial, ask->serial, sizeof(mux_serial));
++		mux_pid = proc_selfpid();
++		say("usb: the USB mux is process %d: its connections are the kernel's to lockdownd\n", mux_pid);
++		mux_asked = true;
++		wakeup((void *)&mux_asked);
++		return 0;
++	}
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw usb_cdevsw = {
++	.d_open = usbdev_open, .d_close = usbdev_close, .d_read = usbdev_read, .d_write = usbdev_write,
++	.d_ioctl = usbdev_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = usbdev_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/*
++ * The run's end (loader_return(), the other processors already off): the controller stopped. The lock is
++ * not waited for (a processor that held it is gone); the shared core's stop ends the transfers and halts the
++ * device side. Its event buffer is left where we put it, which is how the loader knows to restart its link.
++ */
++void hakios_usb_quiesce(void);
++
++void
++hakios_usb_quiesce(void)
++{
++	int r;
++
++	usb_leaving = true;
++	if (usb_history_at != 0) {
++		uint32_t from = usb_history_at > sizeof(usb_history) ? usb_history_at - (uint32_t)sizeof(usb_history) : 0;
++		static const char banner[] = "\n--- usb: what the port said during the run, again ---\n";
++
++		for (const char *c = banner; *c != 0; c++) {
++			loader_log_putc(*c);
++		}
++		for (uint32_t i = from; i < usb_history_at; i++) {
++			loader_log_putc(usb_history[i % sizeof(usb_history)]);
++		}
++		usb_history_at = 0;
++	}
++	if (!usb_owned) {
++		return;
++	}
++	usb_stopping = true;
++	r = dwc3_stop(usb_dev);
++	usb_owned = false;
++	say("usb: the controller stopped%s; %llu characters of the log came faster than the port took them\n",
++	    r == 0 ? "" : " (NOT CLEANLY)", log_skipped);
++}
++
++static void
++take_controller(void)
++{
++	uint32_t bootcpu = 0, usbfree = 0;
++	thread_t thread;
++	int major;
++
++	PE_parse_boot_argn("bootcpu", &bootcpu, sizeof(bootcpu));
++	PE_parse_boot_argn("usbfree", &usbfree, sizeof(usbfree));
++	if (bootcpu != 0 && usbfree == 0) {
++		say("usb: the loader keeps a core of its own (bootcpu=%u) and serves its link on this controller: left to it\n", bootcpu);
++		return;
++	}
++	if (bootcpu != 0) {
++		say("usb: the loader on its own core has stopped its link and lent the controller for this run (usbfree=1)\n");
++	}
++	{
++		char name[sizeof(usb_name)] = { 0 };
++		bool good = PE_parse_boot_arg_str("usb_name", name, sizeof(name)) && name[0] != 0;
++
++		/* printable ASCII only (a USB string descriptor here), '_' standing for the space a boot argument cannot hold */
++		for (size_t i = 0; good && name[i] != 0; i++) {
++			name[i] = name[i] == '_' ? ' ' : name[i];
++			good = name[i] >= 0x20 && name[i] <= 0x7e;
++		}
++		if (good) {
++			strlcpy(usb_name, name, sizeof(usb_name));
++		}
++	}
++	if (!dwc_readable() || ((rd(dwc, DWC3_GCTL) >> 12) & 3) != 2) {
++		say("usb: the controller is not powered, clocked and in device mode as the firmware leaves it: not taken\n");
++		return;
++	}
++	usb_dma_pa = kvtophys((vm_offset_t)usb_dma);
++	for (vm_offset_t off = PAGE_SIZE; off < sizeof(usb_dma); off += PAGE_SIZE) {
++		if (kvtophys((vm_offset_t)usb_dma + off) != usb_dma_pa + off) {
++			say("usb: the DMA memory is not contiguous: not taken\n");
++			return;
++		}
++	}
++	major = cdevsw_add(-1, &usb_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "hakios-usb") == NULL) {
++		say("usb: /dev/hakios-usb cannot be made\n");
++	}
++	if (kernel_thread_start(usb_thread, NULL, &thread) != KERN_SUCCESS) {
++		say("usb: no thread: not taken\n");
++		return;
++	}
++	thread_set_thread_name(thread, "usb:usb_thread");
++	thread_deallocate(thread);
++	usb_taken = true;
++}
++
++void hakios_usb_init(void);
++
++void
++hakios_usb_init(void)
++{
++	if (!PE_parse_boot_argn("usb", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	if (!hakios_board_is_alioth()) {
++		say("usb: these are the Redmi K40's addresses, and this is not a Redmi K40: nothing done\n");
++		return;
++	}
++	gcc = ml_io_map(GCC_BASE, 0x10000 + 0xf000);
++	dwc = ml_io_map(DWC3_BASE, 0x100000);
++	smmu = ml_io_map(SMMU_BASE, 0x1000);
++	if (gcc == 0 || dwc == 0 || smmu == 0) {
++		say("usb: cannot map the registers\n");
++		return;
++	}
++	say("usb: level %u: %s\n", level, level == 1 ? "a look, reading only" : "a look, then the controller for the kernel");
++	look_power();
++	look_controller();
++	look_smmu();
++	if (level >= 2) {
++		take_controller();
++	}
++}
+diff --git a/bsd/dev/hakios_usb_adapter.c b/bsd/dev/hakios_usb_adapter.c
+new file mode 100644
+index 0000000..3ff7ac2
+--- /dev/null
++++ b/bsd/dev/hakios_usb_adapter.c
+@@ -0,0 +1,75 @@
++/*
++ * hakios-port-usb: the few symbols xiongnemo/hakios-alioth's USB files expect
++ * from the rest of their kernel, implemented against this tree.
++ *
++ * Nothing here is on the default boot path: hakios_usb_init() is only called
++ * when the `usbhakios=1` boot argument is present (see 0300-hakios-usb.patch).
++ *
++ *   hakios_board_is_alioth()  their /chosen hakios-board test, plus usbhakios=1
++ *                             so this branch needs no ADT change to be tried
++ *   hakios_smmu_lock          serializes the read-only apps-SMMU walk in
++ *                             hakios.usb.c (their SMMU driver owns it upstream)
++ *   loader_log_putc/tee       their loader log ring; here every byte also goes
++ *                             into our persistent console ring (sweet_ufs.c)
++ *                             so a session can be read back with sweetlogdump
++ *
++ * hakios_usbmux_publish()/hakios_usbmux_host() are defined by
++ * iokit/Kernel/hakios.usbmux.cpp, which is built with this adapter.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/vm_types.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <kern/locks.h>
++#include <sys/hakios.board.h>
++
++/* bsd/dev/sweet_ufs.c: the 4 MiB console ring read by sweetlogdump. */
++extern void sweet_log_append(const char *c, int size);
++
++/* Their loader log tee (osfmk/arm64/loader_return.c upstream): 64 KiB. */
++#define HAKIOS_LOADER_LOG_TEE (64 * 1024)
++
++char loader_log_tee[HAKIOS_LOADER_LOG_TEE];
++volatile uint64_t loader_log_tee_total;
++
++void
++loader_log_putc(char c)
++{
++	uint64_t at = __atomic_fetch_add(&loader_log_tee_total, 1, __ATOMIC_RELEASE);
++
++	loader_log_tee[at % HAKIOS_LOADER_LOG_TEE] = c;
++	/* Never blocks; also survives the session in the UFS console ring. */
++	sweet_log_append(&c, 1);
++}
++
++/* Their SMMU driver owns this mutex upstream; the USB walk only reads. */
++static LCK_GRP_DECLARE(hakios_smmu_lck_grp, "hakios-smmu");
++LCK_MTX_DECLARE(hakios_smmu_lock, &hakios_smmu_lck_grp);
++
++bool
++hakios_board_is_alioth(void)
++{
++	DTEntry chosen;
++	const void *board;
++	unsigned size;
++	uint32_t opt_in = 0;
++
++	/*
++	 * tools/mkadt.py does not emit /chosen hakios-board on this tree, so the
++	 * explicit boot argument is the switch; a future ADT property also works.
++	 */
++	if (PE_parse_boot_argn("usbhakios", &opt_in, sizeof(opt_in)) && opt_in != 0) {
++		return true;
++	}
++	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	       SecureDTGetProperty(chosen, "hakios-board", &board, &size) == kSuccess &&
++	       size == 7 && memcmp(board, "alioth", 7) == 0;
++}
++
++/* Their panel height helper; not used by the USB files, kept for the header. */
++uint32_t
++hakios_board_panel_height(void)
++{
++	return hakios_board_is_alioth() ? 2400 : 2340;
++}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f585be7..92fd55d 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
++extern void hakios_usb_init(void);
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
+ extern bool alioth_board(void);
+@@ -676,6 +677,17 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
+ 	sweet_gpu_init();
++	/*
++	 * xiongnemo/hakios-alioth's USB stack (hakios-port-usb), opt-in only:
++	 * without usbhakios=1 the default boot is unchanged.
++	 */
++	{
++		uint32_t usbhakios = 0;
++
++		if (PE_parse_boot_argn("usbhakios", &usbhakios, sizeof(usbhakios)) && usbhakios != 0) {
++			hakios_usb_init();
++		}
++	}
+ 	return 0;
+ }
+ 
+diff --git a/bsd/sys/hakios.board.h b/bsd/sys/hakios.board.h
+new file mode 100644
+index 0000000..aee9b3c
+--- /dev/null
++++ b/bsd/sys/hakios.board.h
+@@ -0,0 +1,33 @@
++/*
++ * The board: where the blocks of the phone's SoC are (bsd/dev/hakios.board.c). The drivers of the port were
++ * brought up on one phone (the POCO X5 Pro, SM7325), and every address of a block they talk to is that
++ * phone's -- unless the kernel's command line names another: board_<block>=0x... A device profile says so
++ * (common/devices/<device>.conf, BOARD_ARGS; common/new-device.sh reads them out of the phone's own device
++ * tree), so a phone with the same blocks at other places needs no other kernel.
++ */
++#ifndef _SYS_HK_BOARD_H_
++#define _SYS_HK_BOARD_H_
++
++#include <mach/vm_types.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* the physical address of a block: board_<name>= on the command line, else `dflt` (the brought-up phone's) */
++vm_offset_t hakios_board_addr(const char *name, vm_offset_t dflt);
++/* a number of the board (counts, sizes): board_<name>=, else `dflt` */
++uint32_t hakios_board_number(const char *name, uint32_t dflt);
++/* every board_ address that was given, once, to the log (hakios.input.c, at the drivers' start) */
++void hakios_board_report(void);
++/* the loader's hakios-board names a kona phone (umi, alioth) */
++bool hakios_board_kona_name(const void *board, unsigned size);
++bool hakios_board_is_alioth(void);
++uint32_t hakios_board_panel_height(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _SYS_HK_BOARD_H_ */
+diff --git a/iokit/Kernel/hakios.usbmux.cpp b/iokit/Kernel/hakios.usbmux.cpp
+new file mode 100644
+index 0000000..ceff31c
+--- /dev/null
++++ b/iokit/Kernel/hakios.usbmux.cpp
+@@ -0,0 +1,77 @@
++/*
++ * usb=3: what an iPhone's kernel has for its USB mux, AppleUSBDeviceMux, as lockdownd sees it -- a service of
++ * that class, whose clients are told when a computer's usbmux is there (message 0xe3ff8201, argument 1) and when
++ * it has gone (argument 0). lockdownd matches the class (IOServiceMatching("AppleUSBDeviceMux")), asks for its
++ * general interest, and in mux_notification_handler takes the message for "a USB host is connected"
++ * (usb_host_connected: the flag without which it shows no "Trust This Computer" and refuses to pair,
++ * "USB or proxy host no longer connected"). The mux itself is /redwood/bin/usbmux and bsd/dev/hakios.usb.c;
++ * this is only its face in the registry.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOLib.h>
++#include <sys/errno.h>
++
++#define kMuxHostMessage 0xe3ff8201u     /* (lockdownd 20F66, mux_notification_handler) */
++
++class AppleUSBDeviceMux : public IOService
++{
++	OSDeclareDefaultStructors(AppleUSBDeviceMux);
++};
++
++OSDefineMetaClassAndStructors(AppleUSBDeviceMux, IOService);
++
++static AppleUSBDeviceMux *gMux;
++static bool gMuxHost;
++
++extern "C" int hakios_usbmux_publish(void);
++extern "C" void hakios_usbmux_host(bool connected);
++
++/* The service, once (when the port becomes an iPhone's). */
++extern "C" int
++hakios_usbmux_publish(void)
++{
++	IOService *provider = IOService::getPlatform();
++	AppleUSBDeviceMux *mux;
++
++	if (gMux != NULL) {
++		return 0;
++	}
++	mux = new AppleUSBDeviceMux;
++	if (provider == NULL || mux == NULL || !mux->init()) {
++		if (mux != NULL) {
++			mux->release();
++		}
++		return ENOMEM;
++	}
++	mux->setName("AppleUSBDeviceMux");
++	mux->setProperty("HakiosUSBMux", true);
++	if (!mux->attach(provider)) {
++		mux->release();
++		return EIO;
++	}
++	if (!mux->start(provider)) {
++		mux->detach(provider);
++		mux->release();
++		return EIO;
++	}
++	mux->registerService();
++	gMux = mux;
++	IOLog("usb: AppleUSBDeviceMux published, for lockdownd\n");
++	return 0;
++}
++
++/* A computer's usbmux has come (or gone): its clients told; said again for each, the same state included. */
++extern "C" void
++hakios_usbmux_host(bool connected)
++{
++	if (gMux == NULL) {
++		return;
++	}
++	if (connected != gMuxHost) {
++		IOLog("usb: AppleUSBDeviceMux: the computer's usbmux has %s\n", connected ? "come" : "gone");
++	}
++	gMuxHost = connected;
++	gMux->setProperty("HakiosHostConnected", connected);
++	gMux->messageClients(kMuxHostMessage, (void *)(uintptr_t)(connected ? 1 : 0));
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..b18b717 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitc
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
++iokit/Kernel/hakios.usbmux.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
