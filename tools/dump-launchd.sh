@@ -22,15 +22,14 @@ import plistlib, sys, pprint
 path = sys.argv[1]
 d = plistlib.load(open(path, 'rb'))
 print("top keys:", list(d)[:10])
-for key, val in d.items():
-    if isinstance(val, dict) and val:
-        print(f"\n{key}: {len(val)} entries")
-        keys = list(val)[:2]
-        print("first keys:", keys)
-        for k in keys:
-            print(f"\n--- {k}")
-            pprint.pprint(val[k], width=130, sort_dicts=False)
-        break
+val = d.get('LaunchDaemons') or {}
+print(f"\nLaunchDaemons: {len(val)} entries")
+keys = list(val)[:3]
+print("first keys:", keys)
+for k in keys:
+    print(f"\n--- {k}")
+    pprint.pprint(val[k], width=130, sort_dicts=False)
+    print("   (type:", type(val[k]).__name__, ")")
 PY
 
 umount "$mnt"
