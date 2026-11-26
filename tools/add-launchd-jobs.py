@@ -44,8 +44,7 @@ JOBS = {
             '/bin/sh', '-c',
             'if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; '
             'sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; '
-            '/usr/local/bin/gl_test > /dev/hakios-usb 2>&1 || '
-            '/usr/local/bin/gl_test > /dev/console 2>&1; fi',
+            '/usr/local/bin/gl_test 2>&1; fi',
         ],
         'RunAtLoad': True,
         'StandardOutPath': '/dev/console',
