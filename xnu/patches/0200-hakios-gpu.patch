@@ -6172,10 +6172,10 @@ index 0000000..1a35381
 +#endif /* _IOKIT_MINIDRIVERS_H */
 diff --git a/iokit/Kernel/MiniIOSurface.h b/iokit/Kernel/MiniIOSurface.h
 new file mode 100644
-index 0000000..175177b
+index 0000000..35b00e6
 --- /dev/null
 +++ b/iokit/Kernel/MiniIOSurface.h
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,232 @@
 +/*
 + * MiniIOSurface: a stand-in for Apple's closed IOSurface.kext, enough of it for the iOS
 + * window server and its clients to share pixel buffers on a machine without Apple hardware.
@@ -6322,6 +6322,12 @@ index 0000000..175177b
 +	 */
 +	IOMemoryMap *                   readMap;
 +	uint8_t *                       kreadPixels;
++	/*
++	 * (ios-sweet adapter) The SweetSurface this object was made around by
++	 * MiniIOSurfaceCopy(). NULL for a real MiniIOSurface. MiniIOSurfaceDrop()
++	 * releases it with this object.
++	 */
++	void *                          sweet_surface;
 +
 +	virtual bool
 +	init(void) APPLE_KEXT_OVERRIDE
@@ -6333,6 +6339,7 @@ index 0000000..175177b
 +		scanPhys = 0;
 +		readMap = NULL;
 +		kreadPixels = NULL;
++		sweet_surface = NULL;
 +		return OSObject::init();
 +	}
 +	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -6403,10 +6410,10 @@ index 0000000..175177b
 +#endif /* _IOKIT_MINIIOSURFACE_H */
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..332c97d
+index 0000000..d6905e0
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,1888 @@
+@@ -0,0 +1,1942 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -6658,7 +6665,9 @@ index 0000000..332c97d
 +/* (11-19) the interval rule left out for surfaces said GPU-only (MiniIOSurface.h gpu_only; submit() says why) */
 +static TUNABLE(uint32_t, gPushGPUOnly, "gpu_push_gpuonly", 0);
 +/* (11-19) a surface around a program's memory made a GPU buffer when its rows and start allow (surfaceBuffer()) */
-+static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 0);
++/* ios-sweet: SweetSurface-backed buffers are wrapped by the adapter, so the
++ * wrap path is the default here (the reference defaults to 0 for its own MiniIOSurface). */
++static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 1);
 +/*
 + * (11-19) ... and its own interval: census c6 (gpu_wrap=1) moved the compositor's cost from copying and hashing those
 + * surfaces to pushing them -- 3-5 GB in 5 s in home flicks, Control Center and the app switcher on the 4 ms rule. They
@@ -6982,8 +6991,10 @@ index 0000000..332c97d
 +		return false;
 +	}
 +	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
++	setProperty("IOClass", "HakiosGPU");
 +	setName("HakiosGPU");
 +	registerService();
++	IOLog("HakiosGPU: IOServiceMatching(\"HakiosGPU\") will find this service; open it with type 0\n");
 +	return true;
 +}
 +
@@ -7020,12 +7031,55 @@ index 0000000..332c97d
 +	IOLockUnlock(gGPULock);
 +}
 +
++static thread_call_t gGPUStartCall;             /* ios-sweet: IOKit is not up yet when the GPU is kept */
++static bool gGPUStartDone;
++
++static void
++gpuStartServiceWork(thread_call_param_t, thread_call_param_t)
++{
++	if (IOService::getPlatform() == NULL) {
++		uint64_t deadline;
++
++		clock_interval_to_deadline(100, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(gGPUStartCall, deadline);
++		return;
++	}
++	HakiosGPUStart();
++}
++
 +void
 +HakiosGPUStart(void)
 +{
 +	IOService * provider = IOService::getPlatform();
 +	HakiosGPU * gpu;
 +	uint32_t cached = 0;
++
++	if (gGPUStartDone) {
++		return;
++	}
++	/*
++	 * hakios_adreno_init() runs from sweet_ufs_init() while bsd_init is still
++	 * bringing the root up, before IOKitBSDInit() has started the platform
++	 * expert. Do the driver-side setup now, but wait (asynchronously) for the
++	 * platform expert before publishing HakiosGPU.
++	 */
++	if (provider == NULL) {
++		uint64_t deadline;
++
++		if (gGPUStartCall == NULL) {
++			gGPUStartCall = thread_call_allocate_with_options(gpuStartServiceWork, NULL,
++			    THREAD_CALL_PRIORITY_KERNEL, 0);
++		}
++		if (gGPUStartCall != NULL) {
++			clock_interval_to_deadline(100, kMillisecondScale, &deadline);
++			thread_call_enter_delayed(gGPUStartCall, deadline);
++			IOLog("HakiosGPU: IOKit platform not up yet; service start deferred\n");
++		} else {
++			IOLog("HakiosGPU: no thread_call for the deferred service start\n");
++		}
++		return;
++	}
++	gGPUStartDone = true;
 +
 +	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 +	gGPULock = IOLockAlloc();
@@ -7052,8 +7106,12 @@ index 0000000..332c97d
 +			thread_call_enter_delayed(gGPUTestHangCall, deadline);
 +		}
 +	}
++	if (provider == NULL) {
++		IOLog("HakiosGPU: no platform expert yet; the service is not published (start the GPU later)\n");
++		return;
++	}
 +	gpu = OSTypeAlloc(HakiosGPU);
-+	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++	if (gpu == NULL || !gpu->init() || !gpu->attach(provider)) {
 +		OSSafeReleaseNULL(gpu);
 +		IOLog("HakiosGPU: cannot create the service\n");
 +		return;
@@ -7061,7 +7119,10 @@ index 0000000..332c97d
 +	if (!gpu->start(provider)) {
 +		gpu->detach(provider);
 +		IOLog("HakiosGPU: the service did not start\n");
++		gpu->release();
++		return;
 +	}
++	IOLog("HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient\n");
 +	gpu->release();
 +}
 +
@@ -8297,25 +8358,60 @@ index 0000000..332c97d
 +}
 diff --git a/iokit/Kernel/hakios_miniosurface_stub.cpp b/iokit/Kernel/hakios_miniosurface_stub.cpp
 new file mode 100644
-index 0000000..ad0258f
+index 0000000..fa24bc2
 --- /dev/null
 +++ b/iokit/Kernel/hakios_miniosurface_stub.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,160 @@
 +/*
-+ * Stand-ins for the two MiniIOSurface helpers the GPU service calls, for a
-+ * first compile-only evaluation.
++ * The MiniIOSurface side of the ios-sweet adapter, phase 2.
 + *
-+ * This tree already has its own IOSurface implementation
-+ * (iokit/Kernel/arm/SweetSurface.cpp, class IOSurfaceRootUserClient). The
-+ * reference's MiniIOSurface.cpp defines a second IOSurfaceRootUserClient with
-+ * the same C++ names, so building both would be a duplicate-symbol link error.
-+ * Phase 1 therefore builds the GPU service against MiniIOSurface.h only, with
-+ * these four entry points as stubs; putting surfaces into the GPU's address
-+ * space is not usable until the two implementations are merged (PORT-NOTES.md).
++ * We do NOT build the reference's MiniIOSurface.cpp: it defines a second
++ * IOSurfaceRootUserClient, which would collide with SweetSurface.cpp's (the
++ * working display/HID path). Instead, MiniIOSurfaceCopy() wraps the existing
++ * SweetSurface for the same IOSurface id and fills the fields hakios.gpu.cpp
++ * reads. The wrapper is an ordinary MiniIOSurface object with an extra
++ * `sweet_surface` pointer (MiniIOSurface.h); Drop releases it.
 + *
-+ * When the merge happens, delete this file and build MiniIOSurface.cpp instead.
++ * What the GPU service sees:
++ *   client        the SweetSurface's IOMemoryDescriptor (pixels)
++ *   kpixels       kernel VA of those pixels
++ *   kbase         the SweetSurface state page, so shared()->seed is the same
++ *                 seed the IOSurface framework/lock path moves (offset 0xc)
++ *   info          geometry and allocSize copied from the SweetSurface
++ *   scanPhys      non-zero only for the physical panel surface (its memory is
++ *                 an IOMemoryDescriptor, not an IOBufferMemoryDescriptor)
++ *
++ * With gpu_wrap defaulting to 1 (hakios.gpu.cpp) surfaceBuffer() takes the
++ * wrap path for every buffer-backed surface: IOSubMemoryDescriptor over the
++ * SweetSurface pixels from offset 0, entered into the GPU's address space.
 + */
 +#include "MiniIOSurface.h"
++#include "arm/SweetSurface.h"
++
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSObject.h>
++
++OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
++
++static uint8_t sweet_minisurf_zero[MINISURF_AUX_OFFSET + sizeof(struct minisurf_aux)];
++
++void
++MiniIOSurface::free(void)
++{
++	SweetSurface *sweet = (SweetSurface *)sweet_surface;
++
++	if (sweet != NULL) {
++		sweet->release();
++		sweet_surface = NULL;
++	}
++	OSObject::free();
++}
++
++void
++MiniIOSurface::updateValuesState(void)
++{
++	/* No per-surface values dictionary in this adapter. */
++}
 +
 +extern "C" void
 +loader_log_line(const char *line)
@@ -8326,29 +8422,105 @@ index 0000000..ad0258f
 +MiniIOSurface *
 +MiniIOSurfaceCopy(uint32_t sid)
 +{
-+	printf("HAKIOS GPU: MiniIOSurfaceCopy(%u): the MiniIOSurface/SweetSurface merge is not done yet\n", sid);
-+	return NULL;
-+}
++	static uint64_t told;
++	SweetSurface *sweet = sweet_surface_copy(sid);
++	MiniIOSurface *m;
 +
-+void
-+MiniIOSurfaceDrop(MiniIOSurface *surface)
-+{
-+	(void)surface;
++	if (sweet == NULL) {
++		return NULL;
++	}
++	m = OSTypeAlloc(MiniIOSurface);
++	if (m == NULL || !m->init()) {
++		OSSafeReleaseNULL(m);
++		sweet->release();
++		return NULL;
++	}
++	m->sid = sweet->id;
++	m->holders = 1;
++	m->memory = OSDynamicCast(IOBufferMemoryDescriptor, sweet->memory);
++	m->client = sweet->memory;
++	m->clientMap = NULL;
++	m->clientTask = NULL;
++	m->clientTaskID = 0;
++	m->clientAddress = 0;
++	m->kpixels = (uint8_t *)sweet->kernelAddress();
++	m->kbase = sweet->state != NULL ? (uint8_t *)sweet->state->getBytesNoCopy() : sweet_minisurf_zero;
++	m->drawn = 0;
++	m->gpu_written = false;
++	m->gpu_only = false;
++	m->drawn_moves = 0;
++	m->scanPhys = m->memory == NULL ? 1 : 0;        /* physical panel memory */
++	m->values = NULL;
++	m->useCount[0] = m->useCount[1] = 0;
++	m->purgeable = 0;
++	m->traced = false;
++	m->readMap = NULL;
++	m->kreadPixels = NULL;
++
++	m->info.base = 0;
++	m->info.shared = 0;
++	m->info.aux = 0;
++	m->info.sid = sweet->id;
++	m->info.allocSize = sweet->allocSize;
++	m->info.width = sweet->width;
++	m->info.height = sweet->height;
++	m->info.bytesPerRow = sweet->bytesPerRow;
++	m->info.offset = sweet->offset;
++	m->info.pixelFormat = sweet->pixelFormat;
++	m->info.planeCount = sweet->planeCount;
++	m->info.bytesPerElement = sweet->bytesPerElement;
++	m->info.elementWidth = sweet->elementWidth;
++	m->info.elementHeight = sweet->elementHeight;
++
++	for (uint32_t i = 0; i < sweet->planeCount && i < MINISURF_MAX_PLANES; i++) {
++		m->planes[i].width = sweet->planes[i].width;
++		m->planes[i].height = sweet->planes[i].height;
++		m->planes[i].offset = sweet->planes[i].offset;
++		m->planes[i].bytesPerRow = sweet->planes[i].bytesPerRow;
++		m->planes[i].size = sweet->planes[i].size;
++		m->planes[i].bytesPerElement = sweet->planes[i].bytesPerElement;
++		m->planes[i].elementWidth = sweet->planes[i].elementWidth;
++		m->planes[i].elementHeight = sweet->planes[i].elementHeight;
++	}
++
++	m->sweet_surface = sweet;
++	if (told++ < 8) {
++		IOLog("HakiosGPU: surface %u wrapped as MiniIOSurface: %ux%u fmt %#x bpr %u size %u%s\n",
++		    sid, sweet->width, sweet->height, sweet->pixelFormat, sweet->bytesPerRow,
++		    sweet->allocSize, m->scanPhys != 0 ? " (physical panel memory)" : "");
++	}
++	return m;
 +}
 +
 +MiniIOSurface *
 +MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
 +{
-+	printf("HAKIOS GPU: MiniIOSurfaceCreateSimple(%ux%u, %#x) not implemented\n", width, height, pixelFormat);
++	/* Not used by hakios.gpu.cpp; IOSurface creation stays with SweetSurface's
++	 * IOSurfaceRootUserClient (IOSurface.framework). */
++	(void)width;
++	(void)height;
++	(void)pixelFormat;
 +	return NULL;
 +}
 +
 +mach_port_name_t
 +MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface *surface)
 +{
-+	(void)task;
-+	(void)surface;
-+	return 0;
++	SweetSurface *sweet;
++
++	if (surface == NULL || surface->sweet_surface == NULL) {
++		return 0;
++	}
++	sweet = (SweetSurface *)surface->sweet_surface;
++	return sweet_surface_port_in_task(sweet, task);
++}
++
++void
++MiniIOSurfaceDrop(MiniIOSurface *surface)
++{
++	if (surface != NULL) {
++		surface->release();
++	}
 +}
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index acc9ae0..c1eeefe 100644

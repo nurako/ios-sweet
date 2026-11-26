@@ -144,6 +144,12 @@ public:
 	 */
 	IOMemoryMap *                   readMap;
 	uint8_t *                       kreadPixels;
+	/*
+	 * (ios-sweet adapter) The SweetSurface this object was made around by
+	 * MiniIOSurfaceCopy(). NULL for a real MiniIOSurface. MiniIOSurfaceDrop()
+	 * releases it with this object.
+	 */
+	void *                          sweet_surface;
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
@@ -155,6 +161,7 @@ public:
 		scanPhys = 0;
 		readMap = NULL;
 		kreadPixels = NULL;
+		sweet_surface = NULL;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;

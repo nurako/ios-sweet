@@ -249,7 +249,9 @@ static TUNABLE(uint32_t, gPushAgainMs, "gpu_push_ms", GPU_PUSH_AGAIN_MS);
 /* (11-19) the interval rule left out for surfaces said GPU-only (MiniIOSurface.h gpu_only; submit() says why) */
 static TUNABLE(uint32_t, gPushGPUOnly, "gpu_push_gpuonly", 0);
 /* (11-19) a surface around a program's memory made a GPU buffer when its rows and start allow (surfaceBuffer()) */
-static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 0);
+/* ios-sweet: SweetSurface-backed buffers are wrapped by the adapter, so the
+ * wrap path is the default here (the reference defaults to 0 for its own MiniIOSurface). */
+static TUNABLE(uint32_t, gWrapImport, "gpu_wrap", 1);
 /*
  * (11-19) ... and its own interval: census c6 (gpu_wrap=1) moved the compositor's cost from copying and hashing those
  * surfaces to pushing them -- 3-5 GB in 5 s in home flicks, Control Center and the app switcher on the 4 ms rule. They
@@ -573,8 +575,10 @@ HakiosGPU::start(IOService * provider)
 		return false;
 	}
 	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
+	setProperty("IOClass", "HakiosGPU");
 	setName("HakiosGPU");
 	registerService();
+	IOLog("HakiosGPU: IOServiceMatching(\"HakiosGPU\") will find this service; open it with type 0\n");
 	return true;
 }
 
@@ -611,12 +615,55 @@ gpuTestHangWork(thread_call_param_t, thread_call_param_t)
 	IOLockUnlock(gGPULock);
 }
 
+static thread_call_t gGPUStartCall;             /* ios-sweet: IOKit is not up yet when the GPU is kept */
+static bool gGPUStartDone;
+
+static void
+gpuStartServiceWork(thread_call_param_t, thread_call_param_t)
+{
+	if (IOService::getPlatform() == NULL) {
+		uint64_t deadline;
+
+		clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gGPUStartCall, deadline);
+		return;
+	}
+	HakiosGPUStart();
+}
+
 void
 HakiosGPUStart(void)
 {
 	IOService * provider = IOService::getPlatform();
 	HakiosGPU * gpu;
 	uint32_t cached = 0;
+
+	if (gGPUStartDone) {
+		return;
+	}
+	/*
+	 * hakios_adreno_init() runs from sweet_ufs_init() while bsd_init is still
+	 * bringing the root up, before IOKitBSDInit() has started the platform
+	 * expert. Do the driver-side setup now, but wait (asynchronously) for the
+	 * platform expert before publishing HakiosGPU.
+	 */
+	if (provider == NULL) {
+		uint64_t deadline;
+
+		if (gGPUStartCall == NULL) {
+			gGPUStartCall = thread_call_allocate_with_options(gpuStartServiceWork, NULL,
+			    THREAD_CALL_PRIORITY_KERNEL, 0);
+		}
+		if (gGPUStartCall != NULL) {
+			clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+			thread_call_enter_delayed(gGPUStartCall, deadline);
+			IOLog("HakiosGPU: IOKit platform not up yet; service start deferred\n");
+		} else {
+			IOLog("HakiosGPU: no thread_call for the deferred service start\n");
+		}
+		return;
+	}
+	gGPUStartDone = true;
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
@@ -643,8 +690,12 @@ HakiosGPUStart(void)
 			thread_call_enter_delayed(gGPUTestHangCall, deadline);
 		}
 	}
+	if (provider == NULL) {
+		IOLog("HakiosGPU: no platform expert yet; the service is not published (start the GPU later)\n");
+		return;
+	}
 	gpu = OSTypeAlloc(HakiosGPU);
-	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+	if (gpu == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
 		IOLog("HakiosGPU: cannot create the service\n");
 		return;
@@ -652,7 +703,10 @@ HakiosGPUStart(void)
 	if (!gpu->start(provider)) {
 		gpu->detach(provider);
 		IOLog("HakiosGPU: the service did not start\n");
+		gpu->release();
+		return;
 	}
+	IOLog("HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient\n");
 	gpu->release();
 }
 
