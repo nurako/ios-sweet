@@ -81,6 +81,12 @@ else
 	echo "  (no LaunchDaemons directory or no tools/daemons: skipped)"
 fi
 
+if [ "${GL_TEST:-0}" = 1 ]; then
+	mkdir -p "$mnt/var/tmp"
+	touch "$mnt/var/tmp/run-gl-test"
+	echo "  /var/tmp/run-gl-test (gl_test will run once on this boot)"
+fi
+
 echo "== flush and unmount"
 sync
 umount "$mnt"

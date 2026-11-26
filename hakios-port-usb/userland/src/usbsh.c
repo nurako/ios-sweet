@@ -77,6 +77,7 @@ out_bytes(const char *p, size_t n)
 }
 
 static void out(const char *format, ...) __printflike(1, 2);
+static void bootlog(const char *format, ...) __printflike(1, 2);
 
 static void
 out(const char *format, ...)
@@ -761,6 +762,7 @@ serve(void)
 			if (!talking) {
 				/* the first thing typed since the log had the port */
 				talking = 1;
+				bootlog("USBSH: the computer has taken the port; kernel log paused");
 				len = 0;
 				out("\n--- usbsh: the log is paused; 'help' for commands, 'log' to resume it ---\n");
 				prompt();
@@ -883,29 +885,92 @@ listen_on(int tcp_port)
 	}
 }
 
+/*
+ * A line to the boot console (and so, with 0047/0119, the persistent ring),
+ * independently of launchd's StandardOutPath -- that is /dev/null in the job
+ * we install, because a job whose stdout is /dev/console can fail to launch on
+ * this root. Only state transitions go here; the shell's own I/O is the USB
+ * port.
+ */
+static void
+bootlog(const char *format, ...)
+{
+	static FILE *console;
+	va_list list;
+
+	if (console == NULL) {
+		console = fopen("/dev/console", "a");
+	}
+	if (console == NULL) {
+		return;
+	}
+	va_start(list, format);
+	vfprintf(console, format, list);
+	va_end(list);
+	fputc('\n', console);
+	fflush(console);
+}
+
+/* The usb=N value from kern.bootargs, or -1. */
+static int
+usb_level(void)
+{
+	char args[1024] = "";
+	size_t len = sizeof(args) - 1;
+	const char *p;
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return -1;
+	}
+	args[len] = 0;
+	for (p = args; (p = strstr(p, "usb=")) != NULL; p += 4) {
+		if ((p == args || p[-1] == ' ') && p[4] >= '0' && p[4] <= '9') {
+			return atoi(p + 4);
+		}
+	}
+	return -1;
+}
+
 int
 main(int argc, char **argv)
 {
+	int level;
+	unsigned tries = 0;
+
 	signal(SIGPIPE, SIG_IGN);
 	chdir("/");
 	if (argc > 2 && !strcmp(argv[1], "-l")) {
 		return listen_on(atoi(argv[2]));
 	}
-	{
-		/* usb=3: the port is an iPhone's usbmux, userland usbmux's: not ours to open */
-		char args[1024] = "";
-		size_t len = sizeof(args) - 1;
-
-		if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) == 0 && (strncmp(args, "usb=3", 5) == 0 || strstr(args, " usb=3"))) {
-			printf("usbsh: usb=3: the USB port is an iPhone's (userland usbmux has it)\n");
-			return 0;
-		}
-	}
-	port = open("/dev/hakios-usb", O_RDWR);
-	if (port < 0) {
-		printf("usbsh: no USB serial port (%s): the kernel has not got the controller (usb=2)\n", strerror(errno));
+	level = usb_level();
+	if (level != 2) {
+		/*
+		 * One owner per boot: usb=2 is the CDC-ACM shell and belongs to
+		 * usbsh; usb=3 is the iPhone mux and belongs to usbmux. Never race
+		 * for /dev/hakios-usb -- whoever loses would exit and be silent.
+		 */
+		bootlog("USBSH: usb=%d, not usb=2: %s", level,
+		    level == 3 ? "usbmux owns the port" : "no CDC-ACM port on this boot");
 		return 0;
 	}
+	bootlog("USBSH: usb=2: waiting for /dev/hakios-usb (the kernel brings the CDC port up early in boot)");
+	for (;;) {
+		port = open("/dev/hakios-usb", O_RDWR);
+		if (port >= 0) {
+			break;
+		}
+		if (errno != ENXIO && errno != EBUSY && errno != ENOENT) {
+			bootlog("USBSH: open /dev/hakios-usb: %s", strerror(errno));
+			return 1;
+		}
+		if (tries == 0 || tries % 30 == 29) {
+			bootlog("USBSH: /dev/hakios-usb not ready (%s), still waiting (%u s)",
+			    strerror(errno), tries + 1);
+		}
+		tries++;
+		sleep(1);
+	}
+	bootlog("USBSH: the port is open; shell ready (send CR to start)");
 	printf("usbsh: the USB serial port is ours to share with the kernel's log\n");
 	return serve();
 }

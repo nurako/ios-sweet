@@ -4,19 +4,11 @@
 <dict>
 	<key>Label</key>
 	<string>com.hakios.gltest</string>
-	<!--
-	    OPT-IN: a broken GPU client can panic the kernel, so this job must not
-	    run on a normal boot.  It runs once only when the root carries the
-	    sentinel /var/tmp/run-gl-test; the sentinel is removed first, so a
-	    panic leaves the next boot safe.  To run it deliberately:
-	        touch <mounted-root>/var/tmp/run-gl-test    (or on the phone)
-	    then reboot.
-	-->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; /usr/local/bin/gl_test &gt; /dev/hakios-usb 2&gt;&amp;1 || /usr/local/bin/gl_test &gt; /dev/console 2&gt;&amp;1; fi</string>
+		<string>if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; echo "GLTEST: start"; sleep 5; export DYLD_LIBRARY_PATH=/usr/local/lib; /usr/local/bin/gl_test 2&gt;&amp;1; rc=$?; echo "GLTEST: exit $rc"; exit $rc; fi</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

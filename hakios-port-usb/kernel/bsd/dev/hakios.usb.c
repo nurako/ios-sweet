@@ -743,6 +743,7 @@ usb_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		say("usb: THE CONTROLLER IS THE KERNEL'S: a serial port (%04x:%04x \"%s\") from here on; its DMA at %#llx\n",
 		    USB_VID, USB_PID, usb_name, usb_dma_pa);
+		say("usb: the CDC-ACM port is up: /dev/hakios-usb may be opened now (usbsh retries until it is)\n");
 	}
 	log_at = loader_log_tee_total > LOG_BACKLOG ? loader_log_tee_total - LOG_BACKLOG : 0;
 	/*
@@ -879,15 +880,18 @@ usbdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused 
 {
 	/* (usb=3: before the device side is up too -- the program that opens it is what starts it) */
 	if (!usb_owned && !(level == 3 && usb_taken && !usb_stopping)) {
+		say("usb: open /dev/hakios-usb: the controller is not up yet (level %u)\n", level);
 		return ENXIO;
 	}
 	if (!OSCompareAndSwap(0, 1, &user_open)) {
+		say("usb: open /dev/hakios-usb: another program already has the port (level %u)\n", level);
 		return EBUSY;
 	}
 	lck_mtx_lock(&usb_lock);
 	rx_head = rx_tail = 0;
 	lck_mtx_unlock(&usb_lock);
-	say("usb: a program has the port (/dev/hakios-usb): the log goes on until the computer sends something\n");
+	say("usb: a program (pid %d) has the port (/dev/hakios-usb), level %u: the log goes on until the computer sends something\n",
+	    proc_selfpid(), level);
 	return 0;
 }
 
@@ -1258,6 +1262,7 @@ take_controller(void)
 	thread_set_thread_name(thread, "usb:usb_thread");
 	thread_deallocate(thread);
 	usb_taken = true;
+	say("usb: owner thread started (level %u): /dev/hakios-usb is there\n", level);
 }
 
 void hakios_usb_init(void);

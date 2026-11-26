@@ -92,6 +92,53 @@ not ported), cycles 0. Not booted. Notes: `hakios-port-battery/PORT-NOTES.md`.
   allowlisted and happen before launchd so a bad file can be replaced on the next boot.
 - **Trade-off:** phase 1 applies on the NEXT boot (the PC must be in recovery to write raw
   blocks); no live channel until USB works. See `docs/sweetbox.md`.
+## Agent handoff / active work (2026-11-26, console + USB ownership)
+
+### >>> UPDATE 2026-11-26 (branch `hakios-console`): userland console in the ring;
+###     one owner for /dev/hakios-usb (usb=2 usbsh, usb=3 usbmux); GLTEST markers <<<
+
+**A. Persistent ring now captures userland /dev/console (patch 0119, new).** The
+hook moved from `_cnputs` (only reached when the kernel console buffer is
+drained) to the entry of `console_write()` and `console_write_unbuffered()`
+in `osfmk/console/serial_console.c`. Every writer - kernel printf and the tty
+path `kmoutput()` -> `console_write()` used by launchd jobs' `/dev/console` -
+is appended once. `sweet_log_append()` is gated by `sweet_log_ready`, set by
+`sweet_log_start()` only after the UFS partition is found and the writer thread
+starts, so pre-ring boot text is dropped and `sweetlogdump` (which runs before
+start) cannot append itself. No per-byte cost added (same loop, one branch).
+Compile: `XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-con.log
+research/ci-buildtree bsd/dev/sweet_ufs.c osfmk/console/serial_console.c
+bsd/dev/hakios.usb.c` -> 0 of 3 failed (run 45833002347 log; used a copy of
+`ios-sweet/research/ci-buildtree` with the patched files overlaid).
+
+Read it back: wait >=10 s after the program writes (the writer flushes every
+`sweetlogsecs`, default 10; `ufslogsecs=1` for tests), then reboot with
+`sweetlogdump=262144 sweetloggrep=GLTEST sweetlogdumpwait=30` (or grep `USBSH`).
+The dump prints the previous session's tail from the last 4 MiB+4 KiB of
+userdata before this boot's log; `sweetloggrep` filters lines.
+
+**B. USB shell silent on most boots: a one-opener race, not a deadlock.**
+`usbmux` opened `/dev/hakios-usb` unconditionally. On `usb=2` it could win the
+`user_open` CAS before `usbsh`, fail `HAKIOS_USB_IPHONE` with `ENOTSUP`, and
+return 0 (so launchd's KeepAlive-on-failure never restarted it). `usbsh` then
+got `EBUSY`, treated it as success, and exited. The first host CR was queued to
+the ring and set `log_mode=false`, with no program reading: silence.
+Fix: both programs read `usb=` from `kern.bootargs` before opening. `usb=2` ->
+`usbsh` sole owner, retries `ENXIO/EBUSY/ENOENT`; `usb=3` -> `usbmux` sole
+owner, same retry. Kernel logs every transition. Host sequence and doc:
+`docs/usb-shell.md` (open raw, assert DTR/RTS optional, send one bare CR, wait
+`ios:/#`, then `command\r`; `tools/sweet-usbsh.sh` does it).
+
+**GLTEST:** the job now echoes `GLTEST: start` before the 5 s delay and
+`GLTEST: exit N` after `gl_test`, so screen/ring shows whether it ran and how
+it ended. Updated in both `tools/add-launchd-jobs.py` and
+`tools/daemons/com.hakios.gltest.plist`.
+
+**Uncertain / next:** userland was not compiled here (no iOS SDK on this box);
+the edits are C89-style and use only existing headers. `0300` was regenerated
+and re-checked to apply after 0200 (which itself stays after 0001..0118); it
+does not touch `bsd/dev/sweet_gpu.c`. On-device boot verification of the retry
+and markers is still needed.
 
 ## Agent handoff / active work (2026-11-22, latest)
 
