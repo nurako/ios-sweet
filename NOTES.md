@@ -1,5 +1,30 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Agent handoff 2026-11-26: SWEETBOX no-reflash install channel (branch `hakios-autorun`)
+
+- **Goal:** stop rebuilding/flashing the 16 GiB userdata image for every userland change.
+  Design basis: `ios-guacamole`'s `SWEETBOX` (kernel 0115/0116/0118/0119, `ROOT/<path>`,
+  `SWEETDNE` stamp, `sweet-autorun`) and `xiongnemo/hakios-alioth`'s `usbmux`/`usbsh`
+  (better live channel, but needs the USB gadget that is blocked here: apps-SMMU/DWC3).
+- **Implemented, all opt-in behind `sweetbox=1`:** `xnu/patches/0400-sweetbox.patch`
+  (new `bsd/dev/sweet_box.c`; `sweet_ufs_box_read/write` for a 1 MiB mailbox placed
+  immediately before the last-1025-block log ring, so 0047/0097/0108 are unchanged;
+  `bsd_init` call before launchd; `sweetnull` default + sweet-autorun), `tools/sweet-box.py`
+  (pack/apply/pull/clear/status via recovery ADB raw `dd`), `tools/sweet-launchd-autorun.py`,
+  `userland/sweet-autorun.c` + `userland/build.sh`, `docs/sweetbox.md`.
+- **Compile-verified** with `XNU_CC_CLANG=/usr/bin/clang tools/xnu-cc.py /tmp/ci-box.log
+  research/ci-buildtree ...` against CI run `45735232511`: `bsd/dev/sweet_box.c`,
+  `bsd/dev/sweet_ufs.c`, `bsd/kern/bsd_init.c`, `bsd/dev/mem.c` -> 0 failures.
+  `0400-sweetbox.patch` applies with `git apply --check` to the exact CI tree.
+- **Not done / next:** (1) dispatch ONE manual CI run for patch 0400 and confirm it applies
+  after 0118 (the local log is the 0118 tree); (2) build `userland/sweet-autorun` on a Mac,
+  boot `sweetbox=1 sweetboxroot=1` with a test binary and read `SWEET BOX`/`SWEET RUN` from
+  the log. `userdata` risk is bounded: the mailbox is outside the HFS image, every write is
+  bounded to its 1 MiB, the kernel CRCs before opening files, and `ROOT/` installs are
+  allowlisted and happen before launchd so a bad file can be replaced on the next boot.
+- **Trade-off:** phase 1 applies on the NEXT boot (the PC must be in recovery to write raw
+  blocks); no live channel until USB works. See `docs/sweetbox.md`.
+
 ## Agent handoff / active work (2026-11-22, latest)
 
 ### >>> UPDATE 2026-11-22 #2 (alioth): **iOS 16.7.16 HOME SCREEN + TOUCH WORKING**.
