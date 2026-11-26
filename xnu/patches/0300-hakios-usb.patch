@@ -1742,10 +1742,10 @@ index 0000000..8270f66
 +#endif /* __DRIVERS_USB_DWC3_CORE_H */
 diff --git a/bsd/dev/hakios.usb.c b/bsd/dev/hakios.usb.c
 new file mode 100644
-index 0000000..78f8e29
+index 0000000..6af3276
 --- /dev/null
 +++ b/bsd/dev/hakios.usb.c
-@@ -0,0 +1,1086 @@
+@@ -0,0 +1,1291 @@
 +/*
 + * The Redmi K40's USB controller (SM8250 usb_1: a Synopsys DWC3 at 0x0a600000 behind the apps
 + * SMMU as stream 0, its Qualcomm wrapper at 0x0a6f8800), for iOS.
@@ -1813,6 +1813,15 @@ index 0000000..78f8e29
 +extern char loader_log_tee[];
 +extern volatile uint64_t loader_log_tee_total;
 +#define LOADER_LOG_TEE          (64 * 1024)     /* (osfmk/arm64/loader_return.c) */
++/*
++ * The persistent console ring (bsd/dev/sweet_ufs.c, 4 MiB, written by
++ * sweet_log_append() and read back by sweetlogdump).  usbreplay=1 replays it
++ * to a newly opened CDC-ACM port; sweet_log_copy() is the same reader the
++ * UDP live-log thread in sweet_usb.c uses.
++ */
++extern uint64_t sweet_log_position(void);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++#define SWEET_LOG_BYTES         (4u << 20)      /* keep in step with SWEET_LOG_SIZE */
 +
 +#define GCC_BASE                0x00100000ull
 +#define GCC_USB30_PRIM_BCR      0xf000
@@ -2017,6 +2026,25 @@ index 0000000..78f8e29
 +static uint64_t log_at;                 /* the next character of the log tee for the port */
 +static uint64_t log_skipped;            /* characters of the log that came faster than the port took them */
 +static uint32_t usb_failures;
++
++/* usbreplay=1: the persistent console ring to the port when the computer opens it */
++#define REPLAY_CHUNK            2048
++#define REPLAY_SECS             30              /* give up if the computer does not read for this long */
++static int usbreplay;                           /* boot argument, default off */
++static volatile bool host_open;                 /* DTR of the CDC-ACM port (TRACE_READY) */
++static volatile bool replay_request;            /* a rising DTR edge, handled in usb_thread() */
++static bool replaying;                          /* marker/data/end state machine below */
++static bool replay_live;                        /* after a replay, live output comes from the ring too */
++static int replay_stage;                        /* 0 marker, 1 data, 2 end, 3 cut */
++static uint64_t replay_pos, replay_total, replay_sent;
++static uint64_t replay_deadline_ns;
++static uint64_t replay_live_pos;                /* next ring byte for live output after a replay */
++static char replay_marker[96];
++static uint32_t replay_marker_len, replay_marker_at;
++static char replay_buf[REPLAY_CHUNK];
++static uint32_t replay_buf_len, replay_buf_at;
++static char live_buf[REPLAY_CHUNK];
++static uint32_t live_buf_len, live_buf_at;
 +/* /dev/hakios-usb */
 +static uint8_t rx_ring[RX_RING];
 +static uint32_t rx_head, rx_tail;       /* (under usb_lock; free-running counters) */
@@ -2148,6 +2176,13 @@ index 0000000..78f8e29
 +		break;
 +	case DWC3_TRACE_READY:
 +		say("usb: the computer has %s the port (configured %u)\n", b ? "OPENED" : "closed", a);
++		if (level == 2 && usbreplay) {
++			/* (a rising DTR edge: the host just opened the serial port; replay once) */
++			if (b != 0 && !host_open) {
++				replay_request = true;
++			}
++			host_open = b != 0;
++		}
 +		break;
 +	case DWC3_TRACE_TIMEOUT:
 +		say("usb: TIMEOUT waiting on register %#x (%#x)\n", a, b);
@@ -2199,11 +2234,167 @@ index 0000000..78f8e29
 +	}
 +}
 +
++static uint64_t
++now_ns(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++/*
++ * usbreplay=1, on the host's rising DTR edge: the last 4 MiB of the persistent
++ * console ring (the whole boot, since the ring has everything the console ever
++ * printed) as "SWEET USBCON: replay N bytes" ... "SWEET USBCON: end".  The
++ * replay is queue-driven: dwc3_queue() only takes what the controller's TX
++ * ring has room for, so a host that never reads costs nothing beyond a full
++ * queue, and after REPLAY_SECS the rest is skipped and live output begins.
++ */
++static void
++start_replay(void)
++{
++	uint64_t total = sweet_log_position();
++	uint64_t from = total > SWEET_LOG_BYTES ? total - SWEET_LOG_BYTES : 0;
++
++	replay_total = total - from;
++	replay_pos = from;
++	replay_sent = 0;
++	replay_buf_len = replay_buf_at = 0;
++	live_buf_len = live_buf_at = 0;
++	replay_marker_len = (uint32_t)snprintf(replay_marker, sizeof(replay_marker),
++	    "SWEET USBCON: replay %llu bytes\n", replay_total);
++	replay_marker_at = 0;
++	replay_stage = 0;
++	replay_deadline_ns = now_ns() + (uint64_t)REPLAY_SECS * NSEC_PER_SEC;
++	replaying = true;
++	replay_live = false;
++	say("usb: usbreplay: the console ring to the port (%llu bytes)\n", replay_total);
++}
++
++/* Queue as much of replay_marker as there is room for; returns the bytes taken. */
++static size_t
++replay_marker_pump(void)
++{
++	size_t taken;
++
++	if (replay_marker_at >= replay_marker_len) {
++		return 0;
++	}
++	taken = dwc3_queue(usb_dev, replay_marker + replay_marker_at, replay_marker_len - replay_marker_at);
++	replay_marker_at += (uint32_t)taken;
++	return taken;
++}
++
++static void
++replay_finish(bool complete)
++{
++	replaying = false;
++	replay_stage = 0;
++	replay_live = true;
++	/*
++	 * After a complete replay live output starts where the snapshot ended.
++	 * A cut replay skips the bytes the host did not read and starts at the
++	 * ring's current end, so it does not spend another deadline catching up.
++	 */
++	replay_live_pos = complete ? replay_pos : sweet_log_position();
++	live_buf_len = live_buf_at = 0;
++}
++
++static void
++replay_pump(void)
++{
++	if (replay_stage == 0) {
++		(void)replay_marker_pump();
++		if (replay_marker_at < replay_marker_len) {
++			return;
++		}
++		replay_stage = 1;
++	}
++	if (replay_stage == 1) {
++		if (replay_sent < replay_total && now_ns() > replay_deadline_ns) {
++			replay_marker_len = (uint32_t)snprintf(replay_marker, sizeof(replay_marker),
++			    "SWEET USBCON: replay cut after %llu of %llu bytes (host not reading)\n",
++			    replay_sent, replay_total);
++			replay_marker_at = 0;
++			replay_stage = 3;
++		} else {
++			for (;;) {
++				size_t taken;
++
++				if (replay_buf_at == replay_buf_len) {
++					if (replay_sent >= replay_total) {
++						replay_marker_len = (uint32_t)snprintf(replay_marker, sizeof(replay_marker),
++						    "SWEET USBCON: end\n");
++						replay_marker_at = 0;
++						replay_stage = 2;
++						break;
++					}
++					uint32_t want = (uint32_t)MIN((uint64_t)sizeof(replay_buf), replay_total - replay_sent);
++					uint32_t got = sweet_log_copy(&replay_pos, replay_buf, want);
++
++					if (got == 0) {
++						break;
++					}
++					replay_buf_at = 0;
++					replay_buf_len = got;
++				}
++				taken = dwc3_queue(usb_dev, replay_buf + replay_buf_at, replay_buf_len - replay_buf_at);
++				replay_buf_at += (uint32_t)taken;
++				replay_sent += taken;
++				if (taken == 0 || replay_buf_at < replay_buf_len) {
++					return;
++				}
++			}
++		}
++	}
++	if (replay_stage == 2 || replay_stage == 3) {
++		(void)replay_marker_pump();
++		if (replay_marker_at >= replay_marker_len) {
++			replay_finish(replay_stage == 2);
++		}
++	}
++}
++
++/* Live output after a replay: new bytes of the same ring, so the whole console, not only the USB lines. */
++static void
++feed_ring_live(void)
++{
++	for (;;) {
++		size_t taken;
++
++		if (live_buf_at == live_buf_len) {
++			uint32_t got = sweet_log_copy(&replay_live_pos, live_buf, sizeof(live_buf));
++
++			if (got == 0) {
++				return;
++			}
++			live_buf_at = 0;
++			live_buf_len = got;
++		}
++		taken = dwc3_queue(usb_dev, live_buf + live_buf_at, live_buf_len - live_buf_at);
++		live_buf_at += (uint32_t)taken;
++		if (taken == 0 || live_buf_at < live_buf_len) {
++			return;
++		}
++	}
++}
++
 +/* The log into the port, while no program has it: what came since the last time, as much as the port's queue takes. */
 +static void
 +feed_log(void)
 +{
-+	uint64_t total = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
++	uint64_t total;
++
++	if (replaying) {
++		replay_pump();
++		return;
++	}
++	if (replay_live) {
++		feed_ring_live();
++		return;
++	}
++	total = __atomic_load_n(&loader_log_tee_total, __ATOMIC_ACQUIRE);
 +
 +	if (total - log_at > LOADER_LOG_TEE - 4096) {
 +		log_skipped += total - log_at - (LOADER_LOG_TEE - 4096);
@@ -2348,6 +2539,18 @@ index 0000000..78f8e29
 +				lck_mtx_unlock(&usb_lock);
 +				say("usb: the controller does not start again: the port is gone until the run ends\n");
 +				break;
++			}
++			/* (a new device side: the host has to open the port again before a replay) */
++			replaying = false;
++			replay_live = false;
++			replay_stage = 0;
++			host_open = false;
++			replay_request = false;
++		}
++		if (replay_request) {
++			replay_request = false;
++			if (level == 2 && !replaying) {
++				start_replay();
 +			}
 +		}
 +		if (restarted || dwc3_rx_generation(usb_dev) != seen_rx_generation) {
@@ -2813,6 +3016,8 @@ index 0000000..78f8e29
 +	if (!PE_parse_boot_argn("usb", &level, sizeof(level)) || level == 0) {
 +		return;
 +	}
++	/* usbreplay=1 (default off): the persistent console ring to a newly opened CDC-ACM port */
++	PE_parse_boot_argn("usbreplay", &usbreplay, sizeof(usbreplay));
 +	if (!hakios_board_is_alioth()) {
 +		say("usb: these are the Redmi K40's addresses, and this is not a Redmi K40: nothing done\n");
 +		return;

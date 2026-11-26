@@ -320,7 +320,40 @@ tools/sweet-usbsh.sh                               serial host client
 docs/usb-shell.md                                  protocol + recipes
 ```
 
-## 9. Files added by this port
+## 9. Whole-boot replay over the serial port (`usbreplay=1`)
+
+The CDC-ACM log in `hakios.usb.c` used to stream `loader_log_tee`, the 64 KiB
+ring filled by `loader_log_putc()` (the USB driver's own `say()` lines). The
+rest of the kernel console is in the 4 MiB persistent ring that
+`sweet_log_append()` in `bsd/dev/sweet_ufs.c` fills and `sweetlogdump` reads,
+so a serial session that starts at ~48 s only ever saw the tail.
+
+`usbreplay=1` (default off) closes that gap:
+
+* `io_trace()` sees the host's rising DTR (`DWC3_TRACE_READY`, the CDC
+  `SET_CONTROL_LINE_STATE` after the port is opened) and sets `replay_request`.
+* `usb_thread()` takes a snapshot with `sweet_log_position()` / the existing
+  `sweet_log_copy()` reader, bounded to the last 4 MiB, and queues
+  `SWEET USBCON: replay N bytes\n`.
+* `replay_pump()` feeds the snapshot through `dwc3_queue()`. That call only
+  accepts what the TX ring has room for, so the driver never blocks on a host
+  that does not read: the queue fills, the remaining bytes stay unread, and
+  after 30 s the replay is cut with
+  `SWEET USBCON: replay cut after X of N bytes (host not reading)`.
+* On completion it prints `SWEET USBCON: end` and switches the live pump from
+  `loader_log_tee` to the same persistent ring (`feed_ring_live()`), so
+  everything printed after the replay (not just USB lines) stays visible.
+* A controller restart resets the replay state; the next DTR edge starts a new
+  one. With the argument absent, the old `loader_log_tee` path is unchanged.
+
+The replay markers are queued directly (not through `printf`), so they do not
+themselves grow the console ring. Nothing is written to flash; this only reads
+the in-memory ring.
+
+Boot with the usual `usb=2` line plus `usbreplay=1`; read the whole boot in a
+terminal (`stty raw -echo; cat /dev/ttyACM0`) or with `tools/sweet-usbsh.sh -l`.
+
+## 10. Files added by this port
 
 ```
 hakios-port-usb/kernel/...                 reference USB sources, verbatim

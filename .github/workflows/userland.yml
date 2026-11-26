@@ -1,0 +1,101 @@
+name: userland
+
+# Build the iOS userland pieces with Theos + iPhoneOS16.5.sdk and keep the
+# binaries as artifacts.  Manual only: these are cross-compiled, signed
+# (ad-hoc) arm64 programs for the iOS 16 root, not kernel code.
+#
+#   usbsh    - CDC-ACM shell for usb=2; libSystem only
+#   usbmux   - device side of Apple's usbmux for usb=3;
+#              -framework CoreFoundation -lMobileGestalt
+#   sweet-autorun - SWEETBOX helper; built only on branches that carry
+#              userland/sweet-autorun.c (it uses the same flags and needs
+#              no frameworks)
+#
+# The SDK is pinned: theos/sdks release master-146e41f, iPhoneOS16.5.sdk
+# (17.4 MB; sha256 checked below).  That is the release $THEOS/bin/install-sdk
+# would fetch, but install-sdk always takes "latest", so the URL is pinned
+# here instead.  Theos itself is fetched at a pinned commit only to provide
+# $THEOS/sdks; the compiler and linker are Xcode's (xcrun clang).
+#
+# If the download or the SDK's libMobileGestalt.tbd is missing, the job
+# fails with the error text from build.sh instead of uploading nothing.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  THEOS_REPO: https://github.com/theos/theos
+  THEOS_SHA: 8167f59de02fd32cf45b16bfcb1330dfa5c9974c
+  SDK_URL: https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+  SDK_SHA256: 5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb
+
+jobs:
+  userland:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Theos (pinned)
+        run: |
+          git init -q theos
+          git -C theos remote add origin "$THEOS_REPO"
+          git -C theos fetch -q --depth 1 origin "$THEOS_SHA"
+          git -C theos checkout -q FETCH_HEAD
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+          echo "Theos: $(git -C theos rev-parse HEAD)"
+
+      - name: Fetch iPhoneOS16.5.sdk (pinned)
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -fL --retry 3 -o /tmp/iPhoneOS16.5.sdk.tar.xz "$SDK_URL"
+          echo "$SDK_SHA256  /tmp/iPhoneOS16.5.sdk.tar.xz" | shasum -a 256 -c -
+          tar -xJf /tmp/iPhoneOS16.5.sdk.tar.xz -C "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk" || {
+            echo "::error::iPhoneOS16.5.sdk did not extract into $THEOS/sdks"
+            exit 1
+          }
+          echo "IOS_SDK=$THEOS/sdks/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
+          ls -d "$THEOS/sdks/iPhoneOS16.5.sdk"
+
+      - name: Build usbsh and usbmux
+        run: |
+          set -o pipefail
+          CLANG_BIN=$(xcrun --find clang)
+          cd hakios-port-usb/userland
+          IOS_SDK="$IOS_SDK" CLANG="$CLANG_BIN" ./build.sh
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp out/usbsh out/usbmux "$GITHUB_WORKSPACE/artifacts/"
+
+      - name: Build sweet-autorun when this branch has it
+        run: |
+          # sweet-autorun lives on hakios-autorun (and branches that merged it).
+          # It needs the same iPhoneOS flags, no extra frameworks, and the
+          # kernel's 0035/0036 AMFI path accepts an ad-hoc signature.
+          if [ ! -f userland/sweet-autorun.c ]; then
+            echo "note: userland/sweet-autorun.c is not in this branch; skipping it"
+            exit 0
+          fi
+          mkdir -p artifacts
+          CLANG_BIN=$(xcrun --find clang)
+          "$CLANG_BIN" -arch arm64 -isysroot "$IOS_SDK" \
+            -miphoneos-version-min=16.0 -O2 -Wall -Wextra \
+            -o artifacts/sweet-autorun userland/sweet-autorun.c
+          codesign -f -s - artifacts/sweet-autorun || true
+
+      - name: Report what was built
+        run: |
+          ls -l artifacts
+          for f in artifacts/*; do
+            file "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakios-userland
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
