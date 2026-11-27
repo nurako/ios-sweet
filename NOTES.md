@@ -1,4 +1,14 @@
 
+## 2026-11-27 (gpu2): push client command buffers before submit
+
+The client ring is kicked (same `ring_send`/`CP_RB_WPTR` as the internal test)
+and the fence page is mapped in every client space, so the likely failure was
+the core reading a stale command buffer from the client mapping. `submit()` now
+flushes every named BO (command buffers included) to memory before the kick.
+Loud adds ring base/RPTR/WPTR around the kick and client space/context/root;
+blocking CPU_PREP timeout now returns `kIOReturnTimeout`; 0200 regenerated from
+sources (guard: 9 match, 9 skipped).
+
 ## 2026-11-27 (gpu2): 0200 actually regenerated; guard added
 
 The fence fix was committed in the sources but the old `0200` was left behind,

@@ -76,6 +76,8 @@ int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
 void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 uint32_t hakios_gpu_last(void);
 uint32_t hakios_gpu_fence_word(void);
+uint32_t hakios_gpu_space_context(void *space);
+uint64_t hakios_gpu_space_root(void *space);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
@@ -351,6 +353,9 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	uint64_t loudBegan = gGPULoud ? began : 0;
 	bool soon = false;                      /* (11-19) the next sleep a short one: woken, and the fence not there yet */
 
+	if (milliseconds > 60000) {
+		milliseconds = 60000;           /* (a bad client number cannot make a 64-bit multiply wrap) */
+	}
 	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms; fence word at start %u (last submitted %u)\n", fence,
 	    milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
@@ -1519,7 +1524,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
-	uint64_t began, nanos, again;
+	uint64_t began, nanos, again, pushed = 0;
 	IOReturn ret = kIOReturnBadArgument;
 
 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
@@ -1657,6 +1662,23 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		hakios_gpu_to_memory(b->kernel, b->size);
 		gGPUStat.flushed += b->size;
 	}
+	/*
+	 * What the program wrote through its mapping must be in memory before the core
+	 * reads it: a submission is not the place to trust a cache mode. Command buffers
+	 * above all -- the core follows them, and a stale one hangs it before it can
+	 * write this submission's fence (the client then waits out its patience).
+	 */
+	for (uint32_t i = 0; i < request->nr_bos; i++) {
+		struct gpu_buffer * b = buffer(bos[i].handle);
+
+		if (b == NULL || b->kernel == NULL || b->size == 0) {
+			continue;
+		}
+		hakios_gpu_to_memory(b->kernel, b->size);
+		pushed += b->size;
+	}
+	GPU_LOUD("HakiosGPU: loud: submit: pushed %llu bytes of %u buffers to memory before the core reads them\n",
+	    (unsigned long long) pushed, request->nr_bos);
 	hakios_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
 	gGPUStat.flushing += mach_absolute_time() - began;
 	gGPUStat.buffers += request->nr_bos;
@@ -1683,6 +1705,9 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		IOLog("\n");
 	}
+	GPU_LOUD("HakiosGPU: loud: submit: this client's space %p, context %u, root %#llx; the core will run it in the "
+	    "space the line below names\n", fSpace, hakios_gpu_space_context(fSpace),
+	    (unsigned long long) hakios_gpu_space_root(fSpace));
 	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);
 	GPU_LOUD("HakiosGPU: loud: submit -> fence %u, fence word %u (wanted %u)\n", request->fence,
 	    hakios_gpu_fence_word(), request->fence);
@@ -2057,7 +2082,8 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		}
 		waitFence = b->fence != 0 ? b->fence : hakios_gpu_last();
 		if (!gpuWait(waitFence, patience)) {
-			ret = kIOReturnBusy;
+			/* (a blocking prep that timed out is ETIMEDOUT, as Linux's msm; only NOSYNC says EBUSY) */
+			ret = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? kIOReturnBusy : kIOReturnTimeout;
 			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
 				waitOver(&r.cpuPrep.timeout, waitFence);
 			}
