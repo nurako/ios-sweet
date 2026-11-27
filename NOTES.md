@@ -1,4 +1,13 @@
 
+## 2026-11-27 (gpu2): map probe now reads and writes
+
+ul4 already had the per-page probe and still SIGBUSed on the first store: the
+probe only read. `hakios_drm_map` now writes the first and last byte of every
+4 KB page under the SIGBUS/SIGSEGV jump, reports the failing page offset, and
+prints `mapped ... probed N pages, ok` under `hkdrm=1`. The kernel logs the GEM
+descriptor (flags/direction/length, kernel view) and the map descriptor's
+flags/direction. Kernel compile 0/1; 0200 gpu.cpp hunk regenerated.
+
 ## 2026-11-27 (gpu2): GEM mmap SIGBUS made a checked failure
 
 The GPU client now reaches the driver: GET_PARAM/GEM_NEW/SUBMITQUEUE succeed and

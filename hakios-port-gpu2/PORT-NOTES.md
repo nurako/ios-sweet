@@ -225,7 +225,31 @@ HakiosGPU: loud: map type 2 -> 16384 bytes (buffer 16384), address from IOKit
 HakiosGPU: loud: map type 3 -> 4194304 bytes (buffer 4194304), address from IOKit
 ```
 and on stderr with `hkdrm=1` the address the client got:
-`hakios-drm: mapped handle 3: 4194304 bytes -> address 0x..., mapped 4194304, result 0x0`.
+`hakios-drm: mapped handle 3: 4194304 bytes -> 0x..., probed 1024 pages, ok`.
 
 Failure now says `HakiosGPU: map of buffer N refused (0xe00002c4): not backed for
 the whole length`, or on the client, `hakios-drm: map not backed handle N: ...`.
+
+
+## 8. 2026-11-27: the probe only read; the client writes
+
+The 13:41 run (userland ul4: the probe was present) still died:
+`CRASH gl_test pc 0x1ecbb1030 ... far 0x1e36cff40`, `SIGBUS BUS_ADRERR`, right
+after `map type 5 -> 4194304`. The probe loop was real (`ldrb wzr, [x9,x10]` in
+the disassembly) but it only **read** the first byte of each page. A mapping can
+be readable and still fault on a store (read-only PTE, or the page exposed for
+read but not write); the driver's next action after mapping is a store, so the
+probe could pass and the first write still SIGBUS. The descriptor itself is the
+right kind: `IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache)`, i.e.
+user-shared, in/out, length == buffer, kernel view present; the new loud line
+prints those options/direction/length.
+
+**Fix.** `hakios_drm_map` now probes every 4 KB page with **both a read and a
+write of the first and last byte** (volatile, checksum consumed), inside the
+same `sigsetjmp`/handler; a fault reports `map not backed at page offset N` and
+unmaps. A successful map prints
+`hakios-drm: mapped handle N: B bytes -> ADDR, probed P pages, ok` under
+`hkdrm=1`. The kernel logs each GEM descriptor's flags/direction/length and each
+map's descriptor flags/direction, so a read-only or wrong-direction descriptor
+is visible next run.
