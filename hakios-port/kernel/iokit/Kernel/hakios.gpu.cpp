@@ -1326,6 +1326,9 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+		GPU_LOUD("HakiosGPU: loud: GEM buffer %u: %llu bytes, descriptor flags %#x, direction %#x, length %llu, %s\n",
+		    request->handle, (unsigned long long) size, memory->getFlags(), memory->getDirection(),
+		    (unsigned long long) memory->getLength(), b->kernel != NULL ? "kernel view present" : "NO KERNEL VIEW");
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
 	}
@@ -1910,8 +1913,9 @@ HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IO
 		*memory = b->memory;
 		*options = 0;
 		ret = kIOReturnSuccess;
-		GPU_LOUD("HakiosGPU: loud: map type %u -> %llu bytes (buffer %llu), address from IOKit\n", type,
-		    (unsigned long long) b->size, (unsigned long long) length);
+		GPU_LOUD("HakiosGPU: loud: map type %u -> %llu bytes (buffer %llu), descriptor flags %#x, direction %#x\n",
+		    type, (unsigned long long) b->size, (unsigned long long) length, b->memory->getFlags(),
+		    b->memory->getDirection());
 	}
 	IOLockUnlock(gGPULock);
 	if (ret != kIOReturnSuccess) {

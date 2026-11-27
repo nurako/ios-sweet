@@ -6540,10 +6540,10 @@ index b5b3ba9..57a3567 100644
  			paddr = kvtophys(addr);
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..a1635d1
+index 0000000..4e3494f
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,2152 @@
+@@ -0,0 +1,2156 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -7872,6 +7872,9 @@ index 0000000..a1635d1
 +	if (b != NULL) {
 +		b->memory = memory;
 +		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++		GPU_LOUD("HakiosGPU: loud: GEM buffer %u: %llu bytes, descriptor flags %#x, direction %#x, length %llu, %s\n",
++		    request->handle, (unsigned long long) size, memory->getFlags(), memory->getDirection(),
++		    (unsigned long long) memory->getLength(), b->kernel != NULL ? "kernel view present" : "NO KERNEL VIEW");
 +		gGPUStat.made++;
 +		gGPUStat.making += mach_absolute_time() - began;
 +	}
@@ -8456,8 +8459,9 @@ index 0000000..a1635d1
 +		*memory = b->memory;
 +		*options = 0;
 +		ret = kIOReturnSuccess;
-+		GPU_LOUD("HakiosGPU: loud: map type %u -> %llu bytes (buffer %llu), address from IOKit\n", type,
-+		    (unsigned long long) b->size, (unsigned long long) length);
++		GPU_LOUD("HakiosGPU: loud: map type %u -> %llu bytes (buffer %llu), descriptor flags %#x, direction %#x\n",
++		    type, (unsigned long long) b->size, (unsigned long long) length, b->memory->getFlags(),
++		    b->memory->getDirection());
 +	}
 +	IOLockUnlock(gGPULock);
 +	if (ret != kIOReturnSuccess) {

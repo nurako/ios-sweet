@@ -266,7 +266,9 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 	 */
 	{
 		struct sigaction fault, old_bus, old_seg;
-		uint64_t page = 0, step = 4096;
+		uint64_t page = 0, step = 4096, limit = size != 0 ? size : mapped;
+		volatile unsigned char *bytes = (volatile unsigned char *)(uintptr_t)address;
+		unsigned long checksum = 0;
 
 		memset(&fault, 0, sizeof(fault));
 		fault.sa_handler = map_fault;
@@ -275,20 +277,36 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 		sigaction(SIGSEGV, &fault, &old_seg);
 		map_fault_signal = 0;
 		if (sigsetjmp(map_jmp, 1) == 0) {
-			for (page = 0; page < (size != 0 ? size : mapped); page += step) {
-				(void)*(volatile const char *)((uintptr_t)address + page);
+			for (page = 0; page < limit; page += step) {
+				unsigned char first = bytes[page];
+				unsigned char last;
+
+				bytes[page] = first;    /* a read-only or write-unbacked page faults here */
+				if (page + step <= limit) {
+					last = bytes[page + step - 1];
+					bytes[page + step - 1] = last;
+					checksum += (unsigned long)first + last;
+				} else {
+					checksum += first;
+				}
 			}
 		}
 		sigaction(SIGBUS, &old_bus, NULL);
 		sigaction(SIGSEGV, &old_seg, NULL);
 		if (map_fault_signal != 0) {
 			map_say("map not backed", handle, size, address, mapped, result);
+			fprintf(stderr, "hakios-drm: map not backed at page offset %llu (signal %d)\n",
+			    (unsigned long long)page, (int)map_fault_signal);
+			fflush(stderr);
 			IOConnectUnmapMemory64(connection, handle, mach_task_self(), address);
 			return (void *)-1;
 		}
-	}
-	if (map_trace()) {
-		map_say("mapped", handle, size, address, mapped, result);
+		(void)checksum;
+		if (map_trace()) {
+			fprintf(stderr, "hakios-drm: mapped handle %u: %llu bytes -> %#llx, probed %llu pages, ok\n", handle,
+			    (unsigned long long)size, (unsigned long long)address, (unsigned long long)((limit + 4095) / 4096));
+			fflush(stderr);
+		}
 	}
 	return (void *)(uintptr_t)address;
 }
