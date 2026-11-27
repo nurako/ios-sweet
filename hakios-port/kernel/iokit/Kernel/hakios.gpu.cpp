@@ -1855,22 +1855,69 @@ HakiosGPUUserClient::show(const struct hakios_show * request)
 	return ret;
 }
 
+/*
+ * Every page of a buffer must have its own physical memory before the client's
+ * mapping can be backed for the whole length: a mapping with a hole faults with
+ * SIGBUS on the client's first touch. (A short map is what a 4 MB GEM buffer
+ * showed after the first success: the ioctls were fine, the user mapping was
+ * not.) With gGPULock held.
+ */
+static bool
+gpuBufferMappable(struct gpu_buffer * b, uint64_t * bad)
+{
+	for (uint64_t offset = 0; offset < b->size;) {
+		IOByteCount length = 0;
+		addr64_t phys = b->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+
+		if (phys == 0 || length == 0) {
+			*bad = offset;
+			return false;
+		}
+		offset += length;
+	}
+	return true;
+}
+
 IOReturn
 HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
 {
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnBadArgument;
+	uint64_t length = 0, bad = 0;
 
+	if (memory == NULL || options == NULL) {
+		return kIOReturnBadArgument;
+	}
 	IOLockLock(gGPULock);
 	b = buffer(type);
-	if (b != NULL) {
+	if (b == NULL) {
+		GPU_LOUD("HakiosGPU: loud: map type %u -> no such buffer\n", type);
+	} else if (b->memory == NULL || b->size == 0) {
+		GPU_LOUD("HakiosGPU: loud: map type %u -> buffer has no memory (%llu bytes)\n", type,
+		    (unsigned long long) b->size);
+		ret = kIOReturnNoSpace;
+	} else if ((length = b->memory->getLength()) < b->size) {
+		GPU_LOUD("HakiosGPU: loud: map type %u -> descriptor %llu bytes, buffer %llu: refused\n", type,
+		    (unsigned long long) length, (unsigned long long) b->size);
+		ret = kIOReturnNoSpace;
+	} else if (!gpuBufferMappable(b, &bad)) {
+		GPU_LOUD("HakiosGPU: loud: map type %u -> page at offset %llu has no memory: refused\n", type,
+		    (unsigned long long) bad);
+		ret = kIOReturnNoSpace;
+	} else {
 		b->memory->retain();
 		b->seen = true;
 		*memory = b->memory;
 		*options = 0;
 		ret = kIOReturnSuccess;
+		GPU_LOUD("HakiosGPU: loud: map type %u -> %llu bytes (buffer %llu), address from IOKit\n", type,
+		    (unsigned long long) b->size, (unsigned long long) length);
 	}
 	IOLockUnlock(gGPULock);
+	if (ret != kIOReturnSuccess) {
+		hakios_tl("HakiosGPU: map of buffer %u refused (%#x): %s\n", type, ret,
+		    b == NULL ? "no such buffer" : "not backed for the whole length");
+	}
 	return ret;
 }
 

@@ -187,3 +187,45 @@ refused` (or the scan-out variant) for the first 16 refusals and always under
 `gl_test` checks `/var/tmp/run-gl-test`, unlinks it and prints `GLTEST: start`
 when `GL_TEST_LAUNCHD` is set; without the sentinel it exits 0 immediately. A
 manual `/usr/local/bin/gl_test` run does not need the sentinel.
+
+## 7. 2026-11-27: GEM mmap -> SIGBUS on the first touch
+
+**Path today.** Mesa's freedreno `msm_bo_map()` is patched to call
+`hakios_drm_map(dev->fd, bo->handle, bo->size)`, which is
+`IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+kIOMapAnywhere)`. The kernel side is `HakiosGPUUserClient::clientMemoryForType`:
+`buffer(type)` (type == the 1-based GEM handle) returns `b->memory`, the
+`IOBufferMemoryDescriptor` that `gemNew()` made in kernel_task with
+`kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache`, and
+`*options = 0`. IOKit then calls `memory->createMappingInTask(clientTask, 0,
+kIOMapAnywhere)`; the map length is `memory->getLength()`, which is the rounded
+GEM size. That descriptor is real wired DRAM (the same pages `newBuffer()` passed
+to `hakios_gpu_phys_ok()` and the SMMU), so the ioctls are not lying.
+
+**Why SIGBUS.** The client mapped successfully but IOKit left holes / a short
+user mapping, so the first store in the driver hit an unbacked PTE (BUS_ADRERR).
+The old map code trusted the success return and never checked the returned
+`address`/`mapped` length.
+
+**Fix.**
+- `clientMemoryForType` now validates: buffer exists, `memory != NULL`,
+  `memory->getLength() >= b->size`, and **every page has a physical segment**
+  (`gpuBufferMappable()`). Otherwise it returns `kIOReturnNoSpace` and logs why;
+  a successful map logs `HakiosGPU: loud: map type %u -> %llu bytes ...`.
+- `hakios_drm_map()` rejects `address == 0`, `mapped < size`, and probes one byte
+  per 4 KB under a temporary `SIGBUS`/`SIGSEGV` handler; a fault becomes a clean
+  `MAP_FAILED` with `hakios-drm: map not backed ...` on stderr, not a crash.
+- `gl_test` installs `SIGBUS`/`SIGSEGV` handlers that print
+  `gl_test: FAULT: signal N at 0x... at step M` and exit `128+N`.
+
+Expected successful map lines (kernel, `adreno_loud=1`):
+
+```
+HakiosGPU: loud: map type 2 -> 16384 bytes (buffer 16384), address from IOKit
+HakiosGPU: loud: map type 3 -> 4194304 bytes (buffer 4194304), address from IOKit
+```
+and on stderr with `hkdrm=1` the address the client got:
+`hakios-drm: mapped handle 3: 4194304 bytes -> address 0x..., mapped 4194304, result 0x0`.
+
+Failure now says `HakiosGPU: map of buffer N refused (0xe00002c4): not backed for
+the whole length`, or on the client, `hakios-drm: map not backed handle N: ...`.

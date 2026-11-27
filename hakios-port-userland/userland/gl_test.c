@@ -133,6 +133,23 @@ on_alarm(int signal)
 	_exit(124);
 }
 
+/* A bad mapping shows itself as SIGBUS/SIGSEGV on the first touch: say where, and leave cleanly. */
+static void
+on_fault(int signal, siginfo_t *info, void *context)
+{
+	char line[128];
+	int n;
+
+	(void)context;
+	n = snprintf(line, sizeof(line), "gl_test: FAULT: signal %d at %p at step %d\n", signal,
+	    info != NULL ? info->si_addr : NULL, (int)gStep);
+	if (n > 0) {
+		(void)write(STDOUT_FILENO, line, (size_t)n);
+		(void)write(STDERR_FILENO, line, (size_t)n);
+	}
+	_exit(128 + signal);
+}
+
 static uint64_t
 now_us(void)
 {
@@ -321,6 +338,15 @@ main(int argc, char **argv)
 		printf("GLTEST: start\n");
 	}
 	signal(SIGALRM, on_alarm);
+	{
+		struct sigaction fault;
+
+		memset(&fault, 0, sizeof(fault));
+		fault.sa_sigaction = on_fault;
+		fault.sa_flags = SA_SIGINFO;
+		sigaction(SIGBUS, &fault, NULL);
+		sigaction(SIGSEGV, &fault, NULL);
+	}
 	alarm(GL_TEST_TIMEOUT);
 	step("start (unbuffered; watchdog 20 s); opening the GPU service and making the DRM screen");
 
