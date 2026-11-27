@@ -1,4 +1,14 @@
 
+## 2026-11-27 (gpu2): re-kick ring and idle the CP before space switches
+
+Fences 1-2 complete, 3-4 stay queued. `ring_send` now DSBs after WPTR, and
+`gpu_submit` re-writes WPTR if RPTR has not moved (the doorbell can be lost
+between submissions). `space_switch` now waits for RPTR == ring_sent, not just
+the fence word, so a queued IB cannot be fetched under the next client's tables.
+Client waits are per-client (`fLastFence`, and CPU_PREP of an unsubmitted BO is
+done). Loud adds IB addresses, the last 8 ring dwords, and CP status/fault after
+1 ms.
+
 ## 2026-11-27 (gpu2): push client command buffers before submit
 
 The client ring is kicked (same `ring_send`/`CP_RB_WPTR` as the internal test)
