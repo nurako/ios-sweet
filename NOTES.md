@@ -1,4 +1,22 @@
 
+## 2026-11-27 - a userland OpenGL program draws on the panel
+
+`gl_test` (Mesa 25.0.7, freedreno FD650, OpenGL ES 3.2) runs on the iOS root and
+puts a triangle on the panel through `0x7f SHOW`, with iOS still responsive. The
+fence word reached 2 (early submissions complete); later submissions (fence 4)
+time out at ~1008 ms with the word stuck at 2, so the submit path works once or
+twice and then stops landing - next bug.
+
+What made it work: in `submit()`, every named BO (command buffers included) is
+pushed to memory before the ring is kicked. Before that the CP fetched a stale
+command buffer, so no fence ever landed. Client waits now return ETIMEDOUT
+rather than Busy, so a stalled wait cannot trap a thread.
+
+Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
+`/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
+run through `tools/sweet-usbsh.sh` is the reliable path).
+
+
 ## 2026-11-27 (gpu2): push client command buffers before submit
 
 The client ring is kicked (same `ring_send`/`CP_RB_WPTR` as the internal test)
