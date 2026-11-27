@@ -8931,6 +8931,188 @@ index 0000000..fa24bc2
 +	}
 +}
 diff --git a/bsd/conf/files b/bsd/conf/files
+index dee13fe..380b8b9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,9 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/hakios.board.c			standard
++bsd/dev/hakios.adreno.c			standard
++bsd/dev/hakios_gpu_adapter.c		standard
+ bsd/dev/alioth_keys.c			standard
+ bsd/dev/alioth_touch.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 29b7512..fb36ff4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
++extern void hakios_adreno_init(void);
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
+ extern bool alioth_board(void);
+@@ -676,6 +677,13 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
+ 	sweet_gpu_init();
++	/* xiongnemo/hakios-alioth Adreno stack: only when the command line asks
++	 * for a step with adreno=N; the default boot is unchanged. */
++	uint32_t hakios_gpu_steps = 0;
++	if (PE_parse_boot_argn("adreno", &hakios_gpu_steps, sizeof(hakios_gpu_steps)) &&
++	    hakios_gpu_steps != 0) {
++		hakios_adreno_init();
++	}
+ 	return 0;
+ }
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..c1eeefe 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,8 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/hakios.gpu.cpp                                      optional iokitcpp
++iokit/Kernel/hakios_miniosurface_stub.cpp                        optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index b5b3ba9..57a3567 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -47,6 +47,9 @@
+ 
+ #include <arm/misc_protos.h>
+ 
++extern unsigned long gPhysBase;
++extern unsigned long real_phys_size;
++
+ /*
+  * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
+  */
+@@ -70,8 +73,24 @@ flush_dcache(
+ 
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/*
++			 * A physical address no linear map covers (a user client's
++			 * offset, an IOVA, a truncated high-bank PA) must never reach
++			 * phystokv_range(): it panics with "illegal PA". There is no
++			 * cache line of ours to push for such memory; skip it.
++			 */
++			if (gPhysBase != 0 && real_phys_size != 0 &&
++			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
++				count = PAGE_SIZE - (addr & PAGE_MASK);
++				if (count > length) {
++					count = length;
++				}
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
+@@ -104,8 +123,19 @@ clean_dcache(
+ 
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/* (flush_dcache(): a PA outside the linear map is not converted) */
++			if (gPhysBase != 0 && real_phys_size != 0 &&
++			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
++				count = PAGE_SIZE - (addr & PAGE_MASK);
++				if (count > length) {
++					count = length;
++				}
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
+diff --git a/osfmk/arm64/loose_ends.c b/osfmk/arm64/loose_ends.c
+index fcdc6d4..30d6b34 100644
+--- a/osfmk/arm64/loose_ends.c
++++ b/osfmk/arm64/loose_ends.c
+@@ -62,6 +62,15 @@
+ #define BCOPY_PHYS_SRC_IS_USER(flags) (((flags) & (cppvPsrc | cppvKmap)) == 0)
+ #define BCOPY_PHYS_DST_IS_USER(flags) (((flags) & (cppvPsnk | cppvKmap)) == 0)
+ 
++/* phystokv_range()'s bounds: a PA outside them panics with "illegal PA". */
++extern unsigned long gPhysBase;
++extern unsigned long real_phys_size;
++static inline boolean_t
++phys_linear(addr64_t pa)
++{
++	return gPhysBase != 0 && real_phys_size != 0 && pa >= gPhysBase && (pa - gPhysBase) < real_phys_size;
++}
++
+ static kern_return_t
+ bcopy_phys_internal(addr64_t src, addr64_t dst, vm_size_t bytes, int flags)
+ {
+@@ -91,7 +100,7 @@ bcopy_phys_internal(addr64_t src, addr64_t dst, vm_size_t bytes, int flags)
+ 		vm_size_t count = bytes;
+ 		vm_size_t count2 = bytes;
+ 		if (BCOPY_PHYS_SRC_IS_PHYS(flags)) {
+-			use_copy_window_src = !pmap_valid_address(src);
++			use_copy_window_src = !pmap_valid_address(src) || !phys_linear(src);
+ 			pn_src = (ppnum_t)(src >> PAGE_SHIFT);
+ #if !defined(__ARM_COHERENT_IO__) && !__ARM_PTE_PHYSMAP__
+ 			count = PAGE_SIZE - src_offset;
+@@ -108,7 +117,7 @@ bcopy_phys_internal(addr64_t src, addr64_t dst, vm_size_t bytes, int flags)
+ 		}
+ 		if (BCOPY_PHYS_DST_IS_PHYS(flags)) {
+ 			// write preflighting needed for things like dtrace which may write static read-only mappings
+-			use_copy_window_dst = (!pmap_valid_address(dst) || !mmu_kvtop_wpreflight(phystokv((pmap_paddr_t)dst)));
++			use_copy_window_dst = (!pmap_valid_address(dst) || !phys_linear(dst) || !mmu_kvtop_wpreflight(phystokv((pmap_paddr_t)dst)));
+ 			pn_dst = (ppnum_t)(dst >> PAGE_SHIFT);
+ #if !defined(__ARM_COHERENT_IO__) && !__ARM_PTE_PHYSMAP__
+ 			count2 = PAGE_SIZE - dst_offset;
+@@ -210,7 +219,7 @@ bzero_phys(addr64_t src, vm_size_t bytes)
+ 	while (bytes > 0) {
+ 		vm_size_t count = bytes;
+ 
+-		boolean_t use_copy_window = !pmap_valid_address(src);
++		boolean_t use_copy_window = !pmap_valid_address(src) || !phys_linear(src);
+ 		pn = (ppnum_t)(src >> PAGE_SHIFT);
+ 		wimg_bits = pmap_cache_attributes(pn);
+ #if !defined(__ARM_COHERENT_IO__) && !__ARM_PTE_PHYSMAP__
+@@ -716,11 +725,18 @@ copypv(addr64_t source, addr64_t sink, unsigned int size, int which)
+ 	kern_return_t res = bcopy_phys_internal(source, sink, size, which);
+ 
+ #ifndef __ARM_COHERENT_IO__
+-	if (which & cppvFsrc) {
++	/*
++	 * Only a physical address the kernel can convert may be flushed as one:
++	 * flush_dcache64(phys) with a bad PA reaches phystokv_range(), which panics
++	 * (arm_vm_init.c: "illegal PA"). bcopy_phys_internal() above already coped
++	 * with a non-managed address through the copy window; there is no cache
++	 * line to push for device memory, so leave it alone.
++	 */
++	if ((which & cppvFsrc) && (!(which & cppvPsrc) || (pmap_valid_address(source) && phys_linear(source)))) {
+ 		flush_dcache64(source, size, ((which & cppvPsrc) == cppvPsrc));
+ 	}
+ 
+-	if (which & cppvFsnk) {
++	if ((which & cppvFsnk) && (!(which & cppvPsnk) || (pmap_valid_address(sink) && phys_linear(sink)))) {
+ 		flush_dcache64(sink, size, ((which & cppvPsnk) == cppvPsnk));
+ 	}
+ #endif
+diff --git a/bsd/conf/files b/bsd/conf/files
 +index dee13fe..380b8b9 100644
 +--- a/bsd/conf/files
 ++++ b/bsd/conf/files
