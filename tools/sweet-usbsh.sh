@@ -111,6 +111,7 @@ except termios.error as e:
     raise SystemExit(2)
 
 PROMPT = re.compile(rb"ios:[^#\r\n]*# ")
+PARTIAL = {"buf": b""}
 
 def read_until(want, seconds):
     """Read until WANT usbsh prompts are in the buffer; return bytes or None."""
@@ -190,6 +191,7 @@ def read_prompts(initial, want, seconds):
         if not chunk:
             continue
         buf += chunk
+    PARTIAL["buf"] = bytes(buf)
     return bytes(buf) if len(PROMPT.findall(buf)) >= want else None
 
 def show(data):
@@ -255,7 +257,7 @@ if rest:
     os.write(fd, " ".join(rest).encode() + b"\r")
     data = read_prompts(ack, 2, timeout)
     if data is None:
-        bail("no prompt after the command", ack)
+        bail("no prompt after the command (any output received is shown above)", PARTIAL["buf"] or ack)
     text = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     lines = text.decode(errors="replace").split("\n")
     out = [l for l in lines
