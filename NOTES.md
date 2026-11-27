@@ -1,4 +1,15 @@
 
+## 2026-11-27 (gpu2): GEM mmap SIGBUS made a checked failure
+
+The GPU client now reaches the driver: GET_PARAM/GEM_NEW/SUBMITQUEUE succeed and
+the crash is a client SIGBUS on the first touch of a just-mapped GEM buffer.
+`clientMemoryForType` now checks the descriptor length and every page's physical
+segment, returns `kIOReturnNoSpace` with a loud line otherwise, and logs each
+successful map (`map type N -> bytes`). `hakios_drm_map` rejects zero/short maps
+and probes each 4 KB page under a temporary SIGBUS/SIGSEGV handler, so an
+unbacked mapping is `MAP_FAILED`, not a crash; `gl_test` prints the fault address
+and exits 128+N. 0200's gpu.cpp hunk regenerated; compile 0/1.
+
 ## 2026-11-27 (gpu2): second illegal-PA panic hardened at the cache primitives
 
 The reported caller `0xfffffe0007b0ce7c` resolves to `phystokv_range.cold.1+0x48`

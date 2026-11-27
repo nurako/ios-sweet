@@ -8,6 +8,8 @@
  * there is one GPU and one connection to it in a process.
  */
 #include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,21 +199,96 @@ drmGetCap(int fd, uint64_t capability, uint64_t *value)
 	return 0;
 }
 
+/* A mapping the client cannot use must fail here, not in a SIGBUS on its first touch. */
+static sigjmp_buf map_jmp;
+static volatile sig_atomic_t map_fault_signal;
+
+static void
+map_fault(int signal)
+{
+	map_fault_signal = signal;
+	siglongjmp(map_jmp, 1);
+}
+
+static int
+map_trace(void)
+{
+	static int on = -1;
+	char args[512];
+	size_t size = sizeof(args) - 1;
+
+	if (on < 0) {
+		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "hkdrm=1") != NULL;
+	}
+	return on;
+}
+
+static void
+map_say(const char *what, uint32_t handle, uint64_t size, mach_vm_address_t address, mach_vm_size_t mapped,
+    kern_return_t result)
+{
+	fprintf(stderr, "hakios-drm: %s handle %u: %llu bytes -> address %#llx, mapped %llu, result %#x\n", what, handle,
+	    (unsigned long long)size, (unsigned long long)address, (unsigned long long)mapped, result);
+	fflush(stderr);
+}
+
 void *
 hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 {
 	mach_vm_address_t address = 0;
 	mach_vm_size_t mapped = 0;
+	kern_return_t result;
 
 	(void)fd;
-	(void)size;
 	/*
 	 * Linux gives freedreno its buffers write-combined, with no cache of this processor's between
 	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
 	 * made that way, and this mapping is as the memory is.
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+	result = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere);
+	if (result != 0) {
+		map_say("map failed", handle, size, address, mapped, result);
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
+	}
+	if (address == 0 || (size != 0 && mapped < size)) {
+		/* Never hand the caller a mapping shorter than the buffer it is about to use. */
+		map_say("map short", handle, size, address, mapped, result);
+		if (address != 0) {
+			IOConnectUnmapMemory64(connection, handle, mach_task_self(), address);
+		}
+		return (void *)-1;
+	}
+	/*
+	 * IOKit can return a successful map whose pages are not backed for the
+	 * whole descriptor (the client then dies with SIGBUS on first touch).
+	 * Touch one byte of every page under a temporary handler: a fault here
+	 * becomes a clean MAP_FAILED instead of a crash in the GL driver.
+	 */
+	{
+		struct sigaction fault, old_bus, old_seg;
+		uint64_t page = 0, step = 4096;
+
+		memset(&fault, 0, sizeof(fault));
+		fault.sa_handler = map_fault;
+		sigemptyset(&fault.sa_mask);
+		sigaction(SIGBUS, &fault, &old_bus);
+		sigaction(SIGSEGV, &fault, &old_seg);
+		map_fault_signal = 0;
+		if (sigsetjmp(map_jmp, 1) == 0) {
+			for (page = 0; page < (size != 0 ? size : mapped); page += step) {
+				(void)*(volatile const char *)((uintptr_t)address + page);
+			}
+		}
+		sigaction(SIGBUS, &old_bus, NULL);
+		sigaction(SIGSEGV, &old_seg, NULL);
+		if (map_fault_signal != 0) {
+			map_say("map not backed", handle, size, address, mapped, result);
+			IOConnectUnmapMemory64(connection, handle, mach_task_self(), address);
+			return (void *)-1;
+		}
+	}
+	if (map_trace()) {
+		map_say("mapped", handle, size, address, mapped, result);
 	}
 	return (void *)(uintptr_t)address;
 }
