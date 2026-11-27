@@ -9,6 +9,13 @@
 		<string>/usr/local/bin/gl_test</string>
 		<string>8</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DYLD_LIBRARY_PATH</key>
+		<string>/usr/local/lib</string>
+		<key>GL_TEST_LAUNCHD</key>
+		<string>1</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>AbandonProcessGroup</key>

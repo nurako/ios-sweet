@@ -1125,10 +1125,10 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 		uint64_t run = length >= 4096 ? MIN((uint64_t) length & ~4095ULL, size - offset) : 4096;
 
 		if (phys == 0 || length == 0 || !hakios_gpu_phys_ok(phys, run, scanout)) {
-			if (refused++ < 16) {
-				hakios_tl("HakiosGPU: buffer of %llu bytes, %llu from its start: physical %#llx (%llu bytes) is "
-				    "not kernel memory%s; refused\n", size, offset, (uint64_t) phys, run,
-				    scanout ? " (nor the framebuffer)" : "");
+			if (refused++ < 16 || gGPULoud) {
+				hakios_tl("HakiosGPU: %s 0x%llx is not kernel memory; refused (buffer %llu bytes, %llu from its "
+				    "start, run %llu%s)\n", scanout ? "a scan-out surface's physical address" : "a buffer's physical address",
+				    (unsigned long long) phys, size, offset, run, scanout ? ", nor the framebuffer" : "");
 			}
 			mapped = false;
 			break;
@@ -1529,6 +1529,8 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	}
 	if (copyin((user_addr_t) request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
 	    copyin((user_addr_t) request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
+		hakios_tl("HakiosGPU: submission pointers 0x%llx/0x%llx are not the client's memory; refused\n",
+		    (unsigned long long) request->bos, (unsigned long long) request->cmds);
 		ret = kIOReturnVMError;
 		goto out;
 	}
@@ -1843,6 +1845,8 @@ HakiosGPUUserClient::show(const struct hakios_show * request)
 		return kIOReturnNoMemory;
 	}
 	if (copyin((user_addr_t) request->pixels, pixels, size) != 0) {
+		hakios_tl("HakiosGPU: panel pixels 0x%llx are not the client's memory; refused\n",
+		    (unsigned long long) request->pixels);
 		ret = kIOReturnVMError;
 	} else {
 		MiniIOMobileFramebufferShow(pixels, request->width, request->height, request->rowBytes);

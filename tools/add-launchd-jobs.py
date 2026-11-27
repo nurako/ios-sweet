@@ -34,20 +34,17 @@ JOBS = {
     '/System/Library/LaunchDaemons/com.hakios.gltest.plist': {
         'Label': 'com.hakios.gltest',
         # OPT-IN: a broken GPU client panics the kernel, so this job must not
-        # run on a normal boot.  It runs once only when the root carries the
-        # sentinel /var/tmp/run-gl-test; the sentinel is removed first, so a
-        # panic leaves the next boot safe.  To run it deliberately, on a
-        # mounted root:
+        # run on a normal boot.  iOS /bin has no shell, so the job is a plain
+        # ProgramArguments entry; gl_test itself checks and unlinks the
+        # sentinel /var/tmp/run-gl-test when GL_TEST_LAUNCHD=1.  To run it
+        # deliberately, on a mounted root:
         #     touch <root>/var/tmp/run-gl-test
         # (or, on a booted phone: touch /var/tmp/run-gl-test) and reboot.
-        'ProgramArguments': [
-            '/bin/sh', '-c',
-            'if [ -e /var/tmp/run-gl-test ]; then rm -f /var/tmp/run-gl-test; '
-            'echo "GLTEST: start"; sleep 5; '
-            'export DYLD_LIBRARY_PATH=/usr/local/lib; '
-            '/usr/local/bin/gl_test 2>&1; rc=$?; '
-            'echo "GLTEST: exit $rc"; exit $rc; fi',
-        ],
+        'ProgramArguments': ['/usr/local/bin/gl_test', '8'],
+        'EnvironmentVariables': {
+            'DYLD_LIBRARY_PATH': '/usr/local/lib',
+            'GL_TEST_LAUNCHD': '1',
+        },
         'RunAtLoad': True,
         'StandardOutPath': '/dev/console',
         'StandardErrorPath': '/dev/console',

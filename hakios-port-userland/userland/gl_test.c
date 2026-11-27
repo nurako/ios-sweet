@@ -306,6 +306,20 @@ main(int argc, char **argv)
 	/* Nothing is buffered and nothing can hang: a line and an alarm from the first instruction. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+	/*
+	 * The launchd job is a plain ProgramArguments entry (iOS /bin has no shell). It
+	 * sets GL_TEST_LAUNCHD=1; in that mode /var/tmp/run-gl-test is the opt-in
+	 * sentinel, checked and unlinked here before anything can panic. A manual run
+	 * (no GL_TEST_LAUNCHD) does not need it.
+	 */
+	if (getenv("GL_TEST_LAUNCHD") != NULL) {
+		if (access("/var/tmp/run-gl-test", F_OK) != 0) {
+			printf("gl_test: not asked to run (no /var/tmp/run-gl-test)\n");
+			return 0;
+		}
+		unlink("/var/tmp/run-gl-test");
+		printf("GLTEST: start\n");
+	}
 	signal(SIGALRM, on_alarm);
 	alarm(GL_TEST_TIMEOUT);
 	step("start (unbuffered; watchdog 20 s); opening the GPU service and making the DRM screen");
