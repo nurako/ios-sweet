@@ -50,11 +50,16 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
+# The boot-header cmdline is not what XNU sees (the payload carries its own
+# cmdline), but ABL still reads it. QCOM's A/B code skips retry-counter
+# decrements when the cmdline contains "root=" ("boot dev image") in its
+# published UEFI code; inert here if this ABL does not implement the quirk.
+# See docs/persistent-boot.md.
 mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
 	--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
-	--cmdline "console=null" -o out/shim-boot-$BOARD.img
+	--cmdline "console=null root=/dev/ram0" -o out/shim-boot-$BOARD.img
 # Stable name for scripts; per-board names keep sweet/alioth builds from
 # silently overwriting each other (that is how a sweet image got booted on
 # alioth once).
