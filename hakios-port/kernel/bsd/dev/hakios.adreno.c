@@ -3581,9 +3581,8 @@ hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t *held)
 	result = thread_block(THREAD_CONTINUE_NULL);
 	uint64_t ran = mach_absolute_time();
 	lck_mtx_lock(held);
-	if (adreno_loud) {
-		printf("adreno: loud: fence %u: %s\n", fence,
-		    result == THREAD_AWAKENED ? "the 3D core's interrupt woke the wait" : "the wait's deadline came first");
+	if (adreno_loud && result == THREAD_AWAKENED) {
+		printf("adreno: loud: fence %u: the 3D core's interrupt woke the wait\n", fence);
 	}
 	if (result != THREAD_AWAKENED) {
 		/* (11-19, census c24: the looks after a timed-out sleep came 1.1-3.4 ms after the deadline) where that goes:
@@ -4445,6 +4444,16 @@ hakios_gpu_last(void)
 	return gpu_fence;
 }
 
+/* What the CP's completion event has written so far (after taking this CPU's stale lines out). */
+uint32_t
+hakios_gpu_fence_word(void)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+
+	to_memory((vm_offset_t)word, 4);
+	return *word;
+}
+
 /* The core is to write down what time it is: at one end of submission `fence`. */
 static void
 ring_time(uint32_t fence, uint32_t end)
@@ -4741,7 +4750,9 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(gpu_fence);
 	ring_send();
 	if (adreno_loud) {
-		printf("adreno: loud: submission %u queued: %u command buffers, completion interrupt %s\n", gpu_fence, count,
+		printf("adreno: loud: submission %u queued at ring %u..%u: %u command buffers, completion at 0x%x <- %u, "
+		    "interrupt %s\n", gpu_fence, ring_sent > ring_at ? 0 : ring_sent, ring_at, count,
+		    CORE_SCRATCH_ADDRESS + GPU_FENCE_AT, gpu_fence,
 		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)");
 	}
 	return gpu_fence;

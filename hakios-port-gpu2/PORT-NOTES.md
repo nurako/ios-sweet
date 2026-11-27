@@ -253,3 +253,28 @@ unmaps. A successful map prints
 `hkdrm=1`. The kernel logs each GEM descriptor's flags/direction/length and each
 map's descriptor flags/direction, so a read-only or wrong-direction descriptor
 is visible next run.
+
+## 9. 2026-11-27: one stale fence poisoned every later wait (`gGPUReported`)
+
+The 14:48 log shows the real hang: `gpuWait(2)` returns in **147 us** with
+`NOT DONE ... the GPU was reported`, after a different client's `fence 1` had
+timed out earlier. `gpuWait()` broke its loop on the **global** `gGPUReported`
+flag, not on this fence's patience, so the first timeout (a stale client/fence,
+and `gpu_recover=1` was not booted to reset it) made every subsequent wait fail
+immediately — even for a fence that would have completed. The client's submit
+itself is fine: `0x46` returns a fence, the completion packet writes
+`CORE_SCRATCH_ADDRESS + GPU_FENCE_AT` (0x1200040) with that number, and the
+packet/ring positions are now logged.
+
+**Fix.** `gpuWait()` no longer breaks on `gGPUReported`; each wait is bounded
+only by its own (client-capped 2 s) patience, and the first check is still
+`hakios_gpu_done(fence)`. `gGPUReported` remains only to rate-limit the
+`hakios_gpu_report()` line; it cannot fail other clients' waits. `adreno_loud=1`
+now prints:
+- `wait for fence N ...; fence word at start W (last submitted L)`
+- `fence N DONE ...; fence word W` / `fence N NOT DONE ...; fence word W`
+- `submit -> fence N, fence word W (wanted N)`
+- `submission N queued at ring A..B ... completion at 0x1200040 <- N`
+
+The per-2 ms `the wait's deadline came first` line is gone (only the interrupt
+wake is printed), so the ring is readable.
