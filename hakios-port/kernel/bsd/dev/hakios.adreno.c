@@ -2698,6 +2698,9 @@ step_core_power(void)
 #define CP_HW_FAULT             GPU_WORD(0x0821)
 #define CP_INTERRUPT_STATUS     GPU_WORD(0x0823)
 #define CP_PROTECT_STATUS       GPU_WORD(0x0824)
+#define CP_SQE_STAT_ADDR        GPU_WORD(0x0828)        /* (Linux a6xx_cp_hw_err_irq: 1, then DATA is the opcode) */
+#define CP_SQE_STAT_DATA        GPU_WORD(0x0829)
+#define CP_INTERRUPT_OPCODE     (1u << 0)               /* (a6xx_reg.h: A6XX_CP_OPCODE_ERROR) */
 #define CP_SQE_INSTR_BASE       GPU_WORD(0x0830)
 #define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 #define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
@@ -2794,8 +2797,7 @@ ring_send(void)
 		to_memory(core_ring.memory, 4 * ring_at);
 	}
 	ring_sent = ring_at;
-	wr(gpu.base + CP_RB_WPTR, ring_at);
-	settle();                               /* the write pointer reaches the core after the ring's words do */
+	wr(gpu.base + CP_RB_WPTR, ring_at);      /* (the reference's kick: no barrier and no second write) */
 }
 
 /* Let the 3D core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -4156,14 +4158,14 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 }
 
 /*
- * Every client of the 3D core -- a process with a GPU connection: the window server, a game -- has an address space
- * of its own, its buffers and nobody else's, besides the ring, the command processor's microcode and the scratch
- * page that every space has at the same addresses. The 3D core's SMMU context is given the space of the client whose
- * commands come next, with the core idle in between (its TTBR0 written here, its TLB emptied): one client's commands
- * cannot read or write another's memory, the window server's least of all. On the phone 2026-11-01: six clients
- * (backboardd, GPU Check, Minecraft, Terraria, The Sims 3), 33012 switches in 25 minutes, none refused, no SMMU
- * fault, the games at their 60-62 frames a second, a present 0.2-0.5 ms as without. Boot-arg gpu_spaces=0: one space
- * for all, as before. The `_in` functions take a client's space; NULL is the shared one.
+ * One address space for every client of the 3D core, as the reference driver has it ("every client's buffers are in
+ * the one address space", drivers/gpu/hakios.gpu.cpp): all buffers, the ring, the command processor's microcode and
+ * the scratch page live in core_space, and the core's SMMU context is never re-pointed behind a submission.
+ *
+ * Boot-arg gpu_spaces=1 turns on the older experiment of a space for each client (its own TTBR0 loaded with the core
+ * idle). It is off by default: on the phone a new client's space was loaded and the first submission in it stopped
+ * the command processor (CP_INTERRUPT_STATUS bit 0, opcode error) before its completion packet. The `_in` functions
+ * take a client's space; NULL is the shared one.
  */
 void hakios_gpu_space_free(void *opaque);
 bool hakios_gpu_done(uint32_t fence);
@@ -4177,7 +4179,7 @@ static bool
 gpu_spaces_on(void)
 {
 	if (gpu_spaces < 0) {
-		uint32_t value = 1;
+		uint32_t value = 0;             /* (the reference's one address space; gpu_spaces=1 is the experiment) */
 
 		PE_parse_boot_argn("gpu_spaces", &value, sizeof(value));
 		gpu_spaces = value != 0;
@@ -4260,16 +4262,12 @@ space_switch(struct gpu_space *to)
 	if (to == (gpu_space_now != NULL ? gpu_space_now : &core_space)) {
 		return true;
 	}
+	/* (the reference waits for the fence word only before it points the core's context elsewhere) */
 	while (!hakios_gpu_done(gpu_fence) && waited < 5000) {
 		sleep_us(100);
 		waited++;
 	}
-	/* The fence word is written before the CP has necessarily read the ring's last words. */
-	while (rd(gpu.base + CP_RB_RPTR) != ring_sent && waited < 5000) {
-		sleep_us(100);
-		waited++;
-	}
-	if (!hakios_gpu_done(gpu_fence) || rd(gpu.base + CP_RB_RPTR) != ring_sent) {
+	if (!hakios_gpu_done(gpu_fence)) {
 		if (gpu_space_refused++ < 8) {
 			printf("adreno: gpu: the core is still at submission %u after 500 ms: no other client's space for it\n",
 			    gpu_fence);
@@ -4779,22 +4777,7 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
-	ring_send();
-	/*
-	 * A write pointer written while the core is busy is a doorbell: if the core is
-	 * between submissions it can be missed. RPTR says whether the core took it; if
-	 * it did not, write WPTR again (bounded: three tries, and the client's wait is
-	 * the real bound).
-	 */
-	for (uint32_t kick = 0; kick < 3 && rd(gpu.base + CP_RB_RPTR) != ring_at && !hakios_gpu_done(gpu_fence); kick++) {
-		sleep_us(200);
-		wr(gpu.base + CP_RB_WPTR, ring_at);
-		settle();
-		if (adreno_loud && kick != 0) {
-			printf("adreno: loud: submission %u: RPTR %u of %u, WPTR written again (%u)\n", gpu_fence,
-			    rd(gpu.base + CP_RB_RPTR), ring_at, kick + 1);
-		}
-	}
+	ring_send();                            /* (one write of CP_RB_WPTR, as the reference's hakios_gpu_submit) */
 	if (adreno_loud) {
 		printf("adreno: loud: ring tail:");
 		for (uint32_t k = 0; k < 8; k++) {
@@ -5029,6 +5012,11 @@ hakios_gpu_report(const char *why)
 	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
 	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	if (rd(gpu.base + CP_INTERRUPT_STATUS) & CP_INTERRUPT_OPCODE) {
+		/* "CP | opcode error | possible opcode=0x...": the command the command processor refused */
+		wr(gpu.base + CP_SQE_STAT_ADDR, 1);
+		printf("adreno: gpu:   the command processor refused an opcode: %#x\n", rd(gpu.base + CP_SQE_STAT_DATA));
+	}
 	if (ring_switches != 0) {
 		volatile uint32_t *taken = (volatile uint32_t *)(core_scratch.memory + GPU_RING_ROOT_AT);
 

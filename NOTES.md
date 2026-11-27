@@ -1,4 +1,21 @@
 
+## 2026-11-27 (ref): the submit path aligned with xiongnemo/hakios-alioth
+
+The reference's current `drivers/gpu` keeps **one address space for every
+client**; it has no `space_switch()`/`gpu_space_new()`/`hakios_gpu_submit_in()`.
+Our `gpu_spaces` experiment (on by default after the import) switched TTBR0 to a
+new client's tables and the first submission there stopped the CP
+(`CP_INTERRUPT_STATUS` bit 0, opcode error; the loud line showed `RPTR` reaching
+`WPTR`, so it was not the doorbell). `gpu_spaces` now defaults to 0; the old
+per-client path is `gpu_spaces=1`. Also removed the three gpu2 guesses the
+reference does not have: `dsb` after `CP_RB_WPTR`, the WPTR re-kick loop, and
+the `RPTR == ring_sent` drain before a space switch. The one-space mapping,
+`CP_INDIRECT_BUFFER` shape, `0x1200040` fence page and poll are unchanged
+because they already matched. `hakios_gpu_report()` now decodes the opcode
+error and reads `CP_SQE_STAT`. Comparison with quotes and line references:
+`hakios-port-ref/PORT-NOTES.md`. Compile 0/2; `check-patch-sources.sh` 9 match;
+0200 regenerated and re-applied in order. **Not booted from this branch.**
+
 ## 2026-11-27 - a userland OpenGL program draws on the panel
 
 `gl_test` (Mesa 25.0.7, freedreno FD650, OpenGL ES 3.2) runs on the iOS root and
