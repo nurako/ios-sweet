@@ -14,10 +14,10 @@ index dee13fe..380b8b9 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/hakios.adreno.c b/bsd/dev/hakios.adreno.c
 new file mode 100644
-index 0000000..8107deb
+index 0000000..a6e5662
 --- /dev/null
 +++ b/bsd/dev/hakios.adreno.c
-@@ -0,0 +1,5365 @@
+@@ -0,0 +1,5376 @@
 +/*
 + * The GPU of the POCO X5 Pro (HK, Adreno 642L/Yupik) or Xiaomi Mi 10 (UMI,
 + * Adreno 650/Kona), woken step by step toward a picture that it fills and the panel shows.
@@ -3601,9 +3601,8 @@ index 0000000..8107deb
 +	result = thread_block(THREAD_CONTINUE_NULL);
 +	uint64_t ran = mach_absolute_time();
 +	lck_mtx_lock(held);
-+	if (adreno_loud) {
-+		printf("adreno: loud: fence %u: %s\n", fence,
-+		    result == THREAD_AWAKENED ? "the 3D core's interrupt woke the wait" : "the wait's deadline came first");
++	if (adreno_loud && result == THREAD_AWAKENED) {
++		printf("adreno: loud: fence %u: the 3D core's interrupt woke the wait\n", fence);
 +	}
 +	if (result != THREAD_AWAKENED) {
 +		/* (11-19, census c24: the looks after a timed-out sleep came 1.1-3.4 ms after the deadline) where that goes:
@@ -4465,6 +4464,16 @@ index 0000000..8107deb
 +	return gpu_fence;
 +}
 +
++/* What the CP's completion event has written so far (after taking this CPU's stale lines out). */
++uint32_t
++hakios_gpu_fence_word(void)
++{
++	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
++
++	to_memory((vm_offset_t)word, 4);
++	return *word;
++}
++
 +/* The core is to write down what time it is: at one end of submission `fence`. */
 +static void
 +ring_time(uint32_t fence, uint32_t end)
@@ -4761,7 +4770,9 @@ index 0000000..8107deb
 +	ring(gpu_fence);
 +	ring_send();
 +	if (adreno_loud) {
-+		printf("adreno: loud: submission %u queued: %u command buffers, completion interrupt %s\n", gpu_fence, count,
++		printf("adreno: loud: submission %u queued at ring %u..%u: %u command buffers, completion at 0x%x <- %u, "
++		    "interrupt %s\n", gpu_fence, ring_sent > ring_at ? 0 : ring_sent, ring_at, count,
++		    CORE_SCRATCH_ADDRESS + GPU_FENCE_AT, gpu_fence,
 +		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)");
 +	}
 +	return gpu_fence;
@@ -5999,7 +6010,7 @@ index 0000000..4031608
 +	}
 +}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index f585be7..1a7a9ed 100644
+index 29b7512..fb36ff4 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
@@ -6477,73 +6488,12 @@ index 0000000..35b00e6
 +
 +
 +#endif /* _IOKIT_MINIIOSURFACE_H */
-diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
-index b5b3ba9..57a3567 100644
---- a/osfmk/arm/caches.c
-+++ b/osfmk/arm/caches.c
-@@ -47,6 +47,9 @@
- 
- #include <arm/misc_protos.h>
- 
-+extern unsigned long gPhysBase;
-+extern unsigned long real_phys_size;
-+
- /*
-  * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
-  */
-@@ -70,8 +73,24 @@ flush_dcache(
- 
- 	while (length > 0) {
- 		if (phys) {
--			count = length;
- 			paddr = CAST_DOWN(pmap_paddr_t, addr);
-+			/*
-+			 * A physical address no linear map covers (a user client's
-+			 * offset, an IOVA, a truncated high-bank PA) must never reach
-+			 * phystokv_range(): it panics with "illegal PA". There is no
-+			 * cache line of ours to push for such memory; skip it.
-+			 */
-+			if (gPhysBase != 0 && real_phys_size != 0 &&
-+			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
-+				count = PAGE_SIZE - (addr & PAGE_MASK);
-+				if (count > length) {
-+					count = length;
-+				}
-+				addr += count;
-+				length -= count;
-+				continue;
-+			}
-+			count = length;
- 			vaddr = phystokv_range(paddr, &count);
- 		} else {
- 			paddr = kvtophys(addr);
-@@ -104,8 +123,19 @@ clean_dcache(
- 
- 	while (length > 0) {
- 		if (phys) {
--			count = length;
- 			paddr = CAST_DOWN(pmap_paddr_t, addr);
-+			/* (flush_dcache(): a PA outside the linear map is not converted) */
-+			if (gPhysBase != 0 && real_phys_size != 0 &&
-+			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
-+				count = PAGE_SIZE - (addr & PAGE_MASK);
-+				if (count > length) {
-+					count = length;
-+				}
-+				addr += count;
-+				length -= count;
-+				continue;
-+			}
-+			count = length;
- 			vaddr = phystokv_range(paddr, &count);
- 		} else {
- 			paddr = kvtophys(addr);
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..4e3494f
+index 0000000..9f74cd4
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,2156 @@
+@@ -0,0 +1,2167 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -6621,6 +6571,7 @@ index 0000000..4e3494f
 +int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
 +void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 +uint32_t hakios_gpu_last(void);
++uint32_t hakios_gpu_fence_word(void);
 +void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 +void hakios_gpu_report(const char * why);
 +void hakios_gpu_stop(void);
@@ -6896,7 +6847,8 @@ index 0000000..4e3494f
 +	uint64_t loudBegan = gGPULoud ? began : 0;
 +	bool soon = false;                      /* (11-19) the next sleep a short one: woken, and the fence not there yet */
 +
-+	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms\n", fence, milliseconds);
++	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms; fence word at start %u (last submitted %u)\n", fence,
++	    milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
 +	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 +	for (bool waited = false;; waited = true) {
 +		if (hakios_gpu_done(fence)) {
@@ -6908,13 +6860,13 @@ index 0000000..4e3494f
 +				uint64_t ns;
 +
 +				absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
-+				IOLog("HakiosGPU: loud: fence %u DONE after %llu us (waited %s)\n", fence, ns / NSEC_PER_USEC,
-+				    waited ? "yes" : "no");
++				IOLog("HakiosGPU: loud: fence %u DONE after %llu us (waited %s); fence word %u\n", fence,
++				    ns / NSEC_PER_USEC, waited ? "yes" : "no", hakios_gpu_fence_word());
 +			}
 +			return true;
 +		}
-+		if (mach_absolute_time() - began >= patience || gGPUReported) {
-+			break;                  /* (a GPU that has stopped answering is not waited for again) */
++		if (mach_absolute_time() - began >= patience) {
++			break;                  /* (each wait has its own patience: one stale fence must not fail all the others) */
 +		}
 +		/*
 +		 * (the K40's) Asked again every 50 us for the first millisecond -- where the display's own waits end, and
@@ -6997,8 +6949,8 @@ index 0000000..4e3494f
 +		uint64_t ns;
 +
 +		absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
-+		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms, %s)\n", fence, ns / NSEC_PER_USEC,
-+		    milliseconds, gGPUReported ? "the GPU was reported" : "timeout");
++		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
++		    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
 +	}
 +	return false;
 +}
@@ -8220,7 +8172,16 @@ index 0000000..4e3494f
 +		addresses[count] = b->address + cmds[i].submit_offset;
 +		words[count++] = cmds[i].size / 4;
 +	}
++	GPU_LOUD("HakiosGPU: loud: submit: client fence field %u, %u command buffers at", request->fence, count);
++	if (gGPULoud && count != 0) {
++		for (uint32_t i = 0; i < count; i++) {
++			IOLog(" %#llx:%u", addresses[i], words[i]);
++		}
++		IOLog("\n");
++	}
 +	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);
++	GPU_LOUD("HakiosGPU: loud: submit -> fence %u, fence word %u (wanted %u)\n", request->fence,
++	    hakios_gpu_fence_word(), request->fence);
 +	if (gpu_log && request->fence != 0) {
 +		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 +		uint32_t big = 0, all_words = 0;
@@ -8879,6 +8840,67 @@ index acc9ae0..c1eeefe 100644
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index b5b3ba9..57a3567 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -47,6 +47,9 @@
+ 
+ #include <arm/misc_protos.h>
+ 
++extern unsigned long gPhysBase;
++extern unsigned long real_phys_size;
++
+ /*
+  * dcache_incoherent_io_flush64() dcache_incoherent_io_store64() result info
+  */
+@@ -70,8 +73,24 @@ flush_dcache(
+ 
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/*
++			 * A physical address no linear map covers (a user client's
++			 * offset, an IOVA, a truncated high-bank PA) must never reach
++			 * phystokv_range(): it panics with "illegal PA". There is no
++			 * cache line of ours to push for such memory; skip it.
++			 */
++			if (gPhysBase != 0 && real_phys_size != 0 &&
++			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
++				count = PAGE_SIZE - (addr & PAGE_MASK);
++				if (count > length) {
++					count = length;
++				}
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
+@@ -104,8 +123,19 @@ clean_dcache(
+ 
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/* (flush_dcache(): a PA outside the linear map is not converted) */
++			if (gPhysBase != 0 && real_phys_size != 0 &&
++			    (paddr < gPhysBase || paddr - gPhysBase >= real_phys_size)) {
++				count = PAGE_SIZE - (addr & PAGE_MASK);
++				if (count > length) {
++					count = length;
++				}
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
 diff --git a/osfmk/arm64/loose_ends.c b/osfmk/arm64/loose_ends.c
 index fcdc6d4..30d6b34 100644
 --- a/osfmk/arm64/loose_ends.c

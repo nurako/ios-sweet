@@ -1,4 +1,13 @@
 
+## 2026-11-27 (gpu2): 0200 actually regenerated; guard added
+
+The fence fix was committed in the sources but the old `0200` was left behind,
+so CI rebuilt the old driver. `0200-hakios-gpu.patch` is regenerated from the
+current 14 files and verified against a pre-0200 baseline (applies; all content
+matches; 0300/0400/0500/0501 apply after it; no `sweet_gpu.c`). Added
+`tools/check-patch-sources.sh` to catch the next drift. Patched sha256:
+adreno `6fd7d0e6...`, gpu.cpp `a2b42452...` (full in PORT-NOTES §10).
+
 ## 2026-11-27 (gpu2): stale-fence poisoning fixed
 
 `gpuWait()` used a global `gGPUReported` flag to skip waiting after any earlier

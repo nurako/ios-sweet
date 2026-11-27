@@ -278,3 +278,47 @@ now prints:
 
 The per-2 ms `the wait's deadline came first` line is gone (only the interrupt
 wake is printed), so the ring is readable.
+
+## 10. 2026-11-27: 0200 regenerated from sources, and a guard
+
+`0200-hakios-gpu.patch` is now generated from the current sources, not edited by
+hand. It still owns the same 14 files. Regeneration recipe (the one that was
+verified):
+
+```
+gh run download 45973420555 -R nurako/ios-sweet -n xnu-buildtree -D /tmp/bt9
+tar xzf /tmp/bt9/buildtree.tgz -C /tmp/bt9
+git apply -R /tmp/runpatches/0501.patch ... 0300 ... 0200   # run's own patches
+# then: copy current sources over the 0200 files and `git diff` them
+```
+
+Verification performed:
+- `0200` applies to the run's pre-0200 baseline (after reversing 0501..0200);
+- every one of its 14 post-images equals the current tree/sources;
+- `0300`, `0400`, `0500`, `0501` (that run's copies) still apply **sequentially**
+  after it;
+- it does not touch `bsd/dev/sweet_gpu.c`.
+
+sha256 of the patched files (compare a future CI tree against these):
+
+```
+6fd7d0e649b92785d3d6a7bd24bd08453ab01e2f02c973e5da498df248ddf71d  bsd/dev/hakios.adreno.c
+a2b42452f98a2fc4b1f429ec021a53b583a32bf0e0bf84e48da7018ff2054282  iokit/Kernel/hakios.gpu.cpp
+```
+
+### The guard
+
+```
+tools/check-patch-sources.sh [--quiet] [PATCH...]
+```
+
+It reconstructs every file each patch **creates** from the patch's `+` lines
+and compares it with this repo's source copy (`hakios-port/kernel/...`), exits
+1 and names the differing files otherwise. Default: 0200, 0300, 0400, 0500,
+0501. Current result: `9 file(s) match their sources, 9 skipped` (the skipped
+ones are patch-only drivers and config files with no second copy).
+
+It is not wired into `.github/workflows/xnu.yml`: that job applies patches to a
+cached tree and does not keep a pre-0200 baseline to extract against. Run it
+locally before committing any change to `hakios-port/kernel/**` or
+`hakios-port/adapter/**`; it needs no build tree.
