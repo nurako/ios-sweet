@@ -18,6 +18,43 @@ successful map (`map type N -> bytes`). `hakios_drm_map` rejects zero/short maps
 and probes each 4 KB page under a temporary SIGBUS/SIGSEGV handler, so an
 unbacked mapping is `MAP_FAILED`, not a crash; `gl_test` prints the fault address
 and exits 128+N. 0200's gpu.cpp hunk regenerated; compile 0/1.
+## 2026-11-27 (persist): persistent boot plan, tooling and on-device measurements
+
+Branch `hakios-persist` (from `hakios-integrate`). Goal: iOS on a normal
+power-on, no `fastboot boot` and no per-reboot reflash. **Nothing was flashed
+or booted from this branch**; only read-only `fastboot getvar`/`oem device-info`
+queries were run.
+
+Measured while the phone was in fastboot: `current-slot: b`, `slot-count: 2`,
+`unlocked: yes`, `secure: yes`, `partition-size:boot_a|boot_b: 0xC000000`
+(192 MiB, exactly the `phone/boot.img` dump), `vbmeta_*: 0x20000`,
+`dtbo_*: 0x2000000`, `slot-retry-count:a|b: 6`, `max-fetch-size` unsupported
+(no `fastboot fetch`), `is-userspace: no`, `oem device-info` says
+`Verity mode: true / Device unlocked: true / critical unlocked: true /
+Charger screen enabled: false`, `off-mode-charge: 0`. **`fastboot getvar all`
+wedges this ABL** (it stops answering individual getvars) — do not use it.
+
+Decision: write only the active `boot_b` with `shim/out/shim-boot-alioth.img`
+(header v2, self-contained DTB+payload cmdline; stock is v3 — v2 is fine and is
+the exact format that already boots via `fastboot boot`). `boot_a` stays stock.
+`vbmeta` is not required in the orange/unlocked state; `--vbmeta` is a fallback.
+Never re-lock.
+
+New: `docs/persistent-boot.md` (full rationale, exact commands, AVB, escape
+hatch, risks), `tools/install-persistent-boot.sh` (refuses without `--yes`,
+checksums `boot_<slot>`/`vbmeta_<slot>` into `phone/`, preflights the baked
+payload cmdline, prints every command) and `tools/persistent-boot-restore.sh`.
+`shim/build.sh` now puts `root=/dev/ram0` in the boot-header cmdline:
+Qualcomm's published boot code skips A/B retry decrements for a cmdline
+containing `root=` ("boot dev image"), which should prevent the phone from
+falling back to slot A after 6 unsuccessful normal boots (unverified on this
+ABL; the change cannot affect XNU, which uses the payload cmdline). The installer's `--dev-image-cmdline` patches the existing
+image's 512-byte v2 header cmdline in a copy (kernel/payload byte-identical).
+
+Open: `slot-successful:b` could not be read (the ABL was wedged at the time).
+If it is `yes`, ABL never decrements retries and plain `--yes` is enough; if
+`no`/unknown, use `--dev-image-cmdline`. Permanent fix to consider: have the
+shim/kernel write `successful=1` to the `misc` slot metadata on boot.
 
 ## 2026-11-27 (gpu2): second illegal-PA panic hardened at the cache primitives
 
