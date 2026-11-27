@@ -322,3 +322,47 @@ It is not wired into `.github/workflows/xnu.yml`: that job applies patches to a
 cached tree and does not keep a pre-0200 baseline to extract against. Run it
 locally before committing any change to `hakios-port/kernel/**` or
 `hakios-port/adapter/**`; it needs no build tree.
+
+## 11. 2026-11-27: the client ring is kicked; the command buffer was not visible
+
+The loud lines show the client path does exactly what the internal path does:
+`gpu_submit()` appends to the same `core_ring` and `ring_send()` writes
+`CP_RB_WPTR = ring_at` (the internal `ring_run()` only adds `hold()` and a RPTR
+poll). The completion packet is `CP_EVENT_WRITE CACHE_FLUSH_TS` at
+`CORE_SCRATCH_ADDRESS + GPU_FENCE_AT`; that page is one of the blocks
+`hakios_gpu_space_new()` maps into **every** client space, so there is no SMMU
+context mismatch: the client's buffers and the scratch page are in the same
+space the core is switched to.
+
+The suspect is the **command buffer's contents**: Mesa writes them through the
+client's mapping, and `submit()` skipped the cache pass for ordinary buffers
+(`!b->seen || !gGPUCached`), trusting write-combining. If the mapping is not
+actually WC (or the core's view races the store buffer), the core fetches a
+stale/zero IB, faults on it and never reaches our completion packet. The fence
+word stays at 0 and the client waits out its patience.
+
+**Fix.** `submit()` now pushes every named buffer (command buffers first, all
+BOs) to memory with `hakios_gpu_to_memory()` before the ring is sent, and logs
+the byte count under loud. No SMMU remap was needed. Also:
+- `gpuWait()` already got the real unit; the ~209 ms exits were the old global
+  `gGPUReported` break (removed in the previous commit), while the 2.06 s line
+  is the true 2 s wait. A 60 s cap was added so a client cannot overflow the
+  nanosecond multiply.
+- a blocking `0x44 CPU_PREP` that does not land now returns `kIOReturnTimeout`
+  (ETIMEDOUT), not `kIOReturnBusy`; NOSYNC still returns Busy. The wait is
+  bounded, so `gl_test`'s 20 s alarm can run once the syscall returns.
+- loud now prints ring base/size, RPTR/WPTR before and 1 ms after the kick,
+  CP fault/status, the client space/context/root and the fence page address.
+
+Expected proof (new lines):
+
+```
+adreno: loud: ring processor: base 0x..., 8192 words; RPTR N, WPTR N; about to send N..M; space 0x... context 0 root 0x...
+adreno: loud: submission 1 queued ... completion at 0x1200040 <- 1 ...; RPTR now N, WPTR now M
+adreno: loud: submission 1, 1 ms on: RPTR N+..., status 0x1, CP fault 0x0 ...; fence word 1
+HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
+gl_test: step 9: glFinish returned
+```
+
+If RPTR does not move and CP fault stays 0, the next check is the IB payload
+itself (address/size) rather than the ring kick.

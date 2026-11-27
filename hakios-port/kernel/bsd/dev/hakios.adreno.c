@@ -4454,6 +4454,23 @@ hakios_gpu_fence_word(void)
 	return *word;
 }
 
+/* For the loud lines: whose SMMU tables the core is on, and where the fence page is. */
+uint32_t
+hakios_gpu_space_context(void *opaque)
+{
+	struct gpu_space *space = opaque != NULL ? opaque : &core_space;
+
+	return space->context;
+}
+
+uint64_t
+hakios_gpu_space_root(void *opaque)
+{
+	struct gpu_space *space = opaque != NULL ? opaque : &core_space;
+
+	return space->root != NULL ? kvtophys((vm_offset_t)space->root) : 0;
+}
+
 /* The core is to write down what time it is: at one end of submission `fence`. */
 static void
 ring_time(uint32_t fence, uint32_t end)
@@ -4740,6 +4757,14 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	if (gpu_exact) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);      /* the time is the pipeline's, not the command processor's, which is ahead of it */
 	}
+	if (adreno_loud) {
+		uint32_t rptr = rd(gpu.base + CP_RB_RPTR);
+		printf("adreno: loud: ring %s: base 0x%x, %u words; RPTR %u, WPTR %u; about to send %u..%u; space %p "
+		    "context %u root 0x%llx; fence page 0x%x\n", ring_window_open ? "window" : "processor",
+		    CORE_RING_ADDRESS, RING_WORDS, rptr, rd(gpu.base + CP_RB_WPTR), ring_sent, ring_at,
+		    (void *)gpu_space_now, hakios_gpu_space_context(gpu_space_now),
+		    (unsigned long long)hakios_gpu_space_root(gpu_space_now), CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
+	}
 	ring_time(gpu_fence, 1);
 	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	ring_command(CP_EVENT_WRITE, 4);
@@ -4751,9 +4776,15 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring_send();
 	if (adreno_loud) {
 		printf("adreno: loud: submission %u queued at ring %u..%u: %u command buffers, completion at 0x%x <- %u, "
-		    "interrupt %s\n", gpu_fence, ring_sent > ring_at ? 0 : ring_sent, ring_at, count,
+		    "interrupt %s; RPTR now %u, WPTR now %u\n", gpu_fence, ring_sent > ring_at ? 0 : ring_sent, ring_at, count,
 		    CORE_SCRATCH_ADDRESS + GPU_FENCE_AT, gpu_fence,
-		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)");
+		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)",
+		    rd(gpu.base + CP_RB_RPTR), rd(gpu.base + CP_RB_WPTR));
+		sleep_us(1000);
+		printf("adreno: loud: submission %u, 1 ms on: RPTR %u, status %#x, CP fault %#x, CP int %#x, protect %#x; "
+		    "fence word %u\n", gpu_fence, rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
+		    rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS),
+		    hakios_gpu_fence_word());
 	}
 	return gpu_fence;
 }
