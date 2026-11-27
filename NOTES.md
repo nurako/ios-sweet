@@ -1,4 +1,13 @@
 
+## 2026-11-27 (gpu2): stale-fence poisoning fixed
+
+`gpuWait()` used a global `gGPUReported` flag to skip waiting after any earlier
+timeout; one stale fence made every later client wait return `NOT DONE` in
+~150 us. Removed that break: each wait uses its own patience (clients 2 s), and
+`adreno_loud=1` now logs the fence word at wait start/end, the submit's fence
+word, and the completion packet address/value. Kernel compile 0/2; 0200 gpu.cpp
+and adreno.c chunks regenerated.
+
 ## 2026-11-27 (gpu2): map probe now reads and writes
 
 ul4 already had the per-page probe and still SIGBUSed on the first store: the

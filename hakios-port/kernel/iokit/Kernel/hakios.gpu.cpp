@@ -75,6 +75,7 @@ void hakios_gpu_irq_late(uint32_t * n, uint64_t * sched, uint64_t * lock);
 int hakios_gpu_irq_wait(uint32_t fence, uint64_t deadline, lck_mtx_t * held);
 void hakios_gpu_irq_counts(uint64_t * arrived, uint64_t * empty);
 uint32_t hakios_gpu_last(void);
+uint32_t hakios_gpu_fence_word(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
@@ -350,7 +351,8 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	uint64_t loudBegan = gGPULoud ? began : 0;
 	bool soon = false;                      /* (11-19) the next sleep a short one: woken, and the fence not there yet */
 
-	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms\n", fence, milliseconds);
+	GPU_LOUD("HakiosGPU: loud: wait for fence %u, at most %llu ms; fence word at start %u (last submitted %u)\n", fence,
+	    milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		if (hakios_gpu_done(fence)) {
@@ -362,13 +364,13 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 				uint64_t ns;
 
 				absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
-				IOLog("HakiosGPU: loud: fence %u DONE after %llu us (waited %s)\n", fence, ns / NSEC_PER_USEC,
-				    waited ? "yes" : "no");
+				IOLog("HakiosGPU: loud: fence %u DONE after %llu us (waited %s); fence word %u\n", fence,
+				    ns / NSEC_PER_USEC, waited ? "yes" : "no", hakios_gpu_fence_word());
 			}
 			return true;
 		}
-		if (mach_absolute_time() - began >= patience || gGPUReported) {
-			break;                  /* (a GPU that has stopped answering is not waited for again) */
+		if (mach_absolute_time() - began >= patience) {
+			break;                  /* (each wait has its own patience: one stale fence must not fail all the others) */
 		}
 		/*
 		 * (the K40's) Asked again every 50 us for the first millisecond -- where the display's own waits end, and
@@ -451,8 +453,8 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		uint64_t ns;
 
 		absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
-		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms, %s)\n", fence, ns / NSEC_PER_USEC,
-		    milliseconds, gGPUReported ? "the GPU was reported" : "timeout");
+		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
+		    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
 	}
 	return false;
 }
@@ -1674,7 +1676,16 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
+	GPU_LOUD("HakiosGPU: loud: submit: client fence field %u, %u command buffers at", request->fence, count);
+	if (gGPULoud && count != 0) {
+		for (uint32_t i = 0; i < count; i++) {
+			IOLog(" %#llx:%u", addresses[i], words[i]);
+		}
+		IOLog("\n");
+	}
 	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);
+	GPU_LOUD("HakiosGPU: loud: submit -> fence %u, fence word %u (wanted %u)\n", request->fence,
+	    hakios_gpu_fence_word(), request->fence);
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 		uint32_t big = 0, all_words = 0;
