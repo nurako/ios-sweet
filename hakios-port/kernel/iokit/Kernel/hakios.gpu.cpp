@@ -78,6 +78,7 @@ uint32_t hakios_gpu_last(void);
 uint32_t hakios_gpu_fence_word(void);
 uint32_t hakios_gpu_space_context(void *space);
 uint64_t hakios_gpu_space_root(void *space);
+uint32_t hakios_gpu_ring_rptr(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
@@ -373,6 +374,19 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 				    ns / NSEC_PER_USEC, waited ? "yes" : "no", hakios_gpu_fence_word());
 			}
 			return true;
+		}
+		if (gGPULoud) {
+			static uint64_t lastPoll;
+			static uint32_t polls;
+			uint64_t oneTenth;
+
+			nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &oneTenth);
+			if (polls == 0 || mach_absolute_time() - lastPoll >= oneTenth) {
+				lastPoll = mach_absolute_time();
+				polls++;
+				IOLog("HakiosGPU: loud: fence %u poll %u: word %u, RPTR %u (want %u)\n", fence, polls,
+				    hakios_gpu_fence_word(), hakios_gpu_ring_rptr(), fence);
+			}
 		}
 		if (mach_absolute_time() - began >= patience) {
 			break;                  /* (each wait has its own patience: one stale fence must not fail all the others) */
@@ -1699,6 +1713,16 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
 			continue;                               /* the other kinds are for a GPU shared between address spaces */
 		}
+		if (cmds[i].size == 0) {
+			/*
+			 * An empty command buffer is not an indirect buffer: CP_INDIRECT_BUFFER
+			 * with a length of zero leaves the core reading a packet that is not
+			 * there and it never reaches the fence packet (this is what a readback
+			 * submit can carry). It needs no packet.
+			 */
+			GPU_LOUD("HakiosGPU: loud: command buffer %u is empty: no indirect buffer\n", i);
+			continue;
+		}
 		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
 		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
 			IOLog("HakiosGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
@@ -1716,12 +1740,34 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		IOLog("\n");
 	}
+	if (count == 0) {
+		/* (nothing to give the core: no fence is made, and the client is told so) */
+		GPU_LOUD("HakiosGPU: loud: a submission with no non-empty command buffer: not sent\n");
+		ret = kIOReturnBadArgument;
+		IOLockUnlock(gGPULock);
+		goto out;
+	}
 	GPU_LOUD("HakiosGPU: loud: submit: this client's space %p, context %u, root %#llx; %u IBs; the core will run it in "
 	    "the space the line below names\n", fSpace, hakios_gpu_space_context(fSpace),
 	    (unsigned long long) hakios_gpu_space_root(fSpace), count);
 	if (gGPULoud) {
+		for (uint32_t i = 0; i < request->nr_bos; i++) {
+			struct gpu_buffer * b = buffer(bos[i].handle);
+
+			if (b != NULL) {
+				IOLog("HakiosGPU: loud: BO %u: handle %u, GPU 0x%llx, %llu bytes, flags %#x\n", i,
+				    bos[i].handle, b->address, (unsigned long long) b->size, bos[i].flags);
+			}
+		}
 		for (uint32_t i = 0; i < count; i++) {
-			IOLog("HakiosGPU: loud: IB %u at 0x%llx, %u words\n", i, addresses[i], words[i]);
+			struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
+			uint32_t show = MIN(words[i], 16u);
+
+			IOLog("HakiosGPU: loud: IB %u at 0x%llx, %u words:", i, addresses[i], words[i]);
+			for (uint32_t k = 0; b != NULL && b->kernel != NULL && k < show; k++) {
+				IOLog(" %08x", ((const uint32_t *)(b->kernel + cmds[i].submit_offset))[k]);
+			}
+			IOLog("%s\n", words[i] > show ? " ..." : "");
 		}
 	}
 	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);

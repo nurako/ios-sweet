@@ -32,6 +32,13 @@ rather than Busy, so a stalled wait cannot trap a thread.
 Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-27 (gpu2): readback empty IB skipped
+
+The readback submit carries a zero-length `MSM_SUBMIT_CMD_BUF`; emitting
+`CP_INDIRECT_BUFFER` with length 0 stalls the CP before the fence packet.
+`submit()` now skips empty command buffers and refuses a submission with no
+non-empty IB. Loud adds every BO, the first 16 IB dwords, and fence-word/RPTR
+polls every 100 ms.
 
 ## 2026-11-27 (gpu2): re-kick ring and idle the CP before space switches
 
