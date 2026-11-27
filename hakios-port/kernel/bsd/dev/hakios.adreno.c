@@ -2795,6 +2795,7 @@ ring_send(void)
 	}
 	ring_sent = ring_at;
 	wr(gpu.base + CP_RB_WPTR, ring_at);
+	settle();                               /* the write pointer reaches the core after the ring's words do */
 }
 
 /* Let the 3D core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -4263,7 +4264,12 @@ space_switch(struct gpu_space *to)
 		sleep_us(100);
 		waited++;
 	}
-	if (!hakios_gpu_done(gpu_fence)) {
+	/* The fence word is written before the CP has necessarily read the ring's last words. */
+	while (rd(gpu.base + CP_RB_RPTR) != ring_sent && waited < 5000) {
+		sleep_us(100);
+		waited++;
+	}
+	if (!hakios_gpu_done(gpu_fence) || rd(gpu.base + CP_RB_RPTR) != ring_sent) {
 		if (gpu_space_refused++ < 8) {
 			printf("adreno: gpu: the core is still at submission %u after 500 ms: no other client's space for it\n",
 			    gpu_fence);
@@ -4774,7 +4780,28 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	/*
+	 * A write pointer written while the core is busy is a doorbell: if the core is
+	 * between submissions it can be missed. RPTR says whether the core took it; if
+	 * it did not, write WPTR again (bounded: three tries, and the client's wait is
+	 * the real bound).
+	 */
+	for (uint32_t kick = 0; kick < 3 && rd(gpu.base + CP_RB_RPTR) != ring_at && !hakios_gpu_done(gpu_fence); kick++) {
+		sleep_us(200);
+		wr(gpu.base + CP_RB_WPTR, ring_at);
+		settle();
+		if (adreno_loud && kick != 0) {
+			printf("adreno: loud: submission %u: RPTR %u of %u, WPTR written again (%u)\n", gpu_fence,
+			    rd(gpu.base + CP_RB_RPTR), ring_at, kick + 1);
+		}
+	}
 	if (adreno_loud) {
+		printf("adreno: loud: ring tail:");
+		for (uint32_t k = 0; k < 8; k++) {
+			uint32_t at = (ring_at + RING_WORDS - 8 + k) % RING_WORDS;
+			printf(" %u:%08x", at, ((uint32_t *)core_ring.memory)[at]);
+		}
+		printf("\n");
 		printf("adreno: loud: submission %u queued at ring %u..%u: %u command buffers, completion at 0x%x <- %u, "
 		    "interrupt %s; RPTR now %u, WPTR now %u\n", gpu_fence, ring_sent > ring_at ? 0 : ring_sent, ring_at, count,
 		    CORE_SCRATCH_ADDRESS + GPU_FENCE_AT, gpu_fence,

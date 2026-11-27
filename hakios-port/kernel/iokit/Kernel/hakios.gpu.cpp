@@ -456,10 +456,20 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	}
 	if (gGPULoud) {
 		uint64_t ns;
+		static uint32_t saidFence;
+		static uint64_t saidAt, oneSecond;
 
 		absolutetime_to_nanoseconds(mach_absolute_time() - loudBegan, &ns);
-		IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
-		    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
+		if (oneSecond == 0) {
+			nanoseconds_to_absolutetime(NSEC_PER_SEC, &oneSecond);
+		}
+		/* (Mesa retries; one line for a fence, and one a second after that, is enough) */
+		if (fence != saidFence || mach_absolute_time() - saidAt >= oneSecond) {
+			saidFence = fence;
+			saidAt = mach_absolute_time();
+			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
+			    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
+		}
 	}
 	return false;
 }
@@ -864,6 +874,7 @@ class HakiosGPUUserClient : public IOUserClient
 	uint32_t                fBufferCount;
 	uint64_t                fBufferBytes;
 	uint32_t                fSubmits;
+	uint32_t                fLastFence;              /* this client's last submission (clientClose waits for this, not the world's) */
 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
 	struct gpu_left         fLeft[GPU_LEFT];
 	uint32_t                fLeftCount;
@@ -1021,9 +1032,9 @@ HakiosGPUUserClient::clientClose(void)
 {
 	if (fBuffers != NULL) {
 		IOLockLock(gGPULock);
-		/* what the client had the GPU do last may still be going on, in these buffers */
-		if (hakios_gpu_ready()) {
-			gpuWait(hakios_gpu_last(), 1000);
+		/* what THIS client had the GPU do last may still be going on, in these buffers */
+		if (hakios_gpu_ready() && fLastFence != 0) {
+			gpuWait(fLastFence, 1000);
 		}
 		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
 			if (fBuffers[i].memory != NULL) {
@@ -1705,10 +1716,18 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		IOLog("\n");
 	}
-	GPU_LOUD("HakiosGPU: loud: submit: this client's space %p, context %u, root %#llx; the core will run it in the "
-	    "space the line below names\n", fSpace, hakios_gpu_space_context(fSpace),
-	    (unsigned long long) hakios_gpu_space_root(fSpace));
+	GPU_LOUD("HakiosGPU: loud: submit: this client's space %p, context %u, root %#llx; %u IBs; the core will run it in "
+	    "the space the line below names\n", fSpace, hakios_gpu_space_context(fSpace),
+	    (unsigned long long) hakios_gpu_space_root(fSpace), count);
+	if (gGPULoud) {
+		for (uint32_t i = 0; i < count; i++) {
+			IOLog("HakiosGPU: loud: IB %u at 0x%llx, %u words\n", i, addresses[i], words[i]);
+		}
+	}
 	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);
+	if (request->fence != 0) {
+		fLastFence = request->fence;
+	}
 	GPU_LOUD("HakiosGPU: loud: submit -> fence %u, fence word %u (wanted %u)\n", request->fence,
 	    hakios_gpu_fence_word(), request->fence);
 	if (gpu_log && request->fence != 0) {
@@ -2080,7 +2099,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			ret = kIOReturnBadArgument;
 			break;
 		}
-		waitFence = b->fence != 0 ? b->fence : hakios_gpu_last();
+		waitFence = b->fence;           /* (0: never submitted, therefore done -- not the world's last fence) */
 		if (!gpuWait(waitFence, patience)) {
 			/* (a blocking prep that timed out is ETIMEDOUT, as Linux's msm; only NOSYNC says EBUSY) */
 			ret = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? kIOReturnBusy : kIOReturnTimeout;

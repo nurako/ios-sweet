@@ -16,6 +16,15 @@ Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
 
+## 2026-11-27 (gpu2): re-kick ring and idle the CP before space switches
+
+Fences 1-2 complete, 3-4 stay queued. `ring_send` now DSBs after WPTR, and
+`gpu_submit` re-writes WPTR if RPTR has not moved (the doorbell can be lost
+between submissions). `space_switch` now waits for RPTR == ring_sent, not just
+the fence word, so a queued IB cannot be fetched under the next client's tables.
+Client waits are per-client (`fLastFence`, and CPU_PREP of an unsubmitted BO is
+done). Loud adds IB addresses, the last 8 ring dwords, and CP status/fault after
+1 ms.
 
 ## 2026-11-27 (gpu2): push client command buffers before submit
 

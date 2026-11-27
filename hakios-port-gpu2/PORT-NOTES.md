@@ -366,3 +366,41 @@ gl_test: step 9: glFinish returned
 
 If RPTR does not move and CP fault stays 0, the next check is the IB payload
 itself (address/size) rather than the ring kick.
+
+## 12. 2026-11-27: submissions 3+ stop after the CP's page tables move
+
+Fences 1-2 land (word 2), then 3-4 are queued (`last submitted 4`) and the word
+stays 2. The CP is no longer fetching: the ring has words after the point the
+core last read, and the writer only wrote `CP_RB_WPTR` **once**, while the core
+was still busy with 2. Two gaps are now closed:
+
+- `ring_send()` ends with `dsb sy` after `CP_RB_WPTR`, so the pointer cannot
+  reach the core before the ring words do.
+- after sending, `gpu_submit()` checks `CP_RB_RPTR`; if the core has not taken
+  the pointer at all (it was between submissions when the doorbell was written),
+  it writes `CP_RB_WPTR` again, three tries 200 us apart. The client's wait stays
+  the real bound.
+- `space_switch()` used to wait only for the fence **word** before changing the
+  SMMU tables; it now also waits until `CP_RB_RPTR == ring_sent`, so no queued
+  IB of the old space can be fetched under the new client's tables (an SMMU
+  fault there stops the CP before its completion packet).
+- waits are per client: `clientClose` waits for `fLastFence` (this client's last
+  submission), and `CPU_PREP` of a never-submitted buffer is done instead of
+  waiting for the world's last fence. A repeated `NOT DONE` for one fence is
+  logged once and then at most once a second.
+
+New loud lines per submit: `IB i at 0x..., N words`, `ring tail: at:word ...`
+(the last 8 dwords), `RPTR/WPTR` before and 1 ms after the kick, `CP status`,
+`CP fault`, `CP int`, `protect`, and the client space/context/root.
+
+Expected for a second and third completion:
+```
+adreno: loud: submission 3 ... completion at 0x1200040 <- 3 ...; RPTR now N, WPTR now M
+adreno: loud: submission 3, 1 ms on: RPTR M, status 0x1, CP fault 0x0 ...; fence word 3
+HakiosGPU: loud: fence 3 DONE after ... us (waited yes); fence word 3
+adreno: loud: submission 4 ... completion at 0x1200040 <- 4 ...
+HakiosGPU: loud: fence 4 DONE after ... us (waited yes); fence word 4
+```
+If RPTR reaches M but the word stays 2, the completion packet itself is being
+executed in a space where 0x1200040 is not the scratch page; the space/root line
+then names the mismatch.
