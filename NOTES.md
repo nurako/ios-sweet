@@ -1,4 +1,12 @@
 
+## 2026-11-27 (gpu2): readback empty IB skipped
+
+The readback submit carries a zero-length `MSM_SUBMIT_CMD_BUF`; emitting
+`CP_INDIRECT_BUFFER` with length 0 stalls the CP before the fence packet.
+`submit()` now skips empty command buffers and refuses a submission with no
+non-empty IB. Loud adds every BO, the first 16 IB dwords, and fence-word/RPTR
+polls every 100 ms.
+
 ## 2026-11-27 (gpu2): re-kick ring and idle the CP before space switches
 
 Fences 1-2 complete, 3-4 stay queued. `ring_send` now DSBs after WPTR, and

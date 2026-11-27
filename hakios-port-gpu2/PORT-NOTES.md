@@ -404,3 +404,38 @@ HakiosGPU: loud: fence 4 DONE after ... us (waited yes); fence word 4
 If RPTR reaches M but the word stays 2, the completion packet itself is being
 executed in a space where 0x1200040 is not the scratch page; the space/root line
 then names the mismatch.
+
+## 13. 2026-11-27: the readback's empty indirect buffer
+
+Readback sequence from Mesa's freedreno: `0x42 GEM_NEW` for the 16 KB staging
+BO, `0x43 GEM_INFO`, `IOConnectMapMemory64` (map type N), `0x44 CPU_PREP` for the
+render target, then a `0x46` submit (the blit/copy), then `0x47`/`0x44` waits.
+
+The readback submit names a **zero-length command buffer** (Mesa asks for a
+fence around a flush). We turned every `MSM_SUBMIT_CMD_BUF` into
+`CP_INDIRECT_BUFFER` with `words = size/4`, so that one became an indirect
+buffer of **length 0**: the core follows a packet that is not there and never
+reaches the completion packet, so the fence word stops at the previous value
+(2) while `last submitted` moves on (4). This is why it looked like a readback
+wait that ignored its cap: the submit was made, but the core was stuck.
+
+**Fix.** `submit()` now skips `size == 0` command buffers (loud:
+`command buffer N is empty: no indirect buffer`). If nothing non-empty remains,
+it returns `kIOReturnBadArgument` without consuming a fence. This also avoids
+`CP_INDIRECT_BUFFER` with a zero length on any other path.
+
+The readback wait is bounded as before (client waits 2 s, returns
+`kIOReturnTimeout`); a submit-only BO with `fence == 0` is treated as done (no
+wait on another client's last fence), and `clientClose` waits only this client's
+`fLastFence`. New loud diagnostics for the next run: every BO (handle, GPU IOVA,
+size, flags), the first 16 dwords of each IB, and one poll line every 100 ms with
+the fence word and `CP_RB_RPTR`.
+
+Expected final lines:
+```
+HakiosGPU: loud: command buffer 0 is empty: no indirect buffer
+HakiosGPU: loud: IB 0 at 0x..., 42 words: ...
+HakiosGPU: loud: fence 3 DONE after ... us (waited yes); fence word 3
+gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
+gl_test: the picture is on the panel (0x0), for 8 seconds
+```

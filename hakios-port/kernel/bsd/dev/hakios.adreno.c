@@ -4477,6 +4477,12 @@ hakios_gpu_space_root(void *opaque)
 	return space->root != NULL ? kvtophys((vm_offset_t)space->root) : 0;
 }
 
+uint32_t
+hakios_gpu_ring_rptr(void)
+{
+	return core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
+}
+
 /* The core is to write down what time it is: at one end of submission `fence`. */
 static void
 ring_time(uint32_t fence, uint32_t end)
