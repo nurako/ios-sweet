@@ -1,4 +1,21 @@
 
+## 2026-11-27 (gpu2): second illegal-PA panic hardened at the cache primitives
+
+The reported caller `0xfffffe0007b0ce7c` resolves to `phystokv_range.cold.1+0x48`
+only in the pre-guard kernel 45778296613; in 45876690142 it is kperf. The panic
+is therefore the old unguarded path. Value `0x5800000` is below `gPhysBase`
+(0x1_00000000), not an IOVA/handle/offset; most likely a truncated high-bank PA.
+
+Fix: `flush_dcache()`/`clean_dcache()` now skip `phys=TRUE` addresses outside
+`gPhysBase..gPhysBase+real_phys_size`; `bcopy_phys_internal()`/`bzero_phys()`
+and `copypv()` use the same linear-map test plus `pmap_valid_address()`.
+`newBuffer()` logs `HakiosGPU: <what> 0x... is not kernel memory; refused`.
+`gl_test` got the `/var/tmp/run-gl-test` sentinel check and the launchd job is
+now a plain `ProgramArguments` entry with `GL_TEST_LAUNCHD=1` (no `/bin/sh`).
+Compile-verified 0/5 kernel files (gpu, adreno, adapter, caches, loose_ends);
+0200 regenerated (caches.c added, loose_ends updated), order verified earlier.
+Details: `hakios-port-gpu2/PORT-NOTES.md` §6.
+
 ## 2026-11-26 (gpu2): Mesa client path traced and bounded
 
 Branch `hakios-gpu2` (from `hakios-integrate`). The userland `gl_test` client is

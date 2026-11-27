@@ -184,6 +184,21 @@ extern struct vc_info vinfo;
  * a value are refused while they are still only a request.
  */
 extern boolean_t pmap_valid_address(uint64_t addr);
+/* phystokv_range()'s own bounds (osfmk/arm64/arm_vm_init.c): a PA outside these
+ * panics with "illegal PA". vm_first_phys/vm_last_phys can describe a wider or
+ * different set, so check the linear map explicitly as well. */
+extern unsigned long gPhysBase;
+extern unsigned long real_phys_size;
+
+static bool
+hakios_gpu_linear_phys_ok(uint64_t phys, uint64_t size)
+{
+	if (phys < gPhysBase || size == 0 || size > real_phys_size) {
+		return false;
+	}
+	return phys - gPhysBase <= real_phys_size - size;
+}
+
 bool
 hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout)
 {
@@ -193,7 +208,8 @@ hakios_gpu_phys_ok(uint64_t phys, uint64_t size, bool scanout)
 	if (phys == 0 || size == 0 || phys + size < phys) {
 		return false;                   /* no address, or a range that wraps */
 	}
-	if (pmap_valid_address(phys) && pmap_valid_address(phys + size - 1)) {
+	if (hakios_gpu_linear_phys_ok(phys, size) &&
+	    pmap_valid_address(phys) && pmap_valid_address(phys + size - 1)) {
 		return true;                    /* kernel-managed, and in the linear map */
 	}
 	return scanout && fb != 0 && fb_size != 0 && phys >= fb && phys + size <= fb + fb_size;

@@ -143,3 +143,47 @@ case is a dump, not a filter working.
    and compare the `gl_test: fill:` timings against the kernel's five-second
    `HakiosGPU: ... submissions in ...` line; then move to the IOSurface (0x7e)
    path for the window server.
+
+## 6. 2026-11-27: the second `illegal PA` (0x5800000) and the shell-less job
+
+**Caller.** In the kernel artifact named in the new report
+(`gh run download 45876690142 ... -n xnu-kernel`, `__TEXT` at
+`0xfffffe0007004000`) the supplied caller `0xfffffe0007b0ce7c` (written with an
+extra `f`) is inside `kperf_kcallstack_sample.cold.3`. In the **pre-guard**
+kernel 45778296613 the same address is exactly
+`phystokv_range.cold.1 + 0x48`, the return from `bl panic` at `+0x44`. So the
+panic string is from a kernel without the `copypv()` guard; the gpu2 kernel puts
+that site at `0xfffffe0007b11de4/de8`. The panic site itself is
+`phystokv_range()` reached from `copypv()` -> `flush_dcache64()` ->
+`flush_dcache(phys=TRUE)` (or the internal `phystokv_range` of
+`bcopy_phys_internal()`), i.e. a client-derived "physical" address.
+
+**Value.** `0x5800000` = 88 MiB is below `gPhysBase = 0x1_00000000`; it is not
+DRAM, not a GPU IOVA (that window starts at `0x20000000`), not a GEM handle and
+not a SweetSurface offset. It is consistent with a **truncated high-bank PA**
+(`0x1_05800000` -> `0x05800000`) or a low user/mapping address used as a PA.
+The lower stack is absent, so the producer cannot be named from the string.
+
+**Why the guard missed it.** Two reasons. (a) The image that panicked was the
+pre-guard one (caller resolves there). (b) The old guard only ran inside
+`copypv()` and only when `cppvPsrc`/`cppvPsnk` said the address was physical; a
+caller of `flush_dcache64(..., TRUE)`/`clean_dcache64()` directly, or a caller
+whose flags did not name the address physical, bypassed it. `pmap_valid_address`
+alone is not the right predicate for `phystokv_range`: it is `pa_valid()`'s
+managed range, not the linear-map test.
+
+**Fix.** Validate at the first primitive, with the same bounds `phystokv_range`
+uses (`gPhysBase`/`real_phys_size`), in addition to `pmap_valid_address`:
+`flush_dcache()` and `clean_dcache()` skip a `phys=TRUE` address outside the
+linear map; `bcopy_phys_internal()`/`bzero_phys()` choose the CPU copy window
+for it; `copypv()` only flushes addresses that pass both tests. `newBuffer()`
+prints `HakiosGPU: a buffer's physical address 0x... is not kernel memory;
+refused` (or the scan-out variant) for the first 16 refusals and always under
+`adreno_loud=1`; `submit()`/`show()` log bad client pointers the same way.
+
+**Job.** iOS `/bin` has no shell, so `com.hakios.gltest` is now plain
+`ProgramArguments = ['/usr/local/bin/gl_test','8']` plus
+`EnvironmentVariables = {DYLD_LIBRARY_PATH=/usr/local/lib, GL_TEST_LAUNCHD=1}`.
+`gl_test` checks `/var/tmp/run-gl-test`, unlinks it and prints `GLTEST: start`
+when `GL_TEST_LAUNCHD` is set; without the sentinel it exits 0 immediately. A
+manual `/usr/local/bin/gl_test` run does not need the sentinel.
