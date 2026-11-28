@@ -2424,3 +2424,28 @@ older fork). **Verdict: after the GL path** — then a NativeAdreno-v1 facade ov
 iPadOS 17.7.11 rebase is acceptable; do not drop in upstream AdrenoMetal on
 iOS 16. Doc: `docs/adrenometal-feasibility.md`.
 https://github.com/UniXNU/AdrenoMetal · https://github.com/FFT-infra/UniXNU-alioth · https://github.com/NWylynko/ios-flame
+
+## 2026-11-28 (ios-guacamole ios16): Metal on A640 checked — iOS 16 stack found, still A640-only
+
+Read `coreycusick/ios-guacamole` branch **`ios16`** (commit `29e3cf3`, 2026-11-20; README
+retired 2026-11-12 to focus on iOS 27.2). It runs iOS **16.7.16 (20H392)** iPhone X userland
+on XNU 8796 on a OnePlus 7 Pro (SM8150, **Adreno 640**). Its "Metal acceleration" is a real
+device-tested CA compositor: an `IOAcceleratorES` stub published from `AppleCLCD` (0088)
+carries `MetalPluginName=SweetMetal2` / `MetalPluginClassName=SweetMTL2Device` (0144; 0145
+adds the present fence);
+Metal loads `SweetMetal2.bundle`, whose frontend (`NativeBridgeMetalFrontend.mm`) drives
+metal2vulkan + Turnip through a 609-line **NativeAdreno ABI v1** user client over their
+existing `sweet_gpu.c`/RedwoodGPU ring (BO alloc/import/map, 16 IBs, CP fences, `0x4147`).
+backboardd, WebKit GPU/WebContent and Telegram are listed in `/var/local/mtl2-clients`;
+`NOTES.md:2223` confirms "backboardd composes with Metal, NOT libsweet-gl". Evidence: owner
+reports + `mtltest` PASS + swipe rate 25 -> 37-44 fps; no screenshot/video/CI, DeviceLost
+and GPU hangs need recovery, GLES-only apps still crash.
+This is the same ios-flame lineage at a newer, fully documented state: it supplies the
+iOS 16 `IOAcceleratorES` + frontend + facade that upstream AdrenoMetal lacks, and the facade
+maps cleanly onto our `hakios_gpu_ready/map/submit(_in)/done/last` KPI and existing
+per-client spaces. It is still A640-only (chip 0x06040001, GMEM/bank/UBWC, 585 MHz, SM8150
+pool ranges) and does not solve a650 or our 256-dword submit stop. **Verdict: ordering
+unchanged — finish GL/submit first; then this is the concrete reference for the NativeAdreno
+facade, and its userland bundle can be built offline in parallel.**
+Doc: `docs/guacamole-ios16-metal.md`.
+https://github.com/coreycusick/ios-guacamole/tree/ios16
