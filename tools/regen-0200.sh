@@ -54,6 +54,9 @@ if [ -z "$tree" ]; then
 	done
 fi
 
+# (--tree has no download directory of its own; the diff still needs a temporary name)
+tmp=${tmp:-$(mktemp -d)}
+
 [ -f "$tree/bsd/dev/sweet_ufs.c" ] || { echo "no sweet_ufs.c in $tree" >&2; exit 1; }
 if [ -f "$tree/bsd/dev/hakios.adreno.c" ]; then
 	echo "the tree still has 0200 applied; reverse it first" >&2

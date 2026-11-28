@@ -4190,14 +4190,21 @@ gpu_spaces_on(void)
 {
 	if (gpu_spaces < 0) {
 		/*
-		 * Device evidence: per-client spaces get further (the CP executes the
-		 * IB and draws part of a triangle) and the alioth build is reported to
-		 * default to them. Shared space stays the fallback with gpu_spaces=0.
+		 * The reference (hakios-metal, drivers/board/adreno.c:3676 hakios_gpu_submit)
+		 * has one SMMU space for every client and no CP_SMMU_TABLE_UPDATE in the
+		 * ring; its draws complete there. A per-client space needs that packet
+		 * (Linux a6xx_set_pagetable) and ours is still unproven on this phone, so
+		 * gpu_spaces=1 alone is refused rather than wedging the front end again.
 		 */
-		uint32_t value = 1;
+		uint32_t value = 0;
 
 		PE_parse_boot_argn("gpu_spaces", &value, sizeof(value));
 		gpu_spaces = value != 0;
+		if (gpu_spaces && !gTableUpdate && !ring_window_open) {
+			printf("adreno: gpu: gpu_spaces=1 needs CP_SMMU_TABLE_UPDATE (gpu_table_update=1) or an open "
+			    "gpu_ring_switch window; the reference's one shared space is used\n");
+			gpu_spaces = 0;
+		}
 	}
 	return gpu_spaces != 0;
 }
@@ -4821,14 +4828,13 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
-	{
-		uint32_t at = ring_at;
-		ring_command(CP_EVENT_WRITE, 1);
-		ring(EVENT_CACHE_INVALIDATE);
-		if (adreno_loud) {
-			printf("adreno: loud: preamble: CACHE_INVALIDATE at ring %u..%u\n", at, ring_at - 1);
-		}
-	}
+	/*
+	 * (the reference's submit is exactly this: ring_time, INVALIDATE_DEPTH,
+	 * INVALIDATE_COLOR, the IBs, WFI, ring_time, CP_SCRATCH_REG2, CACHE_FLUSH.
+	 * The CACHE_INVALIDATE that a page-table switch needs stays inside the
+	 * gpu_table_update=1 block above; with one shared space there is nothing
+	 * for the UCHE to drop and the reference does not emit it.)
+	 */
 	for (uint32_t i = 0; i < count; i++) {
 		if (i == 0) {
 			last_ib_address = addresses[i];
@@ -4924,6 +4930,7 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
  * (hakios_gpu_space_faulted()); everyone else goes on. At most 3 times a minute; then the GPU is left as before.
  */
 void hakios_gpu_report(const char *why);
+void hakios_gpu_ib_dump(const char *why);       /* iokit/Kernel/hakios.gpu.cpp: the dwords at the stop */
 bool hakios_gpu_hung(void);
 bool hakios_gpu_recover(void);
 bool hakios_gpu_fence_failed(uint32_t fence);
@@ -5120,14 +5127,16 @@ hakios_gpu_report(const char *why)
 	    *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT), rd(gpu.base + CP_RB_RPTR), ring_at,
 	    rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS), rd(gpu.base + CP_HW_FAULT),
 	    rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS));
-	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
-	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
+	printf("adreno: gpu:   in the first command buffer at %#llx, %u dwords, %u to go (ROQ %u); in the second at %#llx, %u to go\n",
+	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_DWORDS),
+	    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_ROQ_AVAIL_IB1) >> 16,
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
 	if (rd(gpu.base + CP_INTERRUPT_STATUS) & CP_INTERRUPT_OPCODE) {
 		/* "CP | opcode error | possible opcode=0x...": the command the command processor refused */
 		wr(gpu.base + CP_SQE_STAT_ADDR, 1);
 		printf("adreno: gpu:   the command processor refused an opcode: %#x\n", rd(gpu.base + CP_SQE_STAT_DATA));
 	}
+	hakios_gpu_ib_dump(why);
 	if (ring_switches != 0) {
 		volatile uint32_t *taken = (volatile uint32_t *)(core_scratch.memory + GPU_RING_ROOT_AT);
 
