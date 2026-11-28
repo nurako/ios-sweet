@@ -1755,13 +1755,32 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		for (uint32_t i = 0; i < count; i++) {
 			struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
-			uint32_t show = MIN(words[i], 16u);
+			const uint32_t * cmd = b != NULL && b->kernel != NULL ?
+			    (const uint32_t *)(b->kernel + cmds[i].submit_offset) : NULL;
+			uint32_t show = MIN(words[i], 64u);
 
+			/*
+			 * 64 dwords, not 16: a CP IB1 prefetch is 256 dwords, so a stop "256 dwords in" can hide
+			 * its cause in the first 1 KiB (DIFF-SUBMIT.md, #6). Then every indirect buffer the walk
+			 * finds in that window and where it points -- freedreno chains the gmem ring to its
+			 * restore and draw rings, and an address that is not mapped is read as zero (SERVE_AFTER_FAULT).
+			 */
 			IOLog("HakiosGPU: loud: IB %u at 0x%llx, %u words:", i, addresses[i], words[i]);
-			for (uint32_t k = 0; b != NULL && b->kernel != NULL && k < show; k++) {
-				IOLog(" %08x", ((const uint32_t *)(b->kernel + cmds[i].submit_offset))[k]);
+			for (uint32_t k = 0; cmd != NULL && k < show; k++) {
+				IOLog(" %08x", cmd[k]);
 			}
 			IOLog("%s\n", words[i] > show ? " ..." : "");
+			for (uint32_t k = 0; cmd != NULL && k + 3 < MIN(words[i], 256u); k++) {
+				uint32_t header = cmd[k];
+
+				if ((header >> 28) == 7 && ((header >> 16) & 0x7f) == 0x3f &&
+				    (header & 0x3fff) == 3) {
+					IOLog("HakiosGPU: loud: IB %u: CP_INDIRECT_BUFFER at +%u -> 0x%llx, %u words\n", i, k,
+					    (unsigned long long) cmd[k + 1] | (unsigned long long) cmd[k + 2] << 32,
+					    cmd[k + 3]);
+					k += 3;
+				}
+			}
 		}
 	}
 	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);

@@ -72,6 +72,20 @@ rather than Busy, so a stalled wait cannot trap a thread.
 Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-28 (gpu2): systematic diff against the working alioth reference
+
+Fetched the real driver for this phone (xiongnemo/hakios-alioth, branch
+`alioth`, `devices/redmi-k40/...`, 5410 + 1888 lines) and diffed it: our port is
+that file plus diagnostics. Restored the reference's end-of-submit
+`ring_time(fence,1)` + `CP_SCRATCH_REG2` write (they were dropped by mistake;
+they are after the IB, so not the 1 KiB stop), and extended the loud probe
+(64 IB dwords, nested-IB targets, `CP_ROQ_AVAIL_IB1`). Reference's kept-GPU run
+is `gpu=1` -> steps 1..21, not our `sweetgpu=22` (step 22's 2D fill runs before
+the handover); next boot `gpu=1 gpu_irq=1 adreno_loud=1`, then add
+`gpu_sleep_test=1`. Also corrected in the notes: the working alioth build uses
+per-client spaces by default (`gpu_spaces=1`), not the shared space.
+Details: `hakios-port-ref/DIFF-SUBMIT.md`.
+
 ## 2026-11-28 (gpu2): reference submit ported; shared space default
 
 Fetched the reference submit (drivers/gpu/hakios.adreno.c): same one-packet
