@@ -2394,3 +2394,19 @@ GPT name (`ufsroot=`). Deferred: the only new brick vector is the first GPT
 write, which Power+VolDown/`fastboot boot`/`boot_a` do not cover.
 Decision doc: `docs/splitboot-feasibility.md`.
 https://github.com/open-mapple/mapple_splitboot · https://open-mapple.pages.dev/splitboot/
+
+## 2026-11-28 (AdrenoMetal): Metal-on-Adreno checked against alioth — after the GL path
+
+Read `UniXNU/AdrenoMetal` (415 commits, active, MIT; upstream A740 on macOS 27 /
+iPadOS 27, no releases), its `FFT-infra` fork with `Adreno650` (A650 on iPadOS
+17.7.11) and `NWylynko/ios-flame` (the same stack on iOS 16.7.16 / A640).
+AdrenoMetal is only the userland Metal frontend plus the
+`MetalPluginName`/`IOAcceleratorES` discovery bundle over metal2vulkan and
+Turnip; it is not an `IOAcceleratorES` provider and cannot open `HakiosGPU`'s
+msm-DRM ABI. A650 UI compositing is shown only on iPadOS 17.7.11 (FFT; partial —
+widgets/posters/Wi-Fi missing, fragile) and iOS 16 only on A640 (ios-flame, an
+older fork). **Verdict: after the GL path** — then a NativeAdreno-v1 facade over
+`HakiosGPU` with the iOS 16 Turnip/frontend, or FFT's full A650 stack if an
+iPadOS 17.7.11 rebase is acceptable; do not drop in upstream AdrenoMetal on
+iOS 16. Doc: `docs/adrenometal-feasibility.md`.
+https://github.com/UniXNU/AdrenoMetal · https://github.com/FFT-infra/UniXNU-alioth · https://github.com/NWylynko/ios-flame
