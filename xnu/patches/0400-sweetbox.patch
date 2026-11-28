@@ -394,6 +394,16 @@ index 0000000..571cc0f
 +	unsigned root_seen = 0, flat_seen = 0;
 +	bool failed = false;
 +	unsigned root_written = 0;
++	if (!root) {
++		/*
++		 * A box that carries ROOT entries and is booted without
++		 * sweetboxroot would otherwise be stamped done having installed
++		 * nothing, and could never be applied again.  Leave it pending.
++		 */
++		printf("SWEET BOX: root install is off; the mailbox is left pending\n");
++		kmem_free(kernel_map, (vm_offset_t)buf, BOX_BYTES);
++		return;
++	}
 +	if (root) {
 +		root_written = box_walk(payload, payload_len, h.nfiles, true,
 +		    &root_seen, &failed);
