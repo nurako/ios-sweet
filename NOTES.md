@@ -1,4 +1,27 @@
 
+## 2026-11-28 (night) - GPU: the first submission of a boot draws; later submissions stall
+
+- Measured truth: per-client SMMU space plus a correctly encoded `CP_SMMU_TABLE_UPDATE`
+  (`gpu_spaces=1 gpu_table_update=1`; `5f/1/0`, `53/4/<ttbr_lo>/<ttbr_hi|asid<<16>/0/0`,
+  `EVENT/1/49`, `5f/1/1`) makes the **first** client submission of a boot complete: `gl_test`
+  draws 1080x2400 in 124 ms, reads back in 73 ms, 673920/2592000 pixels (26%, matches the
+  geometry), and `kHakiosShow` shows it for 6 s. Two boots, same kernel build.
+- Every later submission in that boot stalls: the second `gl_test` takes ~2.1 s draw and ~2.1 s
+  readback (both at the wait cap), the fence word never lands and the readback is zeros. One
+  correct frame per boot, not sustained rendering.
+- Failure modes: shared space -> `CP int 0x1` at 256 dwords; per-client space without the table
+  update -> `CP int 0` then a `HLSQ/SP` wedge at ~448 dwords (`RBBM_STATUS 0xe51005`), white
+  corner and ~15-19k pixels.
+- Boot args for the working runs: `adreno=22 adreno_keep=1 adreno_loud=1 gpu_irq=1
+  gpu_recover=1 gpu_spaces=1 gpu_table_update=1`. `804901a` reverted baked defaults for the last
+  two because that build drew a partial frame; the arrangement stays boot arguments, not defaults,
+  until the second-submission bug is fixed.
+- `boot_b` now holds OrangeFox recovery (192 MiB; the boot partition is 192 MiB and there is no
+  separate recovery partition), so power-on lands in recovery with adb and iOS boots with
+  `fastboot boot`; `boot_b` persistence conflicts with recovery but was verified earlier. Chain:
+  `power-on -> OrangeFox adb -> adb reboot fastboot -> fastbootd -> fastboot reboot bootloader`.
+- CDC-ACM still enumerates as `Xiaomi` / `Mi 11X` on `fastboot boot` boots.
+
 ## 2026-11-28 (late) - GPU: per-client spaces fixed the opcode error; the draw still wedges
 
 - Shared space: `CP int 0x1` (opcode error), IB stops at 256 dwords.

@@ -19,9 +19,11 @@ defaults are untouched, so sweet keeps building and booting as before.
 shim stands in for iBoot (its firmware version is `sweet-shim`), loads our XNU 8796 and an Apple
 device tree, and XNU mounts a 16 GiB HFS+ image from the start of `userdata`. SpringBoard reaches
 the home screen, Settings opens, touch and the volume/power keys respond, all eight CPUs are
-initialised, and the kernel log and a shell come out over USB. The GPU is the current wall: the
-ported Adreno 650 driver brings up the whole block and draws its own test frame, but Mesa client
-submissions reach the command processor but the pipeline wedges mid-IB; the frame is mostly zeros with a white corner. With one SMMU space per client (`gpu_spaces=1`) the earlier opcode error is gone and the CP consumes ~448 dwords before the hang.
+initialised, and the kernel log and a shell come out over USB. The GPU now draws, but once per
+boot: the ported Adreno 650 driver brings up the whole block, and with one SMMU space per client plus
+our `CP_SMMU_TABLE_UPDATE` sequence (`gpu_spaces=1 gpu_table_update=1`) the **first** Mesa client
+submission of a boot completes and reaches the panel. Every later submission in that boot stalls.
+That is one correct frame per boot, not sustained rendering.
 
 > Experimental bring-up, not a usable phone OS. The iOS root lives in the `userdata` partition and
 > **erased Android's user data** when it was flashed (bootloader, boot, dtbo, vbmeta, super,
@@ -32,7 +34,7 @@ submissions reach the command processor but the pipeline wedges mid-IB; the fram
 
 | Area | State |
 | --- | --- |
-| Boot | **Works.** Stock Xiaomi bootloader → temporary `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions yet |
+| Boot | **Works.** Stock Xiaomi bootloader → temporary `fastboot boot` of our shim → XNU. `boot_b` holds OrangeFox recovery (this device has no separate recovery partition), so a normal power-on lands in recovery, not iOS |
 | CPU | **Works.** `cpus=8` → `requested=8 selected=8`, PSCI CPU_ON for cores 1-7, `8/8 CPUs initialized` |
 | Memory | Upper DDR bank, `0x1_00000000` + 0x140000000 (5 GiB), 16K pages, GICv3, virtual timer INTID 27 |
 | Storage | **Works.** Own UFS host driver; GPT parsed; the iOS root is in `userdata` and mounted read-write (`hfs: mounted IOSRoot on device b(1,0)`) |
@@ -43,13 +45,13 @@ submissions reach the command processor but the pipeline wedges mid-IB; the fram
 | Buttons | **Works.** PM8150 GPIO6 (power) and the volume keys, through the alioth keys driver |
 | Battery | **Works.** Real percentage from the PM8150B fuel gauge (`batteryhakios=1`); the static 100 % / 4200 mV service is the fallback |
 | Logging | **Works.** Kernel console ring in the last 4 MiB of `userdata`, readable at the next boot with `sweetlogdump` / `sweetloggrep`; also streamed over USB |
-| USB | **Works.** Device mode: CDC-ACM console at `1209:316d`, manufacturer `Xiaomi`, product `Mi 11X`; the kernel log always flows and a shell attaches on demand |
+| USB | **Works.** Device mode: CDC-ACM console at `1209:316d`, manufacturer `Xiaomi`, product `Mi 11X` (the same on `fastboot boot` boots); the kernel log always flows and a shell attaches on demand |
 | SWEETBOX | **Works.** A 1 MiB mailbox before the log ring accepts a checksummed payload from recovery ADB and installs it on the next boot; a new `/usr/local/bin/usbsh` was installed this way without reflashing `userdata` |
 | GPU core | **Works.** The ported hakios-alioth Adreno 650 driver (patch `0200`) brings up zap/TrustZone, GMU firmware, HFI, the 3D core, the command processor, SMMU, the 2D fill and the panel, publishes `HakiosGPU` (msm-DRM ABI), takes the GPU interrupt (INTID 332 / SPI 300) and draws its orange/white/blue test bands |
-| GPU client | **Partly working.** Mesa 25.0.7/freedreno identifies `FD650` and `gl_test` completes every step; with `gpu_spaces=1` the CP no longer raises an opcode error and consumes ~448 dwords of the IB before the pipeline wedges (`HLSLQ/SP` busy, no fault bit). The readback shows a white corner rather than the 26% triangle. The triangle was drawn correctly once, on 2026-11-27 |
+| GPU client | **One correct frame per boot.** Mesa 25.0.7/freedreno identifies `FD650`; with `gpu_spaces=1 gpu_table_update=1` the first `gl_test` submission of a boot draws 1080×2400 in 124 ms, reads back in 73 ms and colours 673920/2592000 pixels (26%, matching the geometry); `kHakiosShow` shows it for 6 s. Reproduced on two boots. Every later submission in that boot stalls (~2.1 s draw and ~2.1 s readback, both at the wait cap; fence word never lands, readback zeros). This is boot arguments, not defaults: the baked-defaults change was reverted in `804901a` because that build drew a partial frame |
 | Wi-Fi / BT / cellular / audio / camera | **No drivers.** Wi-Fi is the next research project (see below) |
 | Haptics / torch | **Parked.** The AW8697 never answers on the assumed GENI SE11 bus (the probe resets the boot before its first print), so its real bus and GPIOs still need checking; the flash module reports type `0x18`/subtype `0x0000`, not PM8150L, so the torch driver refuses |
-| Persistent boot | **Prepared, not applied.** `boot_b` image, installer and restore path are documented and measured; nothing has been flashed |
+| Persistent boot | **Not used.** `boot_b` now holds OrangeFox recovery (192 MiB; no separate recovery partition), so power-on lands in recovery with adb and iOS boots with `fastboot boot`. Persistence through `boot_b` was verified earlier but conflicts with recovery |
 
 ## How it boots
 
@@ -154,13 +156,16 @@ and runs the ported driver:
 
 ```
 sweetgpu=0 board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
-adreno=22 adreno_keep=1 adreno_pause=0 adreno_watch=30 adreno_loud=1 gpu_irq=1
+adreno=22 adreno_keep=1 adreno_pause=0 adreno_watch=30 adreno_loud=1 gpu_irq=1 \
+gpu_recover=1 gpu_spaces=1 gpu_table_update=1
 ```
 
 Use the second form for the Mesa client; `sweetgpu=N` and `adreno=N` are alternative ladders, not
 something to enable together. `adreno_keep=1` publishes `HakiosGPU`; `gpu_irq=1` attaches the GPU
-interrupt (INTID 332 / SPI 300); `adreno_loud=1` logs every client request and fence wait. Boot
-arguments are space separated; use a substring without spaces for `sweetloggrep`.
+interrupt (INTID 332 / SPI 300); `adreno_loud=1` logs every client request and fence wait. The pair
+`gpu_spaces=1 gpu_table_update=1` is what draws the first frame; it is **not** the default (see
+`804901a` below), and leaving it off reproduces the ~448-dword wedge. Boot arguments are space
+separated; use a substring without spaces for `sweetloggrep`.
 
 ## How to build and boot (alioth)
 
@@ -209,6 +214,7 @@ unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 ro
 launchd_unsecure_cache=1 wdt=-1 sweettouch=1 sweettouchdelay=0 sweetkeys=1 sweetusb=0 \
 sweetgpu=0 board_pil_gpu=0x8681a000 board_pil_gpu_size=0x2000 \
 adreno=22 adreno_keep=1 adreno_pause=0 adreno_watch=30 adreno_loud=1 gpu_irq=1 \
+gpu_recover=1 gpu_spaces=1 gpu_table_update=1 \
 usbhakios=1 usb=2 usbreplay=1 sweetbox=1 batteryhakios=1'
 
 cd shim && BOARD=alioth CC=clang OBJCOPY=llvm-objcopy NM=llvm-nm READELF=llvm-readelf \
@@ -256,10 +262,11 @@ was changed.
 
 ## Persistent boot (`boot_b`)
 
-A normal power-on has no host to supply boot arguments, so the image must be self-contained. The
-plan is to flash **only the active slot, `boot_b`** (`b` at the 2026-11-27 measurement, 192 MiB,
-header v2, payload cmdline baked in); `boot_a` stays stock, and `vbmeta` is not needed while the
-bootloader is unlocked (`verifiedbootstate=orange`). Nothing has been flashed yet.
+A normal power-on has no host to supply boot arguments, so a persistent image must be
+self-contained. **That is not the arrangement on this device today:** `boot_b` holds **OrangeFox
+recovery** (192 MiB — the boot partition is 192 MiB and there is no separate recovery partition), so
+a normal power-on lands in recovery, which has adb, and iOS is booted with `fastboot boot`.
+Persistence through `boot_b` was verified earlier, but it conflicts with recovery on this phone.
 
 ```sh
 tools/install-persistent-boot.sh --yes
@@ -274,8 +281,8 @@ before running it; do **not** run `fastboot getvar all` on this ABL (it wedges),
 the bootloader.
 
 The bootloader is never modified, so fastboot is always reachable with **Power + Volume-Down**
-(handled in XBL/ABL before any boot image is read). For day-to-day work without button combos, a
-failed `boot_b` in practice lands in OrangeFox (the A/B retry path), which has adb:
+(handled in XBL/ABL before any boot image is read). For day-to-day work without button combos, the
+documented chain starts at the OrangeFox that power-on lands in:
 
 ```
 power-on -> OrangeFox adb -> adb reboot fastboot (fastbootd)
@@ -305,20 +312,30 @@ Verified on alioth:
 - `HakiosGPU` is published as an `IOService` with the msm-DRM user client; the GPU interrupt
   (INTID 332, SPI 300, level) tells fence waits when a submission finishes.
 - The Mesa 25.0.7/freedreno client (`gl_test`, `libOSMesa.8.dylib`, the `hakios-drm` stand-in) gets
-  `FD650`, allocates buffers, maps them and submits; `gl_test` reaches its last step.
+  `FD650`, allocates buffers, maps them and submits; with `gpu_spaces=1 gpu_table_update=1` the
+  first submission of a boot draws a correct frame (below).
 
-What is broken: the pipeline wedges mid-IB instead of finishing. With the default one shared SMMU
-space the CP stopped after exactly **256 dwords** with `CP int 0x1` (opcode error, `CP_SQE_STAT_DATA`
-0). With `gpu_spaces=1` (one space per client, which is what the working reference build uses) the
-opcode error is gone: the CP consumes about **448 dwords** (`CP_IB1_REM_SIZE` 1736 -> 1288,
-`ROQ 247`) and then sits with `RBBM_STATUS 0xe51005` (CP/HLSQ/SP/VPC/PC busy), no fault bit and the
-fence word still 0 — the same "no fault, only a wait timeout" signature `hakios-metal` documents.
-The readback is no longer all zeros: a white corner and ~15k pixels inside the triangle, against
-26% expected. The triangle itself was drawn correctly once, on 2026-11-27.
+What works, and for how long: with **per-client SMMU space plus the correctly encoded
+`CP_SMMU_TABLE_UPDATE`** (`gpu_spaces=1 gpu_table_update=1`; the packet is `5f/1/0`,
+`53/4/<ttbr_lo>/<ttbr_hi|asid<<16>/0/0`, `EVENT/1/49`, `5f/1/1`), the **first** client submission
+of a boot completes: `gl_test` draws 1080×2400 through freedreno in 124 ms, reads it back in 73 ms,
+colours `26 26 51`, `68 69 118`, `235 12 8`, `12 235 8`, `10 10 235` — **673920 of 2592000 pixels
+(26%, matching the geometry)** — and `kHakiosShow` puts the picture on the panel for 6 s.
+Reproduced on two boots of the same kernel build.
 
-Next: name the packet at IB dword 448 (end of binning or a nested indirect buffer), check whether a
-per-client space needs `CP_SMMU_TABLE_UPDATE` (0x53, present in the reference's metal notes), and
-make a hung client wait always print the last CP command and IB offset before recovering.
+**Every later submission in that boot stalls.** The second `gl_test` run takes ~2.1 s to draw and
+~2.1 s to read back (both hit the wait cap), the fence word never lands and the readback is zeros.
+It is *one correct frame per boot*, not sustained rendering.
+
+The failure modes, for completeness: shared SMMU space gives `CP int 0x1` (opcode error) 256 dwords
+into the IB; per-client space without the table update gives `CP int 0` but the draw wedges in
+`HLSQ/SP` at ~448 dwords (`RBBM_STATUS 0xe51005`), with a white corner and ~15-19k pixels read back.
+
+Next: make a second submission in the same boot work. The first one proves the page tables, the
+table-update packet and the ring are right, so the bug is in what a later submission leaves behind
+or re-uses. Keep the arrangement as boot arguments until then: `804901a` reverted the baked
+defaults because that build drew a partial frame where the explicit-arguments build drew correctly;
+`gpu_spaces` and `gpu_table_update` default off.
 
 A lesson worth keeping: SMMU/GMU registers are emulated by the hypervisor and only plain,
 non-inlined single `ldr`/`str` accesses work — a C loop can compile to a post-indexed load and
@@ -329,7 +346,7 @@ freeze the phone. The same class of bug was behind the USB gadget's `STARTTRANSF
 | Area | State |
 | --- | --- |
 | Wi-Fi | **Not started.** alioth's radio is a **QCA6390 on PCIe0/MHI**, not a WCN6750/WPSS; the `wpss.mdt` path never runs here. The reference (xiongnemo/hakios-alioth) works on this phone with an in-kernel ath11k object over a LinuxKPI-shaped layer, not a userland supplicant. Porting it means ~13k lines of XNU files plus a prebuilt ath11k object and QCA6390 firmware; estimate **10-16 sessions**. Decision report: `research/hakios-net-decision.md` on branch `hakios-net2` (the `research/` tree is not in this branch) |
-| Metal / GPU UI | **Not started; after the GL path.** AdrenoMetal is a userland Metal frontend over metal2vulkan + Turnip with a NativeAdreno user client; it does not speak our `HakiosGPU` msm-DRM ABI, and upstream supports neither A650 nor iOS 16. `docs/guacamole-ios16-metal.md` documents an iOS 16.7.16 A640 stack that can be adapted; `docs/adrenometal-feasibility.md` has the A650 route. **Correction to the old framing:** the reference composites SpringBoard with OpenGL ES/freedreno, not Metal; Metal is for apps. Both ride the same submit ring, so the 256-dword stop gates either path |
+| Metal / GPU UI | **Not started; after the GL path.** AdrenoMetal is a userland Metal frontend over metal2vulkan + Turnip with a NativeAdreno user client; it does not speak our `HakiosGPU` msm-DRM ABI, and upstream supports neither A650 nor iOS 16. `docs/guacamole-ios16-metal.md` documents an iOS 16.7.16 A640 stack that can be adapted; `docs/adrenometal-feasibility.md` has the A650 route. **Correction to the old framing:** the reference composites SpringBoard with OpenGL ES/freedreno, not Metal; Metal is for apps. Both ride the same submit ring, so the one-frame-per-boot limit gates either path |
 | Splitboot / dual boot | **Deferred.** The Open Mapple mechanism is real but MediaTek-only; the alioth version is a GPT **front**-carve (`darwin` over the existing 16 GiB HFS+ volume, `userdata` moved after it) plus a menu in our shim and a `misc` slot switch. The only new brick vector is the first GPT write, which Power+Volume-Down, `fastboot boot` and `boot_a` do not cover. See `docs/splitboot-feasibility.md` |
 
 ## Repository layout
