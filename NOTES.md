@@ -32,6 +32,14 @@ rather than Busy, so a stalled wait cannot trap a thread.
 Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-28 (gpu2): reference submit ported; shared space default
+
+Fetched the reference submit (drivers/gpu/hakios.adreno.c): same one-packet
+CP_INDIRECT_BUFFER, count 3, words = size/4, no 256-dword split. The real
+difference was our default per-client SMMU space; set gpu_spaces=0 (shared) by
+default and restored the reference packet order. dc-civac polling and the IRQ
+bit stay. 0200 regenerated (guard 9/9).
+
 ## 2026-11-28 (gpu2): UCHE invalidate before client IBs
 
 Status 0xe51005 decodes to CP_BUSY + HLSQ/SP/VPC/PC busy: the IB executes but the

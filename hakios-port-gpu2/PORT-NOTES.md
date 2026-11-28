@@ -517,3 +517,39 @@ gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels i
 ```
 If `CP_IB1_REM_SIZE` never decreases while `CP_IB1_BASE` is 0x204…, the IB was
 not fetched after all; the new line names that case.
+
+## 17. 2026-11-28: port the reference submit; shared space by default
+
+The reference `hakios.adreno.c` (github xiongnemo/hakios-alioth, `drivers/gpu/`
+and the Mi 10 overlay copy) has exactly this submit, verbatim:
+
+```
+ring_time(fence, 0);
+CP_EVENT_WRITE 1  EVENT_INVALIDATE_DEPTH
+CP_EVENT_WRITE 1  EVENT_INVALIDATE_COLOR
+for each cmd: CP_INDIRECT_BUFFER_PFE (0x3f) count 3: addr_lo, addr_hi, words
+if (gpu_exact) CP_WAIT_FOR_IDLE
+ring_time(fence, 1); CP_REG_WRITE scratch2 = fence
+CP_EVENT_WRITE 4  CACHE_FLUSH, fence page, 0, fence
+```
+
+It does **not** split an IB at 256 dwords or any boundary; `words` is the
+client's `cmd.size / 4`, as ours. The difference is the **address space**: the
+reference maps every buffer into the one shared SMMU space, while we defaulted
+to one space per client. An IB that contains an indirect reference past dword
+256 is then fetching a BO that is in the shared tables but not in the client's;
+the CP stops with the opcode error and `REM_SIZE` frozen. So port the reference
+arrangement: `gpu_spaces` now defaults to **0** (shared space), `gpu_spaces=1`
+still opts into per-client spaces. The submit is restored to the reference's
+packet order (timing/scratch packets included); our dc-civac polling and IRQ
+bit remain. The loud `ring tail` prints 40 dwords, so the preamble and the IB
+packets are visible in one look.
+
+Expected:
+```
+adreno: loud: submission 1 ... 1 ms on: ... CP int 0 ...; fence word 1
+HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
+gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
+```
+If it still stops at 256 dwords with CP int 1, the IB itself contains a
+secondary indirect buffer (the tail dump shows it), not a kernel packet-order bug.
