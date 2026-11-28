@@ -14,10 +14,10 @@ index dee13fe..380b8b9 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/hakios.adreno.c b/bsd/dev/hakios.adreno.c
 new file mode 100644
-index 0000000..43f8634
+index 0000000..26dbc95
 --- /dev/null
 +++ b/bsd/dev/hakios.adreno.c
-@@ -0,0 +1,5481 @@
+@@ -0,0 +1,5490 @@
 +/*
 + * The GPU of the POCO X5 Pro (HK, Adreno 642L/Yupik) or Xiaomi Mi 10 (UMI,
 + * Adreno 650/Kona), woken step by step toward a picture that it fills and the panel shows.
@@ -2722,6 +2722,7 @@ index 0000000..43f8634
 +#define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 +#define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 +#define CP_IB1_DWORDS          GPU_WORD(0x0943)
++#define CP_ROQ_AVAIL_IB1        GPU_WORD(0x0949)       /* (a6xx: bits 16-31 the words still in the ROQ) */
 +#define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 +#define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
 +#define CP_APRIV_CNTL           GPU_WORD(0x0844)
@@ -4808,6 +4809,14 @@ index 0000000..43f8634
 +	if (gpu_exact) {
 +		ring_command(CP_WAIT_FOR_IDLE, 0);      /* the time is the pipeline's, not the command processor's, which is ahead of it */
 +	}
++	/*
++	 * The reference's submit ends here with the same two packets ours had dropped while the CP was
++	 * suspected of refusing them (2026-11-28): CP_REG_TO_MEM marks the end of the timed work, and
++	 * CP_SCRATCH_REG2 carries the submission's number where Linux's a6xx_submit and the vendor's
++	 * driver leave it. Restored so the ring is byte-for-byte the reference's (DIFF-SUBMIT.md, #4).
++	 */
++	ring_time(gpu_fence, 1);
++	ring_register(CP_SCRATCH_REG2, gpu_fence);
 +	if (adreno_loud) {
 +		uint32_t rptr = rd(gpu.base + CP_RB_RPTR);
 +		printf("adreno: loud: ring %s: base 0x%x, %u words; RPTR %u, WPTR %u; about to send %u..%u; space %p "
@@ -4874,10 +4883,10 @@ index 0000000..43f8634
 +		printf("\n");
 +		for (uint32_t ms = 0; ms < 20; ms++) {
 +			sleep_us(1000);
-+			printf("adreno: loud: submission %u, %u ms on: IB1 base %#x dwords %u rem %u; RPTR %u; status %#x; "
++			printf("adreno: loud: submission %u, %u ms on: IB1 base %#x dwords %u rem %u (ROQ %u); RPTR %u; status %#x; "
 +			    "fence word %u\n", gpu_fence, ms + 2, rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_DWORDS),
-+			    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
-+			    hakios_gpu_fence_word());
++			    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_ROQ_AVAIL_IB1) >> 16, rd(gpu.base + CP_RB_RPTR),
++			    rd(gpu.base + RBBM_STATUS), hakios_gpu_fence_word());
 +		}
 +	}
 +	return gpu_fence;
@@ -6656,10 +6665,10 @@ index b5b3ba9..57a3567 100644
  			paddr = kvtophys(addr);
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..3b5307a
+index 0000000..d119445
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,2252 @@
+@@ -0,0 +1,2271 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -8417,13 +8426,32 @@ index 0000000..3b5307a
 +		}
 +		for (uint32_t i = 0; i < count; i++) {
 +			struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
-+			uint32_t show = MIN(words[i], 16u);
++			const uint32_t * cmd = b != NULL && b->kernel != NULL ?
++			    (const uint32_t *)(b->kernel + cmds[i].submit_offset) : NULL;
++			uint32_t show = MIN(words[i], 64u);
 +
++			/*
++			 * 64 dwords, not 16: a CP IB1 prefetch is 256 dwords, so a stop "256 dwords in" can hide
++			 * its cause in the first 1 KiB (DIFF-SUBMIT.md, #6). Then every indirect buffer the walk
++			 * finds in that window and where it points -- freedreno chains the gmem ring to its
++			 * restore and draw rings, and an address that is not mapped is read as zero (SERVE_AFTER_FAULT).
++			 */
 +			IOLog("HakiosGPU: loud: IB %u at 0x%llx, %u words:", i, addresses[i], words[i]);
-+			for (uint32_t k = 0; b != NULL && b->kernel != NULL && k < show; k++) {
-+				IOLog(" %08x", ((const uint32_t *)(b->kernel + cmds[i].submit_offset))[k]);
++			for (uint32_t k = 0; cmd != NULL && k < show; k++) {
++				IOLog(" %08x", cmd[k]);
 +			}
 +			IOLog("%s\n", words[i] > show ? " ..." : "");
++			for (uint32_t k = 0; cmd != NULL && k + 3 < MIN(words[i], 256u); k++) {
++				uint32_t header = cmd[k];
++
++				if ((header >> 28) == 7 && ((header >> 16) & 0x7f) == 0x3f &&
++				    (header & 0x3fff) == 3) {
++					IOLog("HakiosGPU: loud: IB %u: CP_INDIRECT_BUFFER at +%u -> 0x%llx, %u words\n", i, k,
++					    (unsigned long long) cmd[k + 1] | (unsigned long long) cmd[k + 2] << 32,
++					    cmd[k + 3]);
++					k += 3;
++				}
++			}
 +		}
 +	}
 +	request->fence = hakios_gpu_submit_in(fSpace, addresses, words, count);

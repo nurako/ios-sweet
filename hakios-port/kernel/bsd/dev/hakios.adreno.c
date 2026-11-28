@@ -2702,6 +2702,7 @@ step_core_power(void)
 #define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 #define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 #define CP_IB1_DWORDS          GPU_WORD(0x0943)
+#define CP_ROQ_AVAIL_IB1        GPU_WORD(0x0949)       /* (a6xx: bits 16-31 the words still in the ROQ) */
 #define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 #define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
 #define CP_APRIV_CNTL           GPU_WORD(0x0844)
@@ -4788,6 +4789,14 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	if (gpu_exact) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);      /* the time is the pipeline's, not the command processor's, which is ahead of it */
 	}
+	/*
+	 * The reference's submit ends here with the same two packets ours had dropped while the CP was
+	 * suspected of refusing them (2026-11-28): CP_REG_TO_MEM marks the end of the timed work, and
+	 * CP_SCRATCH_REG2 carries the submission's number where Linux's a6xx_submit and the vendor's
+	 * driver leave it. Restored so the ring is byte-for-byte the reference's (DIFF-SUBMIT.md, #4).
+	 */
+	ring_time(gpu_fence, 1);
+	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	if (adreno_loud) {
 		uint32_t rptr = rd(gpu.base + CP_RB_RPTR);
 		printf("adreno: loud: ring %s: base 0x%x, %u words; RPTR %u, WPTR %u; about to send %u..%u; space %p "
@@ -4854,10 +4863,10 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 		printf("\n");
 		for (uint32_t ms = 0; ms < 20; ms++) {
 			sleep_us(1000);
-			printf("adreno: loud: submission %u, %u ms on: IB1 base %#x dwords %u rem %u; RPTR %u; status %#x; "
+			printf("adreno: loud: submission %u, %u ms on: IB1 base %#x dwords %u rem %u (ROQ %u); RPTR %u; status %#x; "
 			    "fence word %u\n", gpu_fence, ms + 2, rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_DWORDS),
-			    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
-			    hakios_gpu_fence_word());
+			    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_ROQ_AVAIL_IB1) >> 16, rd(gpu.base + CP_RB_RPTR),
+			    rd(gpu.base + RBBM_STATUS), hakios_gpu_fence_word());
 		}
 	}
 	return gpu_fence;

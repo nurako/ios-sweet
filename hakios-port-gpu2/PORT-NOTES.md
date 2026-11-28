@@ -553,3 +553,37 @@ gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels i
 ```
 If it still stops at 256 dwords with CP int 1, the IB itself contains a
 secondary indirect buffer (the tail dump shows it), not a kernel packet-order bug.
+
+## 18. 2026-11-28: systematic diff against the *working* alioth branch
+
+The reference named in the task (`drivers/gpu/...` on `main`) is the **POCO X5
+Pro / Adreno 642L** variant. The working phone's driver is on branch `alioth`,
+`devices/redmi-k40/overlays/xnu/files/{bsd/dev/hakios.adreno.c,iokit/Kernel/hakios.gpu.cpp}`.
+Full item-by-item comparison, with quotes and line numbers:
+`hakios-port-ref/DIFF-SUBMIT.md`.
+
+Outcome: our port is that file plus diagnostics (303 diff lines; gpu.cpp 668,
+all safety/diagnostics). The submit was already verbatim. Differences found and
+what was done:
+
+* `ring_time(gpu_fence, 1)` and `ring_register(CP_SCRATCH_REG2, gpu_fence)` were
+  missing after `CP_WAIT_FOR_IDLE` (alioth:4775-4776). **Restored** in
+  `gpu_submit()`; the ring is now the reference's packet for packet.
+* `gpu_spaces` default: the working `alioth` build uses **1** (per-client,
+  `alioth:4175`); the 2026-11-28 commit's "reference is shared" was true only of
+  `main`'s rewrite. Left at 0 (that removes the first-submit-in-a-new-space
+  failure), but noted in the diff: shared space still stops at the IB.
+* Reference's kept-GPU run is `gpu=1` -> steps **1..21** (no step 22 frame
+  probe). Our `sweetgpu=22` runs step 22 and hands over at ring 123 (logs:
+  `tmpwork/hkr.log:7810`, `hko.log:18120`) without resetting the ring or
+  re-sending `CP_ME_INIT`. Next boot: `gpu=1 gpu_irq=1 adreno_loud=1`, then the
+  same with `gpu_sleep_test=1`.
+* No `CP_IB1_PREAMBLE_*` exists on a6xx (a6xx.xml: only shader EARLYPREAMBLE
+  bits) — nothing missing. No `CP_PROTECT`/`GPR0`/`SET_MODE`/`SET_PROTECTED_MODE`
+  in the working reference either; protection faults are CP int bit 4, not
+  bit 0, so not added. Flush discipline is stronger than the reference's (we
+  push every BO; it pushes only surfaces and cached buffers); allocation flags
+  are identical (`0x4001011b` = write-combined).
+* Loud diagnostics extended so the next run answers the 1 KiB question:
+  64 IB dwords instead of 16, every `CP_INDIRECT_BUFFER` in the first 256 with
+  its target/length, and `CP_ROQ_AVAIL_IB1` (0x949) in the 1 ms probe.
