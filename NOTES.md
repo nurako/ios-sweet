@@ -1,4 +1,12 @@
 
+## 2026-11-28 (gpu2): client timing packets removed; SQE decode
+
+The first client submit begins at ring 123 with `CP_REG_TO_MEM` (ring_time) and a
+type-4 `CP_SCRATCH_REG2` write, neither exercised by the internal probe; CP int
+0x1 (opcode error) lands there. Removed both from the client submit (fence and
+draw unchanged), and the 1 ms probe now decodes `CP_SQE_STAT_ADDR/DATA` on CP int
+0x1. Zero-length IBs remain emitted as Build A. 0200 regenerated (guard 9/9).
+
 ## 2026-11-28 (gpu2): zero-length-IB skip reverted
 
 Build B (`02ab450`) completed but drew/read zeros; Build A drew the triangle.

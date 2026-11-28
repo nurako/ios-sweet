@@ -2699,6 +2699,8 @@ step_core_power(void)
 #define CP_INTERRUPT_STATUS     GPU_WORD(0x0823)
 #define CP_PROTECT_STATUS       GPU_WORD(0x0824)
 #define CP_SQE_INSTR_BASE       GPU_WORD(0x0830)
+#define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
+#define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 #define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 #define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
 #define CP_APRIV_CNTL           GPU_WORD(0x0844)
@@ -4765,7 +4767,6 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	in = gpu_space_now != NULL ? gpu_space_now : &core_space;
 	in->last_fence = gpu_fence;
 	fence_space[gpu_fence % FENCE_SPACES] = gpu_space_now;
-	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -4787,8 +4788,6 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 		    (void *)gpu_space_now, hakios_gpu_space_context(gpu_space_now),
 		    (unsigned long long)hakios_gpu_space_root(gpu_space_now), CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	}
-	ring_time(gpu_fence, 1);
-	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	ring_command(CP_EVENT_WRITE, 4);
 	/* (11-19) with the interrupt asked for when the waits sleep on it (gpu_irq_on() above; unmasked or not, harmless) */
 	ring(EVENT_CACHE_FLUSH | (gpu_irq_wanted && !gpu_irq_given_up ? CP_EVENT_IRQ : 0));
@@ -4824,10 +4823,16 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)",
 		    rd(gpu.base + CP_RB_RPTR), rd(gpu.base + CP_RB_WPTR));
 		sleep_us(1000);
+		uint32_t cpint = rd(gpu.base + CP_INTERRUPT_STATUS);
+
 		printf("adreno: loud: submission %u, 1 ms on: RPTR %u, status %#x, CP fault %#x, CP int %#x, protect %#x; "
 		    "fence word %u\n", gpu_fence, rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
-		    rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS),
-		    hakios_gpu_fence_word());
+		    rd(gpu.base + CP_HW_FAULT), cpint, rd(gpu.base + CP_PROTECT_STATUS), hakios_gpu_fence_word());
+		if (cpint & 1) {                /* A6XX_CP_INT_CP_OPCODE_ERROR */
+			wr(gpu.base + CP_SQE_STAT_ADDR, 1);
+			printf("adreno: loud: CP opcode error: SQE stat data %#x (possible opcode)\n",
+			    rd(gpu.base + CP_SQE_STAT_DATA));
+		}
 	}
 	return gpu_fence;
 }
