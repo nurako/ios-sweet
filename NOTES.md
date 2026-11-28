@@ -13,6 +13,15 @@ the handover); next boot `gpu=1 gpu_irq=1 adreno_loud=1`, then add
 per-client spaces by default (`gpu_spaces=1`), not the shared space.
 Details: `hakios-port-ref/DIFF-SUBMIT.md`.
 
+## 2026-11-28 (gpu2): per-client SMMU table update in the ring
+
+Per-client run stalls 448 dwords into the IB with ROQ full, no fault. The ring
+was missing CP_SMMU_TABLE_UPDATE (only processor TTBR0 was written); added
+CP_SET_PROTECTED_MODE 0 / CP_SMMU_TABLE_UPDATE 0x53 / CACHE_INVALIDATE /
+CP_SET_PROTECTED_MODE 1 before the IB for gpu_spaces=1. Default remains
+per-client (evidence: it executes), shared with gpu_spaces=0. Recover watch now
+logs before reset; probe prints IB offset. 0200 regenerated (guard 9/9).
+
 ## 2026-11-28 (gpu2): reference submit ported; shared space default
 
 Fetched the reference submit (drivers/gpu/hakios.adreno.c): same one-packet

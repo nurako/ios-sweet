@@ -653,7 +653,11 @@ gpuWatchWork(thread_call_param_t, thread_call_param_t)
 	uint64_t deadline;
 
 	IOLockLock(gGPULock);
-	if (hakios_gpu_hung() && hakios_gpu_recover()) {
+	bool hung = hakios_gpu_hung();
+	if (gGPULoud && hung) {
+		IOLog("HakiosGPU: loud: watch: a submission is outstanding and the GPU has not moved for 2 s; recovering\n");
+	}
+	if (hung && hakios_gpu_recover()) {
 		gGPUReported = false;
 	}
 	IOLockUnlock(gGPULock);
