@@ -32,6 +32,14 @@ rather than Busy, so a stalled wait cannot trap a thread.
 Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-28 (gpu2): zero-length-IB skip reverted
+
+Build B (`02ab450`) completed but drew/read zeros; Build A drew the triangle.
+The empty-IB skip and the `count == 0` refusal were the only behaviour changes
+and are reverted: 0-length `MSM_SUBMIT_CMD_BUF`s are emitted as before. Kept:
+the non-behavioural diagnostics and a handover line with ring_at/ring_sent/
+RPTR/WPTR. 0200 regenerated cleanly (guard 9/9); draw should return.
+
 ## 2026-11-27 (gpu2): readback empty IB skipped
 
 The readback submit carries a zero-length `MSM_SUBMIT_CMD_BUF`; emitting

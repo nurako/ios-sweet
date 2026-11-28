@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/hakios.adreno.c b/bsd/dev/hakios.adreno.c
 new file mode 100644
-index 0000000..18b06e8
+index 0000000..2b09021
 --- /dev/null
 +++ b/bsd/dev/hakios.adreno.c
-@@ -0,0 +1,5428 @@
+@@ -0,0 +1,5438 @@
 +/*
 + * The GPU of the POCO X5 Pro (HK, Adreno 642L/Yupik) or Xiaomi Mi 10 (UMI,
 + * Adreno 650/Kona), woken step by step toward a picture that it fills and the panel shows.
@@ -4487,6 +4487,16 @@ index 0000000..18b06e8
 +	return core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
 +}
 +
++/* The ring's software pointers and the core's, for the handover line and the loud submit lines. */
++void
++hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr)
++{
++	*at = ring_at;
++	*sent = ring_sent;
++	*rptr = core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
++	*wptr = core_runs ? rd(gpu.base + CP_RB_WPTR) : 0;
++}
++
 +/* The core is to write down what time it is: at one end of submission `fence`. */
 +static void
 +ring_time(uint32_t fence, uint32_t end)
@@ -6502,10 +6512,10 @@ index 0000000..35b00e6
 +#endif /* _IOKIT_MINIIOSURFACE_H */
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..ce6d7b6
+index 0000000..3b5307a
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,2258 @@
+@@ -0,0 +1,2252 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -6587,6 +6597,7 @@ index 0000000..ce6d7b6
 +uint32_t hakios_gpu_space_context(void *space);
 +uint64_t hakios_gpu_space_root(void *space);
 +uint32_t hakios_gpu_ring_rptr(void);
++void hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr);
 +void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 +void hakios_gpu_report(const char * why);
 +void hakios_gpu_stop(void);
@@ -7268,6 +7279,12 @@ index 0000000..ce6d7b6
 +		return;
 +	}
 +	IOLog("HakiosGPU: service published (class HakiosGPU), user client HakiosGPUUserClient\n");
++	if (gGPULoud) {
++		uint32_t at = 0, sent = 0, rptr = 0, wptr = 0;
++
++		hakios_gpu_ring_snapshot(&at, &sent, &rptr, &wptr);
++		IOLog("HakiosGPU: loud: handover: ring_at %u, ring_sent %u, CP_RB_RPTR %u, CP_RB_WPTR %u\n", at, sent, rptr, wptr);
++	}
 +	gpu->release();
 +}
 +
@@ -8221,16 +8238,10 @@ index 0000000..ce6d7b6
 +		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
 +			continue;                               /* the other kinds are for a GPU shared between address spaces */
 +		}
-+		if (cmds[i].size == 0) {
-+			/*
-+			 * An empty command buffer is not an indirect buffer: CP_INDIRECT_BUFFER
-+			 * with a length of zero leaves the core reading a packet that is not
-+			 * there and it never reaches the fence packet (this is what a readback
-+			 * submit can carry). It needs no packet.
-+			 */
-+			GPU_LOUD("HakiosGPU: loud: command buffer %u is empty: no indirect buffer\n", i);
-+			continue;
-+		}
++		/* (a zero-length command buffer is emitted as Build A did: the core takes a 0-length indirect buffer as a no-op) */
++		GPU_LOUD("HakiosGPU: loud: cmd %u: buffer %u, offset %u, size %u bytes (%u words), type %u, relocs %u\n",
++		    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].size / 4, cmds[i].type,
++		    cmds[i].nr_relocs);
 +		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
 +		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
 +			IOLog("HakiosGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
@@ -8247,13 +8258,6 @@ index 0000000..ce6d7b6
 +			IOLog(" %#llx:%u", addresses[i], words[i]);
 +		}
 +		IOLog("\n");
-+	}
-+	if (count == 0) {
-+		/* (nothing to give the core: no fence is made, and the client is told so) */
-+		GPU_LOUD("HakiosGPU: loud: a submission with no non-empty command buffer: not sent\n");
-+		ret = kIOReturnBadArgument;
-+		IOLockUnlock(gGPULock);
-+		goto out;
 +	}
 +	GPU_LOUD("HakiosGPU: loud: submit: this client's space %p, context %u, root %#llx; %u IBs; the core will run it in "
 +	    "the space the line below names\n", fSpace, hakios_gpu_space_context(fSpace),
