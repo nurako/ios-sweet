@@ -2701,6 +2701,7 @@ step_core_power(void)
 #define CP_SQE_INSTR_BASE       GPU_WORD(0x0830)
 #define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 #define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
+#define CP_IB1_DWORDS          GPU_WORD(0x0943)
 #define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 #define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
 #define CP_APRIV_CNTL           GPU_WORD(0x0844)
@@ -4771,6 +4772,14 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
+	/*
+	 * A page-table switch is done by this processor; the UCHE (the shaders'
+	 * cache) still holds lines of the previous space. Without this the SP can
+	 * fetch a stale shader and never go idle, so CP_WAIT_FOR_IDLE and the fence
+	 * behind it never came back. Linux's a6xx_set_pagetable emits the same event.
+	 */
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CACHE_INVALIDATE);
 	for (uint32_t i = 0; i < count; i++) {
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
@@ -4823,15 +4832,33 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 		    gpu_irq_wanted && !gpu_irq_given_up ? "asked for (CP_EVENT_IRQ)" : "not asked for (polled fence word)",
 		    rd(gpu.base + CP_RB_RPTR), rd(gpu.base + CP_RB_WPTR));
 		sleep_us(1000);
-		uint32_t cpint = rd(gpu.base + CP_INTERRUPT_STATUS);
+		uint32_t cpint = rd(gpu.base + CP_INTERRUPT_STATUS), st = rd(gpu.base + RBBM_STATUS);
 
 		printf("adreno: loud: submission %u, 1 ms on: RPTR %u, status %#x, CP fault %#x, CP int %#x, protect %#x; "
-		    "fence word %u\n", gpu_fence, rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
+		    "fence word %u\n", gpu_fence, rd(gpu.base + CP_RB_RPTR), st,
 		    rd(gpu.base + CP_HW_FAULT), cpint, rd(gpu.base + CP_PROTECT_STATUS), hakios_gpu_fence_word());
 		if (cpint & 1) {                /* A6XX_CP_INT_CP_OPCODE_ERROR */
 			wr(gpu.base + CP_SQE_STAT_ADDR, 1);
 			printf("adreno: loud: CP opcode error: SQE stat data %#x (possible opcode)\n",
 			    rd(gpu.base + CP_SQE_STAT_DATA));
+		}
+		if (st & 0x00800000) printf("adreno: loud:   RBBM: GPU busy (AHB)");
+		if (st & 0x00400000) printf(" GPU busy (CP)");
+		if (st & 0x00200000) printf(" HLSQ busy");
+		if (st & 0x00080000) printf(" TPL1 busy");
+		if (st & 0x00040000) printf(" SP busy");
+		if (st & 0x00020000) printf(" UCHE busy");
+		if (st & 0x00010000) printf(" VPC busy");
+		if (st & 0x00004000) printf(" TESS busy");
+		if (st & 0x00001000) printf(" PC DCALL busy");
+		if (st & 0x00000004) printf(" CP busy");
+		printf("\n");
+		for (uint32_t ms = 0; ms < 20; ms++) {
+			sleep_us(1000);
+			printf("adreno: loud: submission %u, %u ms on: IB1 base %#x dwords %u rem %u; RPTR %u; status %#x; "
+			    "fence word %u\n", gpu_fence, ms + 2, rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_DWORDS),
+			    rd(gpu.base + CP_IB1_REM_SIZE), rd(gpu.base + CP_RB_RPTR), rd(gpu.base + RBBM_STATUS),
+			    hakios_gpu_fence_word());
 		}
 	}
 	return gpu_fence;

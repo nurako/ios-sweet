@@ -490,3 +490,30 @@ HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
 gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
 ```
 If CP int 1 persists, the SQE line names the exact opcode to remove next.
+
+## 16. 2026-11-28: the pipeline is busy, not the ring; invalidate the UCHE
+
+`RBBM_STATUS 0xe51005` decodes (a6xx.xml.h) to `GPU_BUSY_IGN_AHB |
+GPU_BUSY_IGN_AHB_CP | HLSQ_BUSY | SP_BUSY | VPC_BUSY | PC_DCALL_BUSY |
+CP_BUSY | CP_AHB_BUSY_CX_MASTER`. With RPTR == WPTR and no HW/opcode fault,
+the CP has fetched the ring and is **executing the IB** (a draw); it is stuck
+before the fence because `gpu_exact=1` puts `CP_WAIT_FOR_IDLE` after the IB and
+the SP/HLSQ/PC never go idle. The processor-side page-table switch
+(`space_switch`) changes TTBR0 and TLBI, but the **UCHE (shader cache)** still
+holds lines of the previous space; Linux's `a6xx_set_pagetable` emits
+`CP_EVENT_WRITE CACHE_INVALIDATE` for exactly this reason, and our ring switch
+does too. The submit path did not.
+
+**Fix.** Before the IBs, the submit emits `CP_EVENT_WRITE CACHE_INVALIDATE`
+(EVENT_CACHE_INVALIDATE 49), so the SP fetches the client's shaders. The 20 ms
+probe now prints `CP_IB1_BASE`, `CP_IB1_DWORDS`, `CP_IB1_REM_SIZE`, RPTR,
+status and the fence word every 1 ms, and the 1 ms status is decoded by block.
+
+Expected:
+```
+adreno: loud: submission 1, 1 ms on: ... status 0x1 ...; fence word 1
+HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
+gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
+```
+If `CP_IB1_REM_SIZE` never decreases while `CP_IB1_BASE` is 0x204…, the IB was
+not fetched after all; the new line names that case.
