@@ -464,3 +464,29 @@ HakiosGPU: loud: handover: ring_at N, ring_sent N, CP_RB_RPTR N, CP_RB_WPTR N
 Expected on the next boot: the triangle is drawn again, and the first submit
 shows `cmd 0: ... size 0 bytes (0 words)` if a fence-only buffer follows the
 real one, with RPTR advancing past 147 after the handover.
+
+## 15. 2026-11-28: the CP rejects the client-only timing packets
+
+The handover line shows the first client submission starts at ring word 123.
+Its first packet is `ring_time(fence, 0)` = `CP_REG_TO_MEM` (0x3e), followed by
+`CP_REG_WRITE` (type 4) for `CP_SCRATCH_REG2`; neither opcode is used by the
+internal probe (its path ends at `CP_ME_INIT`/`CP_MEM_WRITE`/2D blits). The CP
+consumed the whole ring (RPTR 147) and raised `CP int 0x1` =
+`A6XX_CP_INT_CP_OPCODE_ERROR`, so the rejection is one of those first
+client-only packets, not the IB doorbell or the fence address.
+
+**Fix.** The client submit no longer emits `ring_time()` (start/end stats
+counters) or the `CP_SCRATCH_REG2` write. The fence still comes from the
+`CP_EVENT_WRITE` CACHE_FLUSH_TS packet; drawing and the readback are unaffected
+(the stats are simply not updated for client submissions). The 1 ms probe now
+reads `CP_SQE_STAT_ADDR = 1` / `CP_SQE_STAT_DATA` when `CP int & 1` and prints
+`CP opcode error: SQE stat data 0x... (possible opcode)`, as Linux's
+`a6xx_cp_hw_err_irq` does.
+
+Expected:
+```
+adreno: loud: submission 1 ... 1 ms on: RPTR 147, status 0x1, CP fault 0, CP int 0, protect 0; fence word 1
+HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
+gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
+```
+If CP int 1 persists, the SQE line names the exact opcode to remove next.
