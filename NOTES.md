@@ -32,6 +32,14 @@ rather than Busy, so a stalled wait cannot trap a thread.
 Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
 `/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
 run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-28 (gpu2): UCHE invalidate before client IBs
+
+Status 0xe51005 decodes to CP_BUSY + HLSQ/SP/VPC/PC busy: the IB executes but the
+pipeline never idles, so CP_WAIT_FOR_IDLE blocks before the fence. The
+processor-side SMMU switch leaves stale shader lines in the UCHE. Emit
+CP_EVENT_WRITE CACHE_INVALIDATE before the IBs (as Linux a6xx_set_pagetable) and
+probe IB1 base/dwords/rem/status every ms for 20 ms.
+
 ## 2026-11-28 (gpu2): client timing packets removed; SQE decode
 
 The first client submit begins at ring 123 with `CP_REG_TO_MEM` (ring_time) and a
