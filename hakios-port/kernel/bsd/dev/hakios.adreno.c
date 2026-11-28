@@ -4324,7 +4324,7 @@ ring_switch(struct gpu_space *to)
 	ring((uint32_t)root);
 	ring((uint32_t)(root >> 32 & 0xffff) | (to->context & 0xffff) << 16);   /* ... and the ASID */
 	ring(0);                                /* (CONTEXTIDR: not used with these tables) */
-	ring(core_space.context);               /* the SMMU's context */
+	ring(0);                                /* (CONTEXTBANK; Linux sends 0, the ASID is in the word above) */
 	ring_command(CP_MEM_WRITE, 4);
 	ring(CORE_SCRATCH_ADDRESS + GPU_RING_ROOT_AT);
 	ring(0);
@@ -4387,6 +4387,20 @@ hakios_gpu_mapped_in(void *space)
 {
 	/* (an invalidate after mapping as well was tried, 2026-11-14 round 66: Flutter Check still black 1 in 8 -- not it) */
 	space_commit(space != NULL ? space : &core_space);
+}
+
+/* Make the SMMU forget cached (including not-present) translations of this space. */
+void
+hakios_gpu_tlb_invalidate(void *opaque)
+{
+	struct gpu_space *space = opaque != NULL ? opaque : &core_space;
+	uint32_t context = smmu_context(&core_space);
+
+	wr(smmu.base + context + SMMU_CB_TLBIASID, space->context);
+	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
+	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
+	}
+	settle();
 }
 
 void
@@ -4808,20 +4822,22 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 
 		ring_command(CP_SET_PROTECTED_MODE, 1);
 		ring(0);
+		uint32_t w0 = (uint32_t)root;
+		uint32_t w1 = (uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16;
+
+		if (adreno_loud) {
+			printf("adreno: loud: preamble: TABLE_UPDATE 5f/1/0, 53/4/%08x/%08x/00000000/00000000, "
+			    "EVENT/1/%u, 5f/1/1\n", w0, w1, EVENT_CACHE_INVALIDATE);
+		}
 		ring_command(CP_SMMU_TABLE_UPDATE, 4);
-		ring((uint32_t)root);
-		ring((uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16);
-		ring(0);
-		ring(core_space.context);
+		ring(w0);
+		ring(w1);
+		ring(0);                /* CONTEXTIDR */
+		ring(0);                /* CONTEXTBANK: Linux's CONTEXTBANK(0), not the ASID (that is in w1) */
 		ring_command(CP_EVENT_WRITE, 1);
 		ring(EVENT_CACHE_INVALIDATE);
 		ring_command(CP_SET_PROTECTED_MODE, 1);
 		ring(1);
-		if (adreno_loud) {
-			printf("adreno: loud: table update dwords: 5f/1/0, 53/4/%#x/%#x/0/%u, EVENT/1/%u, 5f/1/1\n",
-			    (uint32_t)root, (uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16,
-			    core_space.context, EVENT_CACHE_INVALIDATE);
-		}
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -4870,7 +4886,28 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
-	ring_send();                            /* (one write of CP_RB_WPTR, as the reference's hakios_gpu_submit) */
+	hakios_gpu_tlb_invalidate(gpu_space_now);
+	if (adreno_loud) {
+		printf("adreno: loud: preamble: TLBI ASID %u for %s space before ring_send\n",
+		    (gpu_space_now != NULL ? gpu_space_now : &core_space)->context,
+		    gpu_space_now != NULL ? "the client's" : "the shared");
+	}
+	ring_send();
+	/*
+	 * A write pointer written while the core is busy is a doorbell: if the core is
+	 * between submissions it can be missed. RPTR says whether the core took it; if
+	 * it did not, write WPTR again (bounded: three tries, and the client's wait is
+	 * the real bound).
+	 */
+	for (uint32_t kick = 0; kick < 3 && rd(gpu.base + CP_RB_RPTR) != ring_at && !hakios_gpu_done(gpu_fence); kick++) {
+		sleep_us(200);
+		wr(gpu.base + CP_RB_WPTR, ring_at);
+		settle();
+		if (adreno_loud && kick != 0) {
+			printf("adreno: loud: submission %u: RPTR %u of %u, WPTR written again (%u)\n", gpu_fence,
+			    rd(gpu.base + CP_RB_RPTR), ring_at, kick + 1);
+		}
+	}
 	if (adreno_loud) {
 		printf("adreno: loud: ring tail:");
 		for (uint32_t k = 0; k < 40; k++) {

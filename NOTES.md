@@ -127,6 +127,14 @@ the handover); next boot `gpu=1 gpu_irq=1 adreno_loud=1`, then add
 per-client spaces by default (`gpu_spaces=1`), not the shared space.
 Details: `hakios-port-ref/DIFF-SUBMIT.md`.
 
+## 2026-11-28 (gpu2): TLBI before ring; shared default
+
+Mappings committed page tables but only unmaps did TLBIASID, so the SMMU could
+hold stale/not-present entries at a new BO's IOVA. Added
+hakios_gpu_tlb_invalidate() (TLBIASID + TLBSYNC + poll + dsb) before ring_send,
+with a loud line. gpu_spaces defaults 0 (shared); table update fixed to
+CONTEXTBANK(0) dwords and opt-in gpu_table_update=1.
+
 ## 2026-11-28 (gpu2): table update opt-in; UCHE invalidate before IB
 
 The SMMU-table-update packet sequence returned CP opcode error, so it is behind

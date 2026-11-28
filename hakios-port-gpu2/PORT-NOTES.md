@@ -643,3 +643,27 @@ prints `preamble: CACHE_INVALIDATE at ring A..B` so its order is visible.
 On a timeout the wait now prints `IB rem`, `ROQ_AVAIL_IB1`, and
 `hung at IB dword N of M; dwords A..B: k:word ...` (eight around the stop) from
 the first IB's kernel mapping, plus the existing recover-watch line.
+
+## 20. 2026-11-28: TLBI on map, shared by default; table update fixed but opt-in
+
+Before: a BO's pages were entered and `space_commit()` wrote the tables, but
+only **unmap** did a TLBIASID. A new mapping (and the shared space in
+particular) could leave the SMMU holding a not-present/stale translation at the
+BO's IOVA, so the CP fetched the old words 256 dwords into the IB.
+
+Now `hakios_gpu_tlb_invalidate(space)` does `SMMU_CB_TLBIASID(asid)`,
+`TLBSYNC`, polls `TLBSTATUS`, `dsb sy`, and runs immediately before `ring_send`
+for the space the submission is in. Loud prints
+`preamble: TLBI ASID N for the shared/client's space before ring_send`.
+
+The table-update packet is corrected: word 3 is `CONTEXTBANK(0)` (the ASID is
+in word 1), and loud prints the exact dwords:
+`preamble: TABLE_UPDATE 5f/1/0, 53/4/<ttbr_lo>/<ttbr_hi|asid<<16>/00000000/00000000, EVENT/1/49, 5f/1/1`.
+It stays opt-in (`gpu_table_update=1`) until it proves out; `gpu_spaces` now
+defaults to **0** (shared), with `1` for the per-client experiment.
+
+Expected:
+- shared default: `preamble: TLBI ASID 0 for the shared space …`, then
+  `fence 1 DONE`, non-zero readback;
+- per-client `gpu_spaces=1 gpu_table_update=1`: `preamble: TABLE_UPDATE …`
+  (four dwords as above) and `preamble: TLBI ASID … for the client's space …`.
