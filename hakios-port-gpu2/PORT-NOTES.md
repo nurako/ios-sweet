@@ -624,3 +624,22 @@ gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; ... pixels inside the
 If REM_SIZE still freezes at 448, dump the dword there from the IB BO (the ring
 tail and first 16 IB dwords are already printed) and compare it with Mesa's
 expected draw packet.
+
+## 19. 2026-11-28: table update off by default; UCHE invalidate before the IB
+
+The ring `CP_SMMU_TABLE_UPDATE` sequence made the CP opcode-error again (it
+stopped at IB dword 256), so it is not trusted: `gpu_table_update=1` gates it,
+default **0**. `hakios-port-ref/DIFF-SUBMIT.md` records the Linux bytes and the
+suspect fields: our word 3 was `core_space.context` where Linux writes
+`CONTEXTBANK(0)` (the ASID is in word 1), and the protected-mode pair is not
+proven on this core.
+
+With it off, the default is the d1a9d38 behaviour: no CP error, ~448 IB dwords,
+white corner. The remaining wedge is a front end that never drains (ROQ full,
+HLSQ/SP/VPC/PC busy). A single, byte-verified
+`CP_EVENT_WRITE 1 CACHE_INVALIDATE` is now emitted **before** the IBs, and loud
+prints `preamble: CACHE_INVALIDATE at ring A..B` so its order is visible.
+
+On a timeout the wait now prints `IB rem`, `ROQ_AVAIL_IB1`, and
+`hung at IB dword N of M; dwords A..B: k:word ...` (eight around the stop) from
+the first IB's kernel mapping, plus the existing recover-watch line.

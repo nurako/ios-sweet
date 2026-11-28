@@ -2705,6 +2705,7 @@ step_core_power(void)
 #define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 #define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 #define CP_IB1_DWORDS          GPU_WORD(0x0943)
+#define CP_ROQ_AVAIL_IB1       GPU_WORD(0x0949)
 #define CP_SET_PROTECTED_MODE  0x5f
 #define CP_SMMU_TABLE_UPDATE   0x53
 #define CP_ROQ_AVAIL_IB1        GPU_WORD(0x0949)       /* (a6xx: bits 16-31 the words still in the ROQ) */
@@ -3817,6 +3818,7 @@ static uint64_t gpu_ticks;              /* how long the core has worked on the s
 static volatile uint64_t gpu_busy_total; /* ... the same, never set back: the governor's (gpu_gov_thread) */
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
+static TUNABLE(uint32_t, gTableUpdate, "gpu_table_update", 0);
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
@@ -4494,6 +4496,18 @@ hakios_gpu_ring_rptr(void)
 	return core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
 }
 
+uint32_t
+hakios_gpu_ib_rem(void)
+{
+	return core_runs ? rd(gpu.base + CP_IB1_REM_SIZE) : 0;
+}
+
+uint32_t
+hakios_gpu_roq_ib1(void)
+{
+	return core_runs ? rd(gpu.base + CP_ROQ_AVAIL_IB1) : 0;
+}
+
 /* The ring's software pointers and the core's, for the handover line and the loud submit lines. */
 void
 hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr)
@@ -4782,7 +4796,7 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	 * a6xx_set_pagetable (and the metal reference) put CP_SMMU_TABLE_UPDATE in
 	 * the ring before the IB. Then the UCHE must drop the previous space's lines.
 	 */
-	if (gpu_spaces_on() && gpu_space_now != NULL) {
+	if (gTableUpdate && gpu_spaces_on() && gpu_space_now != NULL) {
 		uint64_t root = kvtophys((vm_offset_t)gpu_space_now->root);
 
 		ring_command(CP_SET_PROTECTED_MODE, 1);
@@ -4796,12 +4810,25 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 		ring(EVENT_CACHE_INVALIDATE);
 		ring_command(CP_SET_PROTECTED_MODE, 1);
 		ring(1);
+		if (adreno_loud) {
+			printf("adreno: loud: table update dwords: 5f/1/0, 53/4/%#x/%#x/0/%u, EVENT/1/%u, 5f/1/1\n",
+			    (uint32_t)root, (uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16,
+			    core_space.context, EVENT_CACHE_INVALIDATE);
+		}
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
+	{
+		uint32_t at = ring_at;
+		ring_command(CP_EVENT_WRITE, 1);
+		ring(EVENT_CACHE_INVALIDATE);
+		if (adreno_loud) {
+			printf("adreno: loud: preamble: CACHE_INVALIDATE at ring %u..%u\n", at, ring_at - 1);
+		}
+	}
 	for (uint32_t i = 0; i < count; i++) {
 		if (i == 0) {
 			last_ib_address = addresses[i];

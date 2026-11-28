@@ -79,6 +79,8 @@ uint32_t hakios_gpu_fence_word(void);
 uint32_t hakios_gpu_space_context(void *space);
 uint64_t hakios_gpu_space_root(void *space);
 uint32_t hakios_gpu_ring_rptr(void);
+uint32_t hakios_gpu_ib_rem(void);
+uint32_t hakios_gpu_roq_ib1(void);
 void hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
@@ -214,6 +216,8 @@ static TUNABLE(uint32_t, gGPULoud, "adreno_loud", 0);
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
+static const uint8_t * gLastIb;                  /* the last submission's first IB, for the hang dump */
+static uint32_t gLastIbWords;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 
 /* What the last seconds' submissions were and cost here, for the log. */
@@ -482,8 +486,19 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		if (fence != saidFence || mach_absolute_time() - saidAt >= oneSecond) {
 			saidFence = fence;
 			saidAt = mach_absolute_time();
-			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
-			    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
+			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u; "
+			    "IB rem %u, ROQ_AVAIL_IB1 %#x\n", fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(),
+			    hakios_gpu_last(), hakios_gpu_ib_rem(), hakios_gpu_roq_ib1());
+			if (gLastIb != NULL && gLastIbWords != 0 && hakios_gpu_ib_rem() <= gLastIbWords) {
+				uint32_t consumed = gLastIbWords - hakios_gpu_ib_rem(), from = consumed >= 8 ? consumed - 8 : 0;
+
+				IOLog("HakiosGPU: loud: hung at IB dword %u of %u; dwords %u..%u:", consumed, gLastIbWords, from,
+				    MIN(consumed + 8, gLastIbWords));
+				for (uint32_t k = from; k < MIN(consumed + 8, gLastIbWords); k++) {
+					IOLog(" %u:%08x", k, ((const uint32_t *)gLastIb)[k]);
+				}
+				IOLog("%s\n", consumed < gLastIbWords ? " (the dword at the stop is the first after the colon)" : "");
+			}
 		}
 	}
 	return false;
@@ -1737,6 +1752,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
+		if (count == 1 && b->kernel != NULL) {
+			gLastIb = b->kernel + cmds[i].submit_offset;
+			gLastIbWords = cmds[i].size / 4;
+		}
 	}
 	GPU_LOUD("HakiosGPU: loud: submit: client fence field %u, %u command buffers at", request->fence, count);
 	if (gGPULoud && count != 0) {
