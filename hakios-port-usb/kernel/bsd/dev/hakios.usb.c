@@ -7,8 +7,8 @@
  *           apps SMMU does with stream 0 (which match, which context, bypass or translation).
  *           Safe while the loader serves its own USB link on another core (bootcpu=7 cpus=7):
  *           nothing is written.
- *   usb=2   the controller is the kernel's: a USB serial port (CDC ACM, 1209:316d, named "HakiOS
- *           K40" or usb_name=Your_Name with '_' for spaces, serial hakios-alioth) that carries the
+ *   usb=2   the controller is the kernel's: a USB serial port (CDC ACM, 1209:316d, named "Mi 11X"
+ *           or usb_name=Your_Name with '_' for spaces, serial hakios-alioth) that carries the
  *           kernel's log (what the loader's log gets) to the computer, and /dev/hakios-usb, through
  *           which a program (userland usbsh) shares the port: the log flows until the computer
  *           sends something, which goes to the program, and the log stops until the program
@@ -326,7 +326,7 @@ static unsigned shell_match;            /* bytes of shell_magic matched so far (
 static struct selinfo shell_rsel;
 static struct selinfo usb_rsel, usb_wsel;
 static int usb_wchan;
-static char usb_name[32] = "HakiOS K40";        /* boot-arg usb_name=Your_Name: what the computer calls the port ('_' for a space) */
+static char usb_name[32] = "Mi 11X";            /* boot-arg usb_name=Your_Name: what the computer calls the port ('_' for a space) */
 
 /* ioctl on /dev/hakios-usb: the log to the port again (until the computer next sends something) */
 #define HAKIOS_USB_LOG          _IO('u', 1)
@@ -775,7 +775,7 @@ bring_up(void)
 		.barrier = io_barrier, .trace = io_trace,
 	};
 	struct dwc3_identity identity = {
-		.vid = USB_VID, .pid = USB_PID, .manufacturer = "HakiOS", .product = usb_name, .serial = "hakios-alioth",
+		.vid = USB_VID, .pid = USB_PID, .manufacturer = "Xiaomi", .product = usb_name, .serial = "hakios-alioth",
 	};
 	if (level == 3) {
 		/* an iPhone X (iPhone10,3: PID 0x12a8, as Apple's Windows driver lists it) */

@@ -128,9 +128,9 @@ not set it because their loader/userland choose it):
 | arg | behaviour |
 | --- | --- |
 | `usb=1` | read-only: GCC power/clocks, DWC3 identity/role/state/event buffer, apps-SMMU stream 0. No writes. |
-| `usb=2` | takes the controller: CDC-ACM serial (`1209:316d`), kernel log over USB, `/dev/hakios-usb`. |
+| `usb=2` | takes the controller: CDC-ACM serial (`1209:316d`, manufacturer `Xiaomi`, product `Mi 11X`, serial `hakios-alioth`), kernel log over USB, `/dev/hakios-usb`. |
 | `usb=3` | same, but presents `05ac:12a8` "iPhone" with the usbmux interface; needs userland `usbmux` and the tcp hunk. |
-| `usb_name=...` | serial-port product name (`_` = space). |
+| `usb_name=...` | serial-port product name, replacing `Mi 11X` (`_` = space; printable ASCII only). |
 | `usbfree=1` | declares the loader has stopped its link and lent the controller. |
 | `bootcpu=N` | if non-zero without `usbfree=1`, the driver leaves the controller to the loader. |
 

@@ -6,7 +6,7 @@ share the same kernel driver (`bsd/dev/hakios.usb.c`) and the same
 
 | boot arg | the phone looks like | userland | what it is for |
 | --- | --- | --- | --- |
-| `usb=2` | CDC-ACM serial, `1209:316d` "HakiOS K40" | `usbsh` | a shell and read-only file access over `/dev/ttyACM0` |
+| `usb=2` | CDC-ACM serial, `1209:316d` "Mi 11X" by "Xiaomi" | `usbsh` | a shell and read-only file access over `/dev/ttyACM0` |
 | `usb=3` | iPhone, `05ac:12a8`, usbmux interface | `usbmux` + iOS `lockdownd` | host `usbmuxd`/`idevice*`/AFC (`ifuse`), pairing, file access |
 | `usb=1` | nothing (read-only probe) | none | diagnostics |
 
@@ -110,7 +110,7 @@ asserting them is harmless and matches a normal terminal):
 
 ```sh
 # 1. boot: ... usbhakios=1 usb=2   the port is already streaming the kernel log
-# 2. host sees 1209:316d "HakiOS K40" -> /dev/ttyACM0
+# 2. host sees 1209:316d "Mi 11X" by "Xiaomi" -> /dev/ttyACM0
 stty -F /dev/ttyACM0 115200 raw -echo -echoe -echok -crtscts clocal
 # 3. request a shell: send the 8 magic bytes (printf's \035 is 0x1d)
 printf '\035\035SHELL\n' > /dev/ttyACM0

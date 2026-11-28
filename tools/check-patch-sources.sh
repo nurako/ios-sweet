@@ -49,6 +49,13 @@ SOURCES = {
     'iokit/Kernel/MiniIOSurface.h': 'hakios-port/kernel/iokit/Kernel/MiniIOSurface.h',
     'iokit/Kernel/hakios.gpu.cpp': 'hakios-port/kernel/iokit/Kernel/hakios.gpu.cpp',
     'iokit/Kernel/hakios_miniosurface_stub.cpp': 'hakios-port/adapter/hakios_miniosurface_stub.cpp',
+    # 0300 (hakios-port-usb)
+    'bsd/dev/hakios.dwc3.c': 'hakios-port-usb/kernel/bsd/dev/hakios.dwc3.c',
+    'bsd/dev/hakios.dwc3.h': 'hakios-port-usb/kernel/bsd/dev/hakios.dwc3.h',
+    'bsd/dev/hakios.dwc3regs.h': 'hakios-port-usb/kernel/bsd/dev/hakios.dwc3regs.h',
+    'bsd/dev/hakios.usb.c': 'hakios-port-usb/kernel/bsd/dev/hakios.usb.c',
+    'bsd/dev/hakios_usb_adapter.c': 'hakios-port-usb/adapter/hakios_usb_adapter.c',
+    'iokit/Kernel/hakios.usbmux.cpp': 'hakios-port-usb/kernel/iokit/Kernel/hakios.usbmux.cpp',
 }
 
 def created_files(patch):
