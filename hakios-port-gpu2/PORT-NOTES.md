@@ -439,3 +439,28 @@ HakiosGPU: loud: fence 3 DONE after ... us (waited yes); fence word 3
 gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; error 0; ... pixels inside the triangle
 gl_test: the picture is on the panel (0x0), for 8 seconds
 ```
+
+## 14. 2026-11-28: the zero-length-IB skip was the regression (reverted)
+
+Build A (shared-space fixes, without `02ab450`) drew the triangle; Build B
+(with it) completed but read back zeros. `02ab450`'s only behaviour change was
+to drop `size == 0` command buffers and to refuse a submission left with no
+non-empty IB. That was wrong: a zero-length `MSM_SUBMIT_CMD_BUF` is a valid
+no-op indirect buffer (a fence-only submit); removing it from the stream made
+the draw/fence sequence incomplete, the CP stopped at RPTR 147, and both
+`glFinish` and the readback hit the 2 s timeout and returned zeros.
+
+Both changes are reverted: every `MSM_SUBMIT_CMD_BUF` is emitted exactly as
+Build A did, including a 0-length one, and there is no `count == 0` refusal.
+The diagnostics from that commit are kept (they do not affect behaviour):
+`cmd i: buffer, offset, size bytes/words, type, relocs`, every BO (handle,
+GPU IOVA, size, flags), the first 16 IB dwords, one fence-word/RPTR poll per
+100 ms, and a new handover line:
+
+```
+HakiosGPU: loud: handover: ring_at N, ring_sent N, CP_RB_RPTR N, CP_RB_WPTR N
+```
+
+Expected on the next boot: the triangle is drawn again, and the first submit
+shows `cmd 0: ... size 0 bytes (0 words)` if a fence-only buffer follows the
+real one, with RPTR advancing past 147 after the handover.

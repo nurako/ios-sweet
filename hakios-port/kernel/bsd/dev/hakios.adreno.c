@@ -4483,6 +4483,16 @@ hakios_gpu_ring_rptr(void)
 	return core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
 }
 
+/* The ring's software pointers and the core's, for the handover line and the loud submit lines. */
+void
+hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr)
+{
+	*at = ring_at;
+	*sent = ring_sent;
+	*rptr = core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
+	*wptr = core_runs ? rd(gpu.base + CP_RB_WPTR) : 0;
+}
+
 /* The core is to write down what time it is: at one end of submission `fence`. */
 static void
 ring_time(uint32_t fence, uint32_t end)
