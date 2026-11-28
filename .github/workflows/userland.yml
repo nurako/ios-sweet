@@ -122,6 +122,14 @@ jobs:
              hakios-port-userland/out/exported-gl.txt \
              "$GITHUB_WORKSPACE/artifacts/"
 
+      - name: Build gpucheck-cli (ios-gpu-check tests, off screen)
+        run: |
+          set -o pipefail
+          CLANG_BIN=$(xcrun --find clang)
+          IOS_SDK="$IOS_SDK" CLANG="$CLANG_BIN" \
+            hakios-port-userland/tools/gpu-check/build-gpucheck-cli.sh
+          cp hakios-port-userland/out/gpucheck-cli "$GITHUB_WORKSPACE/artifacts/"
+
       - name: Sign every Mach-O artifact (ad-hoc)
         run: |
           # iOS runs arm64 binaries only from a valid signature; ad-hoc ("-")
