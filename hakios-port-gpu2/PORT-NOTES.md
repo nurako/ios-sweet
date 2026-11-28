@@ -587,3 +587,40 @@ what was done:
 * Loud diagnostics extended so the next run answers the 1 KiB question:
   64 IB dwords instead of 16, every `CP_INDIRECT_BUFFER` in the first 256 with
   its target/length, and `CP_ROQ_AVAIL_IB1` (0x949) in the 1 ms probe.
+
+## 18. 2026-11-28: per-client space needs the ring's table update
+
+Per-client run: the CP executes 448 of 1736 IB dwords, `CP_IB1_REM_SIZE 1288`,
+`CP_ROQ_AVAIL_IB1 247` (ROQ full), `RBBM_STATUS 0xe51005` (HLSQ/SP/VPC/PC + CP
+busy), no fault. The stop is **inside the IB**, at a draw command the front end
+cannot drain: the CP's ROQ filled and it stopped feeding, so the fence behind
+`CP_WAIT_FOR_IDLE` never ran. The IB offset is `1736 - 1288 = 448`.
+
+`CP_SMMU_TABLE_UPDATE` was missing from the ring in the per-client path: only
+this processor wrote TTBR0 (and TLBI). Linux's `a6xx_set_pagetable` and the
+metal reference put `CP_SET_PROTECTED_MODE 0`, `CP_SMMU_TABLE_UPDATE` (0x53),
+`CP_EVENT_WRITE CACHE_INVALIDATE`, `CP_SET_PROTECTED_MODE 1` before the IB. That
+is now emitted whenever `gpu_spaces=1`:
+
+```
+CP_SET_PROTECTED_MODE 1: 0
+CP_SMMU_TABLE_UPDATE 4: ttbr_lo, ttbr_hi|asid, 0, context
+CP_EVENT_WRITE 1: CACHE_INVALIDATE
+CP_SET_PROTECTED_MODE 1: 1
+```
+
+`gpu_spaces` defaults to 1 (device evidence: it executes and draws white
+pixels); `gpu_spaces=0` remains the shared fallback. The 20 ms probe now prints
+`IB1 0x… dwords N rem R (at IB dword N-R)`, and the recover watch prints
+`HakiosGPU: loud: watch: ... recovering` before `hakios_gpu_recover()`, so a
+hung client leaves a line even when the reset is refused.
+
+Expected after the table update:
+```
+adreno: loud: submission 1 ... 20 ms on: IB1 0x… dwords 1736 rem 0 (at IB dword 1736); ... fence word 1
+HakiosGPU: loud: fence 1 DONE after ... us (waited yes); fence word 1
+gl_test: 1080 x 2400 drawn in ... ms, read back in ... ms; ... pixels inside the triangle (≈26%)
+```
+If REM_SIZE still freezes at 448, dump the dword there from the IB BO (the ring
+tail and first 16 IB dwords are already printed) and compare it with Mesa's
+expected draw packet.

@@ -2705,6 +2705,8 @@ step_core_power(void)
 #define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 #define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 #define CP_IB1_DWORDS          GPU_WORD(0x0943)
+#define CP_SET_PROTECTED_MODE  0x5f
+#define CP_SMMU_TABLE_UPDATE   0x53
 #define CP_ROQ_AVAIL_IB1        GPU_WORD(0x0949)       /* (a6xx: bits 16-31 the words still in the ROQ) */
 #define CP_CHICKEN_DBG          GPU_WORD(0x0841)
 #define CP_ADDR_MODE_CNTL       GPU_WORD(0x0842)
@@ -2761,6 +2763,8 @@ static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
 static uint32_t ring_at;                /* where the next word goes: the ring goes round */
 static uint32_t ring_sent;              /* up to where the core has been told to read */
+static uint64_t last_ib_address;
+static uint32_t last_ib_words;
 
 static uint32_t
 odd_parity(uint32_t v)
@@ -4184,12 +4188,11 @@ gpu_spaces_on(void)
 {
 	if (gpu_spaces < 0) {
 		/*
-		 * The reference driver on this phone runs every client in the one shared
-		 * SMMU space; that is the arrangement its submit/IB path is known to work
-		 * in. Per-client spaces stay available with gpu_spaces=1 but are not the
-		 * default while the client IB path is being brought up.
+		 * Device evidence: per-client spaces get further (the CP executes the
+		 * IB and draws part of a triangle) and the alioth build is reported to
+		 * default to them. Shared space stays the fallback with gpu_spaces=0.
 		 */
-		uint32_t value = 0;
+		uint32_t value = 1;
 
 		PE_parse_boot_argn("gpu_spaces", &value, sizeof(value));
 		gpu_spaces = value != 0;
@@ -4773,12 +4776,37 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	in = gpu_space_now != NULL ? gpu_space_now : &core_space;
 	in->last_fence = gpu_fence;
 	fence_space[gpu_fence % FENCE_SPACES] = gpu_space_now;
+	/*
+	 * A per-client space: the processor's TTBR0 write is not enough for the CP,
+	 * whose microcode keeps the translation it was last given. Linux's
+	 * a6xx_set_pagetable (and the metal reference) put CP_SMMU_TABLE_UPDATE in
+	 * the ring before the IB. Then the UCHE must drop the previous space's lines.
+	 */
+	if (gpu_spaces_on() && gpu_space_now != NULL) {
+		uint64_t root = kvtophys((vm_offset_t)gpu_space_now->root);
+
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(0);
+		ring_command(CP_SMMU_TABLE_UPDATE, 4);
+		ring((uint32_t)root);
+		ring((uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16);
+		ring(0);
+		ring(core_space.context);
+		ring_command(CP_EVENT_WRITE, 1);
+		ring(EVENT_CACHE_INVALIDATE);
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(1);
+	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
 	for (uint32_t i = 0; i < count; i++) {
+		if (i == 0) {
+			last_ib_address = addresses[i];
+			last_ib_words = words[i];
+		}
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
 		ring((uint32_t)(addresses[i] >> 32));
