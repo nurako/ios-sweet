@@ -409,3 +409,28 @@ usb: log mode again
 The earlier race (usbmux opening unconditionally and making usbsh fail with
 `EBUSY`) is still fixed by the boot-arg gate above; it is no longer the only
 ordering rule.
+
+## 9. Rebooting from usbsh (2026-11-28)
+
+`usbsh` has `reboot`, `reboot fastboot`, `reboot recovery` and `halt`. All but
+`halt` go through `ioctl(/dev/hakios-usb, HAKIOS_USB_RESTART, &mode)` (0300:
+`_IOW('u', 6, int)`, mode 0/1/2). The driver maps the IMEM page with
+`ml_io_map` (4 KiB, uncached), writes `restart_reason@65c` at 0x146bf65c
+(alioth; 0x146aa65c on sweet, `board_imem=` overrides) with `dsb sy`, prints
+`hakios: restart reason 0x... written (mode N); restarting`, and calls
+`reboot_kernel(RB_AUTOBOOT, NULL)`.
+
+The reason values are the LK/Xiaomi aboot table, not the downstream
+msm-poweroff convention: `FASTBOOT_MODE 0x77665500`, `RECOVERY_MODE
+0x77665502`, normal/`ADB_REBOOT_MODE 0x77665501`. The shim's
+`RESTART_BOOTLOADER` is the same fastboot value; its cached store before PSCI
+was probably lost (it still booted Android), hence the uncached kernel write.
+
+`reboot_kernel` is the `reboot(2)` path (sync, proc_shutdown, unmount,
+`host_reboot` -> `halt_all_cpus` -> `PEHaltRestart(kPERestartCPU)`). 0016 now
+gives `SweetPlatformExpert` a `haltRestart()` that issues PSCI `SYSTEM_RESET`
+(and `SYSTEM_OFF` for `kPEHaltCPU`); before that `PE_halt_restart` was NULL and
+the kernel spun at `MACH Reboot`. `halt` uses `reboot(RB_HALT)` directly.
+
+Not observed on the phone from this branch. If ABL ignores the reason it boots
+normally; do not claim `fastboot devices` works until it has been seen.

@@ -26,6 +26,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
+#if __has_include(<sys/reboot.h>)
+#include <sys/reboot.h>
+#else
+/* The iPhoneOS SDK has no sys/reboot.h; libSystem still exports reboot(2). */
+#define RB_AUTOBOOT     0
+#define RB_HALT         0x0008
+extern int reboot(int);
+#endif
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -36,6 +44,11 @@
 #include <unistd.h>
 
 #define HAKIOS_USB_LOG  _IO('u', 1)     /* (bsd/dev/hakios.usb.c) */
+/*
+ * HAKIOS_USB_RESTART: mode 0 normal, 1 fastboot, 2 recovery. The kernel writes the board's
+ * IMEM restart_reason and runs its clean shutdown, so the phone comes back in that mode.
+ */
+#define HAKIOS_USB_RESTART      _IOW('u', 6, int)
 
 extern char **environ;
 
@@ -587,11 +600,55 @@ cmd_dmesg(void)
 	}
 }
 
+/*
+ * reboot [fastboot|recovery]: HAKIOS_USB_RESTART asks the kernel to write the board's IMEM
+ * restart_reason and run the clean shutdown (reboot_kernel -> PEHaltRestart -> PSCI SYSTEM_RESET),
+ * so the bootloader comes back in that mode. Only a plain reboot falls back to reboot(2) if the
+ * ioctl is missing (an older kernel); a mode has no meaning without the reason write.
+ *
+ * The USB link disappears with the process, so say so before the shutdown starts and give the
+ * host a moment to read the line. Neither path returns on success; if it does, say why.
+ */
+static void
+cmd_reboot(int mode)
+{
+	static const char *const names[] = { "reboot", "fastboot", "recovery" };
+	int m = mode;
+
+	out("usbsh: %s: writing the restart reason and shutting down (USB drops)\n", names[mode]);
+	sleep(1);
+	if (ioctl(port, HAKIOS_USB_RESTART, &m) == 0) {
+		out("usbsh: the kernel returned without restarting\n");
+		return;
+	}
+	out("usbsh: HAKIOS_USB_RESTART: %s\n", strerror(errno));
+	if (mode == 0) {
+		out("usbsh: falling back to reboot(2)\n");
+		sync();
+		if (reboot(RB_AUTOBOOT) != 0) {
+			out("usbsh: reboot(RB_AUTOBOOT): %s\n", strerror(errno));
+		}
+	}
+}
+
+/* halt: no IMEM reason; the clean BSD path, then the platform's PSCI SYSTEM_OFF. */
+static void
+cmd_halt(void)
+{
+	out("usbsh: halting: USB drops, the phone powers off\n");
+	sleep(1);
+	sync();
+	if (reboot(RB_HALT) != 0) {
+		out("usbsh: reboot(RB_HALT): %s\n", strerror(errno));
+	}
+}
+
 static void
 help(void)
 {
 	out("usbsh: commands over USB, run on iOS\n"
 	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
+	    "  reboot [fastboot|recovery] / halt (clean shutdown, then SoC reset / power off; USB drops)\n"
 	    "  fill FILE MB (0: remove it)  udp PORT SECONDS  dmesg (the kernel's message buffer)\n"
 	    "  tcpsink PORT SECONDS [KB] / tcpsource PORT SECONDS [KB] (one connection: bytes in / out, MB/s; KB: its buffer)\n"
 	    "  anything else: a program and its arguments; names are looked for in\n"
@@ -716,6 +773,18 @@ execute(char *line)
 		cmd_udp(atoi(argv[1]), atoi(argv[2]));
 	} else if ((!strcmp(argv[0], "tcpsink") || !strcmp(argv[0], "tcpsource")) && argc > 2) {
 		cmd_tcp_rate(argv[0], atoi(argv[1]), atoi(argv[2]), argv[0][3] == 's' && argv[0][4] == 'o', argc > 3 ? atoi(argv[3]) : 0);
+	} else if (!strcmp(argv[0], "reboot")) {
+		if (argc == 1) {
+			cmd_reboot(0);
+		} else if (!strcmp(argv[1], "fastboot")) {
+			cmd_reboot(1);
+		} else if (!strcmp(argv[1], "recovery")) {
+			cmd_reboot(2);
+		} else {
+			out("reboot: %s: use 'reboot', 'reboot fastboot' or 'reboot recovery'\n", argv[1]);
+		}
+	} else if (!strcmp(argv[0], "halt")) {
+		cmd_halt();
 	} else if (!strcmp(argv[0], "dmesg")) {
 		cmd_dmesg();
 	} else if (!strcmp(argv[0], "uname")) {
