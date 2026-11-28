@@ -113,7 +113,7 @@ hakios: restart reason 0x77665500 written (mode 1); restarting
 
 and calls `reboot_kernel(RB_AUTOBOOT, NULL)`. That is the `reboot(2)` path:
 sync, kill processes, unmount, then `host_reboot` -> `halt_all_cpus` ->
-`PEHaltRestart(kPERestartCPU)`. Patch 0016 now implements the platform
+`PEHaltRestart(kPERestartCPU)`. Patch 0120 now implements the platform
 expert's `haltRestart()` with PSCI `SYSTEM_RESET`/`SYSTEM_OFF`; without it
 `PE_halt_restart` is NULL and the kernel spins at `MACH Reboot`.
 
@@ -258,9 +258,9 @@ tools/sweet-box.py apply /tmp/usbsh.box
 `ROOT/usr/local/bin/` is in 0400's allowlist; the HFS image and `userdata`'s
 HFS area are not touched. Boot with `sweetbox=1` (the first SWEETBOX boot also
 needs `sweetboxroot=1`; see `docs/sweetbox.md`). The kernel must already have
-0300 for `HAKIOS_USB_RESTART` and 0016 for `haltRestart`. A usbsh box alone on
+0300 for `HAKIOS_USB_RESTART` and 0120 for `haltRestart`. A usbsh box alone on
 an older kernel gets `ENOTTY` for every mode; plain `reboot` then falls back to
-`reboot(2)`, which on a pre-0016 kernel stops at `MACH Reboot` because
+`reboot(2)`, which on a pre-0120 kernel stops at `MACH Reboot` because
 `PE_halt_restart` is NULL. Flash the matching kernel once.
 
 Entitlements: none are required by the sources and miniamfi here does not

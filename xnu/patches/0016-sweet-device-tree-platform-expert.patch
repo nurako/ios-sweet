@@ -30,7 +30,7 @@ diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPl
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,86 @@
 +/*
 + * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
 + * Uses XNU's normal platform, power-domain and nub initialization. Hardware
@@ -53,31 +53,9 @@ new file mode 100644
 +	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
 +	bool getTargetName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
 +	bool getProductName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
-+	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 +};
 +
 +OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
-+
-+/*
-+ * PSCI 1.0 SYSTEM_RESET / SYSTEM_OFF through the same SMC conduit SweetCPU uses for CPU_ON.
-+ * The kernel's reboot(2) and halt_all_cpus() end in PEHaltRestart(); without this override
-+ * IOPlatformExpert::haltRestart finds PE_halt_restart == NULL and the kernel spins at
-+ * "MACH Reboot" instead of resetting the SoC.
-+ */
-+static int
-+sweet_psci_system(unsigned long function)
-+{
-+	register uint64_t x0 __asm__("x0") = function;
-+	register uint64_t x1 __asm__("x1") = 0;
-+	register uint64_t x2 __asm__("x2") = 0;
-+	register uint64_t x3 __asm__("x3") = 0;
-+	__asm__ volatile("dsb sy\n\tsmc #0"
-+	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
-+	    :
-+	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-+	      "x14", "x15", "x16", "x17", "cc", "memory");
-+	return (int)x0;
-+}
 +
 +bool
 +SweetPlatformExpert::start(IOService *provider)
@@ -137,26 +115,5 @@ new file mode 100644
 +	}
 +	strlcpy(name, "Redmi Note 10 Pro", (size_t)maxLength);
 +	return true;
-+}
-+
-+int
-+SweetPlatformExpert::haltRestart(unsigned int type)
-+{
-+	unsigned long function;
-+
-+	if (type == kPERestartCPU) {
-+		function = 0x84000009UL;        /* PSCI SYSTEM_RESET */
-+		IOLog("SWEET: PSCI SYSTEM_RESET\n");
-+	} else if (type == kPEHaltCPU) {
-+		function = 0x84000008UL;        /* PSCI SYSTEM_OFF */
-+		IOLog("SWEET: PSCI SYSTEM_OFF\n");
-+	} else {
-+		return IODTPlatformExpert::haltRestart(type);
-+	}
-+	(void)sweet_psci_system(function);
-+	IOLog("SWEET: PSCI returned without resetting; halting\n");
-+	for (;;) {
-+		__asm__ volatile("wfe");
-+	}
 +}
 +#endif /* SWEET */
