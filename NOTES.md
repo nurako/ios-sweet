@@ -1,4 +1,25 @@
 
+## 2026-11-28 (reboot): usbsh reboot / fastboot / recovery
+
+`usbsh` now has `reboot`, `reboot fastboot`, `reboot recovery` and `halt`.
+The three reboot modes call `ioctl(/dev/hakios-usb, HAKIOS_USB_RESTART, &mode)`
+(0300, `_IOW('u', 6, int)`); the driver maps IMEM with `ml_io_map` (4 KiB,
+uncached), writes `restart_reason@65c` (0x146bf65c alioth / 0x146aa65c sweet,
+`board_imem=`), `dsb sy`, prints `hakios: restart reason 0x... written (mode
+N); restarting`, then `reboot_kernel(RB_AUTOBOOT, NULL)` -- the `reboot(2)`
+path to `PEHaltRestart(kPERestartCPU)`. 0016 now implements
+`SweetPlatformExpert::haltRestart()` with PSCI SYSTEM_RESET/SYSTEM_OFF;
+without it `PE_halt_restart` is NULL and the kernel spins at `MACH Reboot`.
+Reason values follow LK/Xiaomi aboot: fastboot 0x77665500, recovery
+0x77665502, normal/ADB 0x77665501 (the shim's `RESTART_BOOTLOADER` is the
+fastboot value). 0300 regenerated from a pre-0300 46123576757 buildtree,
+in-place blocks carried; 0300 applies, 0400/0501 apply after,
+`check-patch-sources.sh` 6/6. `SweetPlatformExpert.cpp` and `hakios.usb.c`
+compile with `xnu-cc.py` (0/1 each); `usbsh.c` compiles with the real
+iPhoneOS16.5 SDK. **Not booted/tested on the phone**: a reason ABL ignores
+just boots normally; do not claim `fastboot devices` until seen. SWEETBOX
+install path documented in `docs/usb-shell.md` and `docs/sweetbox.md`.
+
 ## 2026-11-27 (ref): the submit path aligned with xiongnemo/hakios-alioth
 
 The reference's current `drivers/gpu` keeps **one address space for every

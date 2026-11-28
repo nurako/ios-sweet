@@ -157,6 +157,21 @@ tools/sweet-box.py apply /tmp/box.bin
 # reboot with sweetbox=1
 ```
 
+### 4. Example: a new `usbsh` (the reboot/fastboot builtins)
+
+`usbsh` is ~80 KB, well inside the 1 MiB mailbox, and
+`ROOT/usr/local/bin/` is in the allowlist:
+
+```sh
+# artifact from the `userland` workflow (iPhoneOS16.5 SDK, ad-hoc signed)
+tools/sweet-box.py pack /tmp/usbsh.box ROOT/usr/local/bin/usbsh=/path/to/hakios-userland/usbsh
+# phone in OrangeFox recovery with adb, then boot with sweetbox=1
+tools/sweet-box.py apply /tmp/usbsh.box
+```
+
+The `fastboot`/`recovery` modes also need the matching kernel (0300's
+`HAKIOS_USB_RESTART` and 0016's `haltRestart`); see `docs/usb-shell.md`.
+
 ### Reading the result
 
 ```sh

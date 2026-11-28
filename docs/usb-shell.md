@@ -69,7 +69,7 @@ ios:/# ls /
 * Input is line based (`\r` or `\n`), echoed, with backspace and Ctrl-C.
 * Builtins: `ls`, `cat FILE` (1 MB cap), `b64 FILE`, `cd`, `pwd`, `getenv`,
   `sysctl`, `cs`, `fill FILE MB`, `udp`, `tcpsink`, `tcpsource`, `dmesg`,
-  `uname`, `ps`, `kill`, `log`, `help`.
+  `uname`, `ps`, `kill`, `log`, `reboot [fastboot|recovery]`, `halt`, `help`.
 * Anything else is a program plus arguments; a name without `/` is looked up
   in `/redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec`. On our root
   that means it finds the stock iOS programs and whatever is in
@@ -84,6 +84,57 @@ ios:/# ls /
   ```
   `tools/sweet-usbsh.sh -g REMOTE [LOCAL]` parses exactly this and writes the
   bytes (or stdout with `-`).
+### Rebooting from the shell
+
+`reboot`, `reboot fastboot` and `reboot recovery` write the QCOM restart reason
+to IMEM and then run the kernel's normal clean shutdown, so the bootloader
+should come back in that mode. `halt` powers it off.
+
+```
+reboot              normal reboot           reason 0x77665501
+reboot fastboot     bootloader/fastboot     reason 0x77665500
+reboot recovery     recovery                reason 0x77665502
+halt                power off (no reason)
+```
+
+The values are the LK/Xiaomi aboot ones (`FASTBOOT_MODE 0x77665500`,
+`RECOVERY_MODE 0x77665502`; `0x77665501` is the normal/ADB reboot value). The
+shim's `RESTART_BOOTLOADER` is the same `0x77665500`. Do not swap 0x77665500
+and 0x77665501: the bootloader will then simply boot normally.
+
+How it works: `usbsh` calls `ioctl(/dev/hakios-usb, HAKIOS_USB_RESTART, &mode)`
+(new in patch 0300). The driver maps the IMEM page with `ml_io_map` (4 KiB,
+uncached), writes the 32-bit reason at `restart_reason@65c` (0x146bf65c on
+alioth, 0x146aa65c on sweet; `board_imem=` overrides), does `dsb sy`, prints
+
+```
+hakios: restart reason 0x77665500 written (mode 1); restarting
+```
+
+and calls `reboot_kernel(RB_AUTOBOOT, NULL)`. That is the `reboot(2)` path:
+sync, kill processes, unmount, then `host_reboot` -> `halt_all_cpus` ->
+`PEHaltRestart(kPERestartCPU)`. Patch 0016 now implements the platform
+expert's `haltRestart()` with PSCI `SYSTEM_RESET`/`SYSTEM_OFF`; without it
+`PE_halt_restart` is NULL and the kernel spins at `MACH Reboot`.
+
+Caveat: none of the three modes has been observed on the phone from this
+branch. A reason the ABL does not honour just boots normally. The old shim
+wrote the same 0x77665500 with a cached store before PSCI and still booted
+Android, which is why the kernel writes through an uncached `ml_io_map`
+mapping. Report what the console shows; do not assume `fastboot devices` will
+appear until it has been run once.
+
+Host side:
+
+```sh
+tools/sweet-usbsh.sh reboot              # plain reboot; -t 3 keeps the wait short
+tools/sweet-usbsh.sh 'reboot fastboot'   # the one that replaces Power+VolDown
+tools/sweet-usbsh.sh 'reboot recovery'
+```
+
+The script sends arbitrary commands unchanged; `reboot`/`halt` are special
+only in that it does not wait for a prompt that will never come.
+
 * There is **no write/upload builtin**. Writes need a program run through the
   shell, or the `usb=3` AFC path below.
 
@@ -188,6 +239,29 @@ IOS_SDK=~/theos/sdks/iPhoneOS16.5.sdk ./build.sh
 `/redwood/bin` paths. Both jobs can be installed together: the job that does
 not own the port for this boot exits before opening it, and on `usb=2` even
 `usbsh` waits for the host's magic line (see the ownership table above).
+
+### Installing a new usbsh without reflashing (SWEETBOX)
+
+The `userland` workflow builds `usbsh` and uploads `artifacts/` as
+`hakios-userland`; download that run's artifact, then pack it as a root entry
+and apply the box from OrangeFox. The usbsh binary is small, so the 1 MiB
+mailbox is enough:
+
+```sh
+# 1. pack (the artifact is from the `userland` workflow, iPhoneOS16.5, ad-hoc signed)
+tools/sweet-box.py pack /tmp/usbsh.box ROOT/usr/local/bin/usbsh=/path/to/hakios-userland/usbsh
+
+# 2. phone in OrangeFox recovery with adb: the NEXT boot with sweetbox=1 installs it
+tools/sweet-box.py apply /tmp/usbsh.box
+```
+
+`ROOT/usr/local/bin/` is in 0400's allowlist; the HFS image and `userdata`'s
+HFS area are not touched. Boot with `sweetbox=1` (the first SWEETBOX boot also
+needs `sweetboxroot=1`; see `docs/sweetbox.md`). The kernel must already have
+0300 for `HAKIOS_USB_RESTART` and 0016 for `haltRestart`. A usbsh box alone on
+an older kernel gets `ENOTTY` for every mode; plain `reboot` then falls back to
+`reboot(2)`, which on a pre-0016 kernel stops at `MACH Reboot` because
+`PE_halt_restart` is NULL. Flash the matching kernel once.
 
 Entitlements: none are required by the sources and miniamfi here does not
 enforce them. If a stricter AMFI path is ever used, `usbmux`'s

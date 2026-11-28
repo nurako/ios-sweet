@@ -46,6 +46,7 @@
 #include <sys/filio.h>
 #include <sys/vnode.h>
 #include <sys/errno.h>
+#include <sys/reboot.h>
 #include <miscfs/devfs/devfs.h>
 #include <mach/mach_types.h>
 #include <kern/locks.h>
@@ -344,6 +345,16 @@ struct hakios_usb_note {
 	char text[160];
 };
 #define HAKIOS_USB_NOTE         _IOW('u', 5, struct hakios_usb_note)
+/*
+ * HAKIOS_USB_RESTART: mode 0 normal, 1 fastboot, 2 recovery. Write the board's IMEM
+ * restart_reason before the reset; the QCOM bootloader reads it (LK aboot: FASTBOOT_MODE
+ * 0x77665500, RECOVERY_MODE 0x77665502, normal/ADB_REBOOT_MODE 0x77665501).
+ */
+#define HAKIOS_USB_RESTART      _IOW('u', 6, int)
+#define HAKIOS_RESTART_NORMAL   0x77665501u
+#define HAKIOS_RESTART_FASTBOOT 0x77665500u
+#define HAKIOS_RESTART_RECOVERY 0x77665502u
+#define HAKIOS_IMEM_RESTART     0x65c           /* qcom,msm-imem restart_reason@65c */
 extern int hakios_usbmux_publish(void);
 extern void hakios_usbmux_host(bool connected);
 extern void thread_set_thread_name(thread_t thread, const char *name);
@@ -1238,6 +1249,48 @@ usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
 	return ready;
 }
 
+/*
+ * The QCOM bootloader reads restart_reason from IMEM (0x146bf65c on alioth, 0x146aa65c on
+ * sweet; board_imem= overrides). Import both constants rather than hard-coding one: this
+ * kernel also runs on the SM7325 phone. ml_io_map gives an uncached 4 KiB window, so the
+ * store reaches IMEM; the shim's cached store before PSCI may have been lost (that reset
+ * booted Android despite writing 0x77665500).
+ *
+ * reboot_kernel() is the same path as reboot(2): sync, kill processes, unmount, then
+ * host_reboot -> halt_all_cpus -> PEHaltRestart(kPERestartCPU). It only actually resets
+ * with the platform expert's haltRestart (patch 0016), which issues PSCI SYSTEM_RESET.
+ */
+static int
+hakios_restart(int mode)
+{
+	uint32_t reason;
+	vm_offset_t base, imem;
+
+	switch (mode) {
+	case 0:
+		reason = HAKIOS_RESTART_NORMAL;
+		break;
+	case 1:
+		reason = HAKIOS_RESTART_FASTBOOT;
+		break;
+	case 2:
+		reason = HAKIOS_RESTART_RECOVERY;
+		break;
+	default:
+		return EINVAL;
+	}
+	base = hakios_board_addr("imem", hakios_board_is_alioth() ? 0x146bf000 : 0x146aa000);
+	imem = ml_io_map(base, 0x1000);
+	if (imem == 0) {
+		printf("hakios: restart: ml_io_map(%#lx) failed\n", (unsigned long)base);
+		return ENOMEM;
+	}
+	*(volatile uint32_t *)(imem + HAKIOS_IMEM_RESTART) = reason;
+	__asm__ volatile("dsb sy" ::: "memory");
+	printf("hakios: restart reason %#08x written (mode %d); restarting\n", reason, mode);
+	return reboot_kernel(RB_AUTOBOOT, NULL) != 0 ? EIO : 0;
+}
+
 static int
 usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 {
@@ -1265,6 +1318,8 @@ usbdev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __
 		*(uint32_t *)(void *)data = usb_generation;
 		lck_mtx_unlock(&usb_lock);
 		return 0;
+	case HAKIOS_USB_RESTART:
+		return hakios_restart(*(const int *)(const void *)data);
 	case HAKIOS_USB_HOST: {
 		/*
 		 * Only the changes said, with how often the state before was said again: the mux says "come" at every

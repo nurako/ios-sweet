@@ -15,6 +15,9 @@
 # Usage:
 #   tools/sweet-usbsh.sh                     interactive shell
 #   tools/sweet-usbsh.sh 'ls /'              one command, its output
+#   tools/sweet-usbsh.sh reboot              reboot to iOS (usbsh "reboot")
+#   tools/sweet-usbsh.sh 'reboot fastboot'   reboot to the bootloader/fastboot
+#   tools/sweet-usbsh.sh 'reboot recovery'   reboot to recovery
 #   tools/sweet-usbsh.sh -g /etc/hosts hosts download a file (usbsh "b64")
 #   tools/sweet-usbsh.sh -g /var/tmp/usbmux.log -
 #                                            ... to stdout
@@ -254,7 +257,13 @@ if rest:
     ack = request_shell(ack_timeout)
     if ack is None:
         fallback_log(None, timeout)
-    os.write(fd, " ".join(rest).encode() + b"\r")
+    command = " ".join(rest)
+    os.write(fd, command.encode() + b"\r")
+    # reboot/halt never return a prompt: the kernel shuts userland down and
+    # the USB link disappears.  Read long enough for the shell's own message.
+    if re.match(r"^(reboot|halt)(\s|$)", command):
+        show(read_for(min(timeout, 3.0), ack))
+        raise SystemExit(0)
     data = read_prompts(ack, 2, timeout)
     if data is None:
         bail("no prompt after the command (any output received is shown above)", PARTIAL["buf"] or ack)
