@@ -25,7 +25,7 @@ wait_for() {   # wait_for <command> <seconds>
 	return 1
 }
 
-have_adb() { command -v adb >/dev/null 2>&1 && adb devices 2>/dev/null | grep -qw device; }
+have_adb() { command -v adb >/dev/null 2>&1 && adb devices 2>/dev/null | awk 'NR>1 {print $2}' | grep -qxE 'device|recovery|sideload'; }
 have_fb()  { command -v fastboot >/dev/null 2>&1 && fastboot devices 2>/dev/null | grep -qw fastboot; }
 have_fbd() { command -v fastboot >/dev/null 2>&1 && fastboot devices 2>/dev/null | grep -qw fastbootd; }
 
