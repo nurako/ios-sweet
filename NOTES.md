@@ -21,8 +21,492 @@ Branches: hakios-all (GPU+USB), hakios-gpu, hakios-usb, hakios-battery (0500),
 hakios-small (0501 haptics/torch), hakios-net (0300-net), hakios-autorun (0400
 SWEETBOX), hakios-infra (CI cache, userland workflow, usbreplay), hakios-userland
 (GPU userland DRM/Mesa), docs/guacamole-research.
+## 2026-11-28 (late) - GPU: per-client spaces fixed the opcode error; the draw still wedges
+
+- Shared space: `CP int 0x1` (opcode error), IB stops at 256 dwords.
+- Per-client spaces (`gpu_spaces=1`): `CP int 0`, the CP consumes ~448 dwords, then
+  `RBBM_STATUS 0xe51005` (CP/HLSQ/SP/VPC/PC busy), no fault bit, fence word 0. The
+  readback is no longer all zeros (white corner, ~15k pixels vs 26% expected): the
+  draw reaches the front end and never drains. This is the `hakios-metal` signature.
+- A `CP_SMMU_TABLE_UPDATE` attempt made it worse (opcode error returned): our word 3
+  used `core_space.context` where Linux writes `CONTEXTBANK(0)`; the sequence is now
+  behind `gpu_table_update=1`, default off. Recorded in `hakios-port-ref/DIFF-SUBMIT.md`.
+- A byte-verified `CACHE_INVALIDATE` before the IBs is emitted (`preamble:
+  CACHE_INVALIDATE at ring 131..132`) and did not clear the wedge on its own.
+- `reboot fastboot` from usbsh writes the IMEM reason (`hakios: restart reason
+  0x77665500 written (mode 1)`) but Xiaomi's ABL boots recovery anyway; the reliable
+  chain stays `adb reboot fastboot` -> fastbootd -> `fastboot reboot bootloader`
+  (`tools/sweet-fastboot.sh`).
+
+
+## 2026-11-28 - GPU submit: the CP stops 256 dwords into every IB
+
+Every client submission now reaches the CP, parses the ring and starts the
+command buffer, then stops after exactly 256 dwords with `CP int 0x1`
+(opcode error) and `CP_SQE_STAT_DATA` reading 0; `CP_IB1_REM_SIZE` freezes at
+1736-256. Reproduced with our own packet order and with the reference
+(hakios-alioth) submit ported verbatim, in the shared SMMU space, so it is not
+packet order or spaces. 256 dwords is 1 KiB, the size of one CP IB prefetch
+chunk, which points at how the IB memory is presented (cache attributes /
+second chunk fetch) rather than at the dwords themselves. Next idea: allocate
+the GEM buffers the way the reference does and/or with cache-inhibited
+attributes, and watch `CP_IB1_REM_SIZE` after the first chunk.
+
+
+## 2026-11-28 (reboot): usbsh reboot / fastboot / recovery
+
+`usbsh` now has `reboot`, `reboot fastboot`, `reboot recovery` and `halt`.
+The three reboot modes call `ioctl(/dev/hakios-usb, HAKIOS_USB_RESTART, &mode)`
+(0300, `_IOW('u', 6, int)`); the driver maps IMEM with `ml_io_map` (4 KiB,
+uncached), writes `restart_reason@65c` (0x146bf65c alioth / 0x146aa65c sweet,
+`board_imem=`), `dsb sy`, prints `hakios: restart reason 0x... written (mode
+N); restarting`, then `reboot_kernel(RB_AUTOBOOT, NULL)` -- the `reboot(2)`
+path to `PEHaltRestart(kPERestartCPU)`. **0120** implements
+`SweetPlatformExpert::haltRestart()` with PSCI SYSTEM_RESET/SYSTEM_OFF;
+without it `PE_halt_restart` is NULL and the kernel spins at `MACH Reboot`.
+CI 46127059873 failed because the hook was first put in 0016, which changed
+0059's context; 0016 is restored byte-for-byte from `hakios-integrate`
+(`4822377`) and 0120 is the only addition. Chain verified on the 46123576757
+buildtree with 0200..0501 reversed: 0001..0119 -> 0120 -> 0200 -> 0300 ->
+0400 -> 0500 -> 0501 all apply.
+Reason values follow LK/Xiaomi aboot: fastboot 0x77665500, recovery
+0x77665502, normal/ADB 0x77665501 (the shim's `RESTART_BOOTLOADER` is the
+fastboot value). 0300 regenerated from a pre-0300 46123576757 buildtree,
+in-place blocks carried; 0300 applies, 0400/0501 apply after,
+`check-patch-sources.sh` 6/6. `SweetPlatformExpert.cpp` and `hakios.usb.c`
+compile with `xnu-cc.py` (0/1 each); `usbsh.c` compiles with the real
+iPhoneOS16.5 SDK. **Not booted/tested on the phone**: a reason ABL ignores
+just boots normally; do not claim `fastboot devices` until seen. SWEETBOX
+install path documented in `docs/usb-shell.md` and `docs/sweetbox.md`.
+
+## 2026-11-27 (ref): the submit path aligned with xiongnemo/hakios-alioth
+
+The reference's current `drivers/gpu` keeps **one address space for every
+client**; it has no `space_switch()`/`gpu_space_new()`/`hakios_gpu_submit_in()`.
+Our `gpu_spaces` experiment (on by default after the import) switched TTBR0 to a
+new client's tables and the first submission there stopped the CP
+(`CP_INTERRUPT_STATUS` bit 0, opcode error; the loud line showed `RPTR` reaching
+`WPTR`, so it was not the doorbell). `gpu_spaces` now defaults to 0; the old
+per-client path is `gpu_spaces=1`. Also removed the three gpu2 guesses the
+reference does not have: `dsb` after `CP_RB_WPTR`, the WPTR re-kick loop, and
+the `RPTR == ring_sent` drain before a space switch. The one-space mapping,
+`CP_INDIRECT_BUFFER` shape, `0x1200040` fence page and poll are unchanged
+because they already matched. `hakios_gpu_report()` now decodes the opcode
+error and reads `CP_SQE_STAT`. Comparison with quotes and line references:
+`hakios-port-ref/PORT-NOTES.md`. Compile 0/2; `check-patch-sources.sh` 9 match;
+0200 regenerated and re-applied in order. **Not booted from this branch.**
+
+## 2026-11-27 - a userland OpenGL program draws on the panel
+
+`gl_test` (Mesa 25.0.7, freedreno FD650, OpenGL ES 3.2) runs on the iOS root and
+puts a triangle on the panel through `0x7f SHOW`, with iOS still responsive. The
+fence word reached 2 (early submissions complete); later submissions (fence 4)
+time out at ~1008 ms with the word stuck at 2, so the submit path works once or
+twice and then stops landing - next bug.
+
+What made it work: in `submit()`, every named BO (command buffers included) is
+pushed to memory before the ring is kicked. Before that the CP fetched a stale
+command buffer, so no fence ever landed. Client waits now return ETIMEDOUT
+rather than Busy, so a stalled wait cannot trap a thread.
+
+Reproduction: `adreno=22 adreno_keep=1 gpu_irq=1 adreno_loud=1`, run
+`/usr/local/bin/gl_test` (the launchd job needs /var/tmp/run-gl-test; the manual
+run through `tools/sweet-usbsh.sh` is the reliable path).
+## 2026-11-28 (gpu2): systematic diff against the working alioth reference
+
+Fetched the real driver for this phone (xiongnemo/hakios-alioth, branch
+`alioth`, `devices/redmi-k40/...`, 5410 + 1888 lines) and diffed it: our port is
+that file plus diagnostics. Restored the reference's end-of-submit
+`ring_time(fence,1)` + `CP_SCRATCH_REG2` write (they were dropped by mistake;
+they are after the IB, so not the 1 KiB stop), and extended the loud probe
+(64 IB dwords, nested-IB targets, `CP_ROQ_AVAIL_IB1`). Reference's kept-GPU run
+is `gpu=1` -> steps 1..21, not our `sweetgpu=22` (step 22's 2D fill runs before
+the handover); next boot `gpu=1 gpu_irq=1 adreno_loud=1`, then add
+`gpu_sleep_test=1`. Also corrected in the notes: the working alioth build uses
+per-client spaces by default (`gpu_spaces=1`), not the shared space.
+Details: `hakios-port-ref/DIFF-SUBMIT.md`.
+
+## 2026-11-28 (gpu2): table update opt-in; UCHE invalidate before IB
+
+The SMMU-table-update packet sequence returned CP opcode error, so it is behind
+gpu_table_update=1 (default 0) and the Linux/reference bytes are recorded in
+hakios-port-ref/DIFF-SUBMIT.md. Default per-client path now emits only the
+verified CP_EVENT_WRITE CACHE_INVALIDATE before the IBs; timeout prints IB rem,
+ROQ_AVAIL_IB1 and 8 IB dwords around the stop. 0200 regenerated (guard 9/9);
+regen-0200.sh copied from hakios-integrate but the CI tree version skew needed
+the splice path.
+
+## 2026-11-28 (gpu2): per-client SMMU table update in the ring
+
+Per-client run stalls 448 dwords into the IB with ROQ full, no fault. The ring
+was missing CP_SMMU_TABLE_UPDATE (only processor TTBR0 was written); added
+CP_SET_PROTECTED_MODE 0 / CP_SMMU_TABLE_UPDATE 0x53 / CACHE_INVALIDATE /
+CP_SET_PROTECTED_MODE 1 before the IB for gpu_spaces=1. Default remains
+per-client (evidence: it executes), shared with gpu_spaces=0. Recover watch now
+logs before reset; probe prints IB offset. 0200 regenerated (guard 9/9).
+
+## 2026-11-28 (gpu2): reference submit ported; shared space default
+
+Fetched the reference submit (drivers/gpu/hakios.adreno.c): same one-packet
+CP_INDIRECT_BUFFER, count 3, words = size/4, no 256-dword split. The real
+difference was our default per-client SMMU space; set gpu_spaces=0 (shared) by
+default and restored the reference packet order. dc-civac polling and the IRQ
+bit stay. 0200 regenerated (guard 9/9).
+
+## 2026-11-28 (gpu2): UCHE invalidate before client IBs
+
+Status 0xe51005 decodes to CP_BUSY + HLSQ/SP/VPC/PC busy: the IB executes but the
+pipeline never idles, so CP_WAIT_FOR_IDLE blocks before the fence. The
+processor-side SMMU switch leaves stale shader lines in the UCHE. Emit
+CP_EVENT_WRITE CACHE_INVALIDATE before the IBs (as Linux a6xx_set_pagetable) and
+probe IB1 base/dwords/rem/status every ms for 20 ms.
+
+## 2026-11-28 (gpu2): client timing packets removed; SQE decode
+
+The first client submit begins at ring 123 with `CP_REG_TO_MEM` (ring_time) and a
+type-4 `CP_SCRATCH_REG2` write, neither exercised by the internal probe; CP int
+0x1 (opcode error) lands there. Removed both from the client submit (fence and
+draw unchanged), and the 1 ms probe now decodes `CP_SQE_STAT_ADDR/DATA` on CP int
+0x1. Zero-length IBs remain emitted as Build A. 0200 regenerated (guard 9/9).
+
+## 2026-11-28 (gpu2): zero-length-IB skip reverted
+
+Build B (`02ab450`) completed but drew/read zeros; Build A drew the triangle.
+The empty-IB skip and the `count == 0` refusal were the only behaviour changes
+and are reverted: 0-length `MSM_SUBMIT_CMD_BUF`s are emitted as before. Kept:
+the non-behavioural diagnostics and a handover line with ring_at/ring_sent/
+RPTR/WPTR. 0200 regenerated cleanly (guard 9/9); draw should return.
+
+## 2026-11-27 (gpu2): readback empty IB skipped
+
+The readback submit carries a zero-length `MSM_SUBMIT_CMD_BUF`; emitting
+`CP_INDIRECT_BUFFER` with length 0 stalls the CP before the fence packet.
+`submit()` now skips empty command buffers and refuses a submission with no
+non-empty IB. Loud adds every BO, the first 16 IB dwords, and fence-word/RPTR
+polls every 100 ms.
+
+## 2026-11-27 (gpu2): re-kick ring and idle the CP before space switches
+
+Fences 1-2 complete, 3-4 stay queued. `ring_send` now DSBs after WPTR, and
+`gpu_submit` re-writes WPTR if RPTR has not moved (the doorbell can be lost
+between submissions). `space_switch` now waits for RPTR == ring_sent, not just
+the fence word, so a queued IB cannot be fetched under the next client's tables.
+Client waits are per-client (`fLastFence`, and CPU_PREP of an unsubmitted BO is
+done). Loud adds IB addresses, the last 8 ring dwords, and CP status/fault after
+1 ms.
+
+## 2026-11-27 (gpu2): push client command buffers before submit
+
+The client ring is kicked (same `ring_send`/`CP_RB_WPTR` as the internal test)
+and the fence page is mapped in every client space, so the likely failure was
+the core reading a stale command buffer from the client mapping. `submit()` now
+flushes every named BO (command buffers included) to memory before the kick.
+Loud adds ring base/RPTR/WPTR around the kick and client space/context/root;
+blocking CPU_PREP timeout now returns `kIOReturnTimeout`; 0200 regenerated from
+sources (guard: 9 match, 9 skipped).
+
+## 2026-11-27 (gpu2): 0200 actually regenerated; guard added
+
+The fence fix was committed in the sources but the old `0200` was left behind,
+so CI rebuilt the old driver. `0200-hakios-gpu.patch` is regenerated from the
+current 14 files and verified against a pre-0200 baseline (applies; all content
+matches; 0300/0400/0500/0501 apply after it; no `sweet_gpu.c`). Added
+`tools/check-patch-sources.sh` to catch the next drift. Patched sha256:
+adreno `6fd7d0e6...`, gpu.cpp `a2b42452...` (full in PORT-NOTES §10).
+
+## 2026-11-27 (gpu2): stale-fence poisoning fixed
+
+`gpuWait()` used a global `gGPUReported` flag to skip waiting after any earlier
+timeout; one stale fence made every later client wait return `NOT DONE` in
+~150 us. Removed that break: each wait uses its own patience (clients 2 s), and
+`adreno_loud=1` now logs the fence word at wait start/end, the submit's fence
+word, and the completion packet address/value. Kernel compile 0/2; 0200 gpu.cpp
+and adreno.c chunks regenerated.
+
+## 2026-11-27 (gpu2): map probe now reads and writes
+
+ul4 already had the per-page probe and still SIGBUSed on the first store: the
+probe only read. `hakios_drm_map` now writes the first and last byte of every
+4 KB page under the SIGBUS/SIGSEGV jump, reports the failing page offset, and
+prints `mapped ... probed N pages, ok` under `hkdrm=1`. The kernel logs the GEM
+descriptor (flags/direction/length, kernel view) and the map descriptor's
+flags/direction. Kernel compile 0/1; 0200 gpu.cpp hunk regenerated.
+
+## 2026-11-27 (gpu2): GEM mmap SIGBUS made a checked failure
+
+The GPU client now reaches the driver: GET_PARAM/GEM_NEW/SUBMITQUEUE succeed and
+the crash is a client SIGBUS on the first touch of a just-mapped GEM buffer.
+`clientMemoryForType` now checks the descriptor length and every page's physical
+segment, returns `kIOReturnNoSpace` with a loud line otherwise, and logs each
+successful map (`map type N -> bytes`). `hakios_drm_map` rejects zero/short maps
+and probes each 4 KB page under a temporary SIGBUS/SIGSEGV handler, so an
+unbacked mapping is `MAP_FAILED`, not a crash; `gl_test` prints the fault address
+and exits 128+N. 0200's gpu.cpp hunk regenerated; compile 0/1.
+## 2026-11-27 (persist): persistent boot plan, tooling and on-device measurements
+
+Branch `hakios-persist` (from `hakios-integrate`). Goal: iOS on a normal
+power-on, no `fastboot boot` and no per-reboot reflash. **Nothing was flashed
+or booted from this branch**; only read-only `fastboot getvar`/`oem device-info`
+queries were run.
+
+Measured while the phone was in fastboot: `current-slot: b`, `slot-count: 2`,
+`unlocked: yes`, `secure: yes`, `partition-size:boot_a|boot_b: 0xC000000`
+(192 MiB, exactly the `phone/boot.img` dump), `vbmeta_*: 0x20000`,
+`dtbo_*: 0x2000000`, `slot-retry-count:a|b: 6`, `max-fetch-size` unsupported
+(no `fastboot fetch`), `is-userspace: no`, `oem device-info` says
+`Verity mode: true / Device unlocked: true / critical unlocked: true /
+Charger screen enabled: false`, `off-mode-charge: 0`. **`fastboot getvar all`
+wedges this ABL** (it stops answering individual getvars) — do not use it.
+
+Decision: write only the active `boot_b` with `shim/out/shim-boot-alioth.img`
+(header v2, self-contained DTB+payload cmdline; stock is v3 — v2 is fine and is
+the exact format that already boots via `fastboot boot`). `boot_a` stays stock.
+`vbmeta` is not required in the orange/unlocked state; `--vbmeta` is a fallback.
+Never re-lock.
+
+New: `docs/persistent-boot.md` (full rationale, exact commands, AVB, escape
+hatch, risks), `tools/install-persistent-boot.sh` (refuses without `--yes`,
+checksums `boot_<slot>`/`vbmeta_<slot>` into `phone/`, preflights the baked
+payload cmdline, prints every command) and `tools/persistent-boot-restore.sh`.
+`shim/build.sh` now puts `root=/dev/ram0` in the boot-header cmdline:
+Qualcomm's published boot code skips A/B retry decrements for a cmdline
+containing `root=` ("boot dev image"), which should prevent the phone from
+falling back to slot A after 6 unsuccessful normal boots (unverified on this
+ABL; the change cannot affect XNU, which uses the payload cmdline). The installer's `--dev-image-cmdline` patches the existing
+image's 512-byte v2 header cmdline in a copy (kernel/payload byte-identical).
+
+Open: `slot-successful:b` could not be read (the ABL was wedged at the time).
+If it is `yes`, ABL never decrements retries and plain `--yes` is enough; if
+`no`/unknown, use `--dev-image-cmdline`. Permanent fix to consider: have the
+shim/kernel write `successful=1` to the `misc` slot metadata on boot.
+
+## 2026-11-27 (gpu2): second illegal-PA panic hardened at the cache primitives
+
+The reported caller `0xfffffe0007b0ce7c` resolves to `phystokv_range.cold.1+0x48`
+only in the pre-guard kernel 45778296613; in 45876690142 it is kperf. The panic
+is therefore the old unguarded path. Value `0x5800000` is below `gPhysBase`
+(0x1_00000000), not an IOVA/handle/offset; most likely a truncated high-bank PA.
+
+Fix: `flush_dcache()`/`clean_dcache()` now skip `phys=TRUE` addresses outside
+`gPhysBase..gPhysBase+real_phys_size`; `bcopy_phys_internal()`/`bzero_phys()`
+and `copypv()` use the same linear-map test plus `pmap_valid_address()`.
+`newBuffer()` logs `HakiosGPU: <what> 0x... is not kernel memory; refused`.
+`gl_test` got the `/var/tmp/run-gl-test` sentinel check and the launchd job is
+now a plain `ProgramArguments` entry with `GL_TEST_LAUNCHD=1` (no `/bin/sh`).
+Compile-verified 0/5 kernel files (gpu, adreno, adapter, caches, loose_ends);
+0200 regenerated (caches.c added, loose_ends updated), order verified earlier.
+Details: `hakios-port-gpu2/PORT-NOTES.md` §6.
+
+## 2026-11-26 (gpu2): Mesa client path traced and bounded
+
+Branch `hakios-gpu2` (from `hakios-integrate`). The userland `gl_test` client is
+now observable and cannot hang silently:
+
+- `gl_test` is unbuffered, prints `gl_test: step N: ...` before each phase, and
+  has a 20 s `SIGALRM` watchdog that prints the step and exits 124.
+- new boot arg `adreno_loud=1` (default off): one kernel line per user-client
+  request with selector/key parameters/result, plus every fence wait and the
+  `CP_EVENT_IRQ`/`CP_CACHE_FLUSH_TS` wake path.
+- client waits (`0x44`, `0x47`) are capped at 2 s; `0x44` now waits on the named
+  buffer's fence, not the newest submission of any client; SMMU entry of one
+  buffer has a 250 ms budget. Existing waits were already bounded.
+- `0200-hakios-gpu.patch` regenerated: applies after `0119`, `0300` applies
+  after it, and it does not touch `bsd/dev/sweet_gpu.c`.
+- Details, expected lines and the ring-dump command: `hakios-port-gpu2/PORT-NOTES.md`.
+
+Not yet done: boot with `adreno_loud=1`, run the opt-in launchd job, and read
+the step where the first real fault is. No device work from this branch.
+
+## 2026-11-26 (night) - one image with everything that works
+
+`hakios-integrate` + image HKN (`a43ed26f15b8`): Adreno 650 drawing on the panel
+with interrupts and `HakiosGPU` published; USB DWC3 enumerating as 1209:316d with
+the CDC-ACM console (usbreplay); SWEETBOX mailbox; real battery percentage from the
+PM8150B fuel gauge. Verified on the phone: home screen, touch, keys, live battery.
+
+Left out and why: `haptichakios` (AW8697 over GENI SE11): even with every wait
+bounded the boot still reset before the probe's first print, so the chip is almost
+certainly not on SE11 on alioth - needs the live DT checked for the real I2C engine
+and reset/INT GPIOs. `torchstep`: the flash module reports type 0x18/subtype 0x0000,
+not PM8150L, so the torch driver refuses; a different module driver is needed.
+`sweetloggrep` also did not filter in the last two dump boots (whole ring printed);
+check the argument parse before relying on it again.
+
+Known-good boot args:
+`sweettouch=1 sweetkeys=1 sweetgpu=22 sweetgpukeep=1 usbhakios=1 usb=2 usbreplay=1
+sweetbox=1 batteryhakios=1` plus board_pil_gpu/board_pil_gpu_size and the usual UI line.
 
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+
+## UPDATE 2026-11-26 (hakios-integrate): one branch for all current work
+`hakios-integrate` is `hakios-panicfix` plus `hakios-infra` (CI object/KDB
+caching, `usbreplay=1`, udev rule), `hakios-battery` (0500 PM8150B fg-gen4),
+`hakios-small` (0501 AW8697 haptics, PM8150L torch), `hakios-autorun` (0400
+SWEETBOX) and `hakios-userland` (DRM client, Mesa 25.0.7 patches, gl_test,
+build scripts; its workflow keeps both the usbsh/usbmux and Mesa/gl_test +
+llvm/bison + signing steps).  Verified patch order on the CI buildtree
+(`45833002347`, upstream blacktop xnu 6639065 + 0001..0118):
+`0200` GPU -> `0300` USB (with usbreplay) -> `0400` SWEETBOX -> `0500`
+battery -> `0501` haptic/torch; each `git apply --check` passes after the
+previous one, and none of them touches `bsd/dev/sweet_gpu.c`.  `0400` and
+`0501` were regenerated for the post-`0300` context.  The single boot line
+that turns every extra on (each still opt-in) is the common UI line plus:
+
+```
+sweetgpu=22 sweetgpukeep=1 usbhakios=1 usb=2 usbreplay=1 \
+sweetbox=1 batteryhakios=1 haptichakios=1 torchstep=1
+```
+
+`hakios-net` (unbuilt ath11k/LinuxKPI object) and `hakios-console` (active
+work elsewhere) are deliberately not merged.  SWEETBOX, battery and
+haptic/torch log through the existing `printf`/`sweet_log_append()` console
+tee, and all use the shared `sweet_spmi_read()` helper; no second tee or
+duplicate global was added.
+
+## UPDATE 2026-11-26 (hakios-panicfix): gl_test panic fixed and made opt-in
+The userland GPU client panic (`phystokv_range: illegal PA 0x50304000`) is
+diagnosed in `hakios-port/PORT-NOTES.md` (last section): an IOVA-shaped value
+reached `copypv()`'s physical cache flush via `newBuffer()`. `newBuffer()` now
+validates every `getPhysicalSegment()` run against `hakios_gpu_phys_ok()`, and
+`copypv()` only flushes `pmap_valid_address()` physical ranges. The gl_test
+launchd job no longer runs on a normal boot; touch `/var/tmp/run-gl-test` to
+run it once. Patch `0200` regenerated and compile-verified against CI
+`45778296613`; `0300` still applies after it.
+
+## Agent handoff 2026-11-26: hakios-infra CI + USB boot replay
+
+- **Caching in `xnu.yml`:** caches `dxb` (source/patches/`build/xnu.obj`/fakeroot)
+  and the installed 13.5 KDK. Key = dxb SHA + hash of `xnu/patches/*` + workflow
+  inputs + the workflow file. Expected repeat run ~2-4 min (from 12m45s); a hit
+  skips patch re-application after checking the cached HEAD and patch hash.
+  Risk is stale objects, which the strict key prevents; a miss costs a cold run.
+- **`userland.yml` (workflow_dispatch):** pinned Theos `8167f59` + pinned
+  `theos/sdks` `master-146e41f` iPhoneOS16.5.sdk (17.4 MB, sha256 checked);
+  builds `usbsh`/`usbmux` with `hakios-port-usb/userland/build.sh`, plus
+  `userland/sweet-autorun.c` when the branch has it; uploads `hakios-userland`.
+- **`usbreplay=1` in 0300/`hakios.usb.c`:** on the host's DTR edge replay the
+  last 4 MiB of the `sweet_log_append()` ring, `SWEET USBCON: replay N bytes`
+  ... `SWEET USBCON: end`, then live ring output. Queue-driven, cuts after 30 s
+  if the host never reads; default off.
+- **Docs:** `docs/udev/99-hakios-usb.rules`, `BRANCHES.md`, replay notes in
+  `docs/usb-shell.md` and `hakios-port-usb/PORT-NOTES.md`.
+- Verified: 0300 applies to baseline+0001..0118; `hakios.usb.c` compiles
+  (`0 of 1 failed`, log 45735232511); both workflow YAMLs parse; 0300 does not
+  touch `bsd/dev/sweet_gpu.c`. Not verified: a cached CI run, a userland build
+  on a Mac, and the replay on the phone (nothing booted from this branch).
+
+### >>> UPDATE 2026-11-26 (alioth): BATTERY PHASE 1 (compile-only, opt-in) <<<
+
+Patch `0500-hakios-battery.patch` (branch only, after 0118) adds alioth's
+PM8150B fg-gen4 gauge to the existing `SweetBattery` IOPMPowerSource. SPMI
+SID 2 blocks 0x40/0x41 (SOC, VBATT/IBATT shadows) plus the SMB5 charger at
+0x1006/0x1007/0x1310 are read-only; `batteryhakios=1` selects it, everything
+else (including the default boot) keeps the static 100% / 4200 mV fallback.
+One probe line prints all raw registers + derived percent/mV/mA/temp. Both
+files pass xnu-cc (`0 of 2 failed`) and the patch applies cleanly to the
+45735232511 buildtree (0001..0118). Temperature stays fixed 25.0 C (RRADC
+not ported), cycles 0. Not booted. Notes: `hakios-port-battery/PORT-NOTES.md`.
+## Agent handoff 2026-11-26: SWEETBOX no-reflash install channel (branch `hakios-autorun`)
+
+- **Goal:** stop rebuilding/flashing the 16 GiB userdata image for every userland change.
+  Design basis: `ios-guacamole`'s `SWEETBOX` (kernel 0115/0116/0118/0119, `ROOT/<path>`,
+  `SWEETDNE` stamp, `sweet-autorun`) and `xiongnemo/hakios-alioth`'s `usbmux`/`usbsh`
+  (better live channel, but needs the USB gadget that is blocked here: apps-SMMU/DWC3).
+- **Implemented, all opt-in behind `sweetbox=1`:** `xnu/patches/0400-sweetbox.patch`
+  (new `bsd/dev/sweet_box.c`; `sweet_ufs_box_read/write` for a 1 MiB mailbox placed
+  immediately before the last-1025-block log ring, so 0047/0097/0108 are unchanged;
+  `bsd_init` call before launchd; `sweetnull` default + sweet-autorun), `tools/sweet-box.py`
+  (pack/apply/pull/clear/status via recovery ADB raw `dd`), `tools/sweet-launchd-autorun.py`,
+  `userland/sweet-autorun.c` + `userland/build.sh`, `docs/sweetbox.md`.
+- **Compile-verified** with `XNU_CC_CLANG=/usr/bin/clang tools/xnu-cc.py /tmp/ci-box.log
+  research/ci-buildtree ...` against CI run `45735232511`: `bsd/dev/sweet_box.c`,
+  `bsd/dev/sweet_ufs.c`, `bsd/kern/bsd_init.c`, `bsd/dev/mem.c` -> 0 failures.
+  `0400-sweetbox.patch` applies with `git apply --check` to the exact CI tree.
+- **Not done / next:** (1) dispatch ONE manual CI run for patch 0400 and confirm it applies
+  after 0118 (the local log is the 0118 tree); (2) build `userland/sweet-autorun` on a Mac,
+  boot `sweetbox=1 sweetboxroot=1` with a test binary and read `SWEET BOX`/`SWEET RUN` from
+  the log. `userdata` risk is bounded: the mailbox is outside the HFS image, every write is
+  bounded to its 1 MiB, the kernel CRCs before opening files, and `ROOT/` installs are
+  allowlisted and happen before launchd so a bad file can be replaced on the next boot.
+- **Trade-off:** phase 1 applies on the NEXT boot (the PC must be in recovery to write raw
+  blocks); no live channel until USB works. See `docs/sweetbox.md`.
+## Agent handoff / active work (2026-11-26 #2, log-first USB shell)
+
+### >>> UPDATE 2026-11-26 #2 (branch `hakios-console`): USB port is log-first;
+###     shell only on the magic line; usbsh no longer opens at boot <<<
+
+Hardware showed the previous `usb=2` rule (usbsh owns the port from boot) could
+leave the CDC-ACM port with no log and no shell. Reworked:
+
+* Kernel `usb=2` is in **log mode** from bring-up; the log always flows when no
+  program is attached. `usbsh` opens only `/dev/hakios-usb-shell` at boot.
+* Host magic line `1d 1d 53 48 45 4c 4c 0a` (`"\x1d\x1dSHELL\n"`) is matched
+  in `shell_input()` while in log mode. The kernel stops the log, queues
+  `--- usbsh: log paused; 'log' resumes it ---`, sets `shell_wanted`, wakes the
+  control node. `usbdev_open` refuses `/dev/hakios-usb` unless a request is
+  pending, so an accidental open cannot silence the log.
+* `usbdev_open` sets `shell_active`; `HAKIOS_USB_LOG` / the shell's `log` /
+  120 s with no shell input / 10 s with no attach all call `shell_to_log()`.
+* Kernel prints exactly `usb: log mode`, `usb: host asked for a shell`,
+  `usb: shell took the port`, `usb: log mode again`. Ring dump shows the last
+  transition, so a silent port is diagnosable.
+* `tools/sweet-usbsh.sh` sends the magic, waits `-a` (3 s) for the banner, then
+  runs the command; on no ack it prints `-t` seconds of the log and exits 1.
+  `usb=3`/`usbmux` is unchanged (boot-arg gate still there).
+
+Compile: run 45868317204 log + buildtree, overlaid patched files:
+`XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-con2.log /tmp/bt2
+bsd/dev/sweet_ufs.c osfmk/console/serial_console.c bsd/dev/hakios.usb.c` ->
+0 of 3 failed. `usbsh.c` host syntax check with clang + stub sysctl/sockaddr
+headers -> clean. Patch series `0119 -> 0200 -> 0300` applies on 0001..0118.
+
+## Agent handoff / active work (2026-11-26, console + USB ownership)
+
+### >>> UPDATE 2026-11-26 (branch `hakios-console`): userland console in the ring;
+###     one owner for /dev/hakios-usb (usb=2 usbsh, usb=3 usbmux); GLTEST markers <<<
+
+**A. Persistent ring now captures userland /dev/console (patch 0119, new).** The
+hook moved from `_cnputs` (only reached when the kernel console buffer is
+drained) to the entry of `console_write()` and `console_write_unbuffered()`
+in `osfmk/console/serial_console.c`. Every writer - kernel printf and the tty
+path `kmoutput()` -> `console_write()` used by launchd jobs' `/dev/console` -
+is appended once. `sweet_log_append()` is gated by `sweet_log_ready`, set by
+`sweet_log_start()` only after the UFS partition is found and the writer thread
+starts, so pre-ring boot text is dropped and `sweetlogdump` (which runs before
+start) cannot append itself. No per-byte cost added (same loop, one branch).
+Compile: `XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py /tmp/ci-con.log
+research/ci-buildtree bsd/dev/sweet_ufs.c osfmk/console/serial_console.c
+bsd/dev/hakios.usb.c` -> 0 of 3 failed (run 45833002347 log; used a copy of
+`ios-sweet/research/ci-buildtree` with the patched files overlaid).
+
+Read it back: wait >=10 s after the program writes (the writer flushes every
+`sweetlogsecs`, default 10; `ufslogsecs=1` for tests), then reboot with
+`sweetlogdump=262144 sweetloggrep=GLTEST sweetlogdumpwait=30` (or grep `USBSH`).
+The dump prints the previous session's tail from the last 4 MiB+4 KiB of
+userdata before this boot's log; `sweetloggrep` filters lines.
+
+**B. USB shell silent on most boots: a one-opener race, not a deadlock.**
+`usbmux` opened `/dev/hakios-usb` unconditionally. On `usb=2` it could win the
+`user_open` CAS before `usbsh`, fail `HAKIOS_USB_IPHONE` with `ENOTSUP`, and
+return 0 (so launchd's KeepAlive-on-failure never restarted it). `usbsh` then
+got `EBUSY`, treated it as success, and exited. The first host CR was queued to
+the ring and set `log_mode=false`, with no program reading: silence.
+Fix: both programs read `usb=` from `kern.bootargs` before opening. `usb=2` ->
+`usbsh` sole owner, retries `ENXIO/EBUSY/ENOENT`; `usb=3` -> `usbmux` sole
+owner, same retry. Kernel logs every transition. Host sequence and doc:
+`docs/usb-shell.md` (open raw, assert DTR/RTS optional, send one bare CR, wait
+`ios:/#`, then `command\r`; `tools/sweet-usbsh.sh` does it).
+
+**GLTEST:** the job now echoes `GLTEST: start` before the 5 s delay and
+`GLTEST: exit N` after `gl_test`, so screen/ring shows whether it ran and how
+it ended. Updated in both `tools/add-launchd-jobs.py` and
+`tools/daemons/com.hakios.gltest.plist`.
+
+**Uncertain / next:** userland was not compiled here (no iOS SDK on this box);
+the edits are C89-style and use only existing headers. `0300` was regenerated
+and re-checked to apply after 0200 (which itself stays after 0001..0118); it
+does not touch `bsd/dev/sweet_gpu.c`. On-device boot verification of the retry
+and markers is still needed.
 
 ## Agent handoff / active work (2026-11-22, latest)
 
@@ -1942,3 +2426,122 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+### >>> UPDATE 2026-11-26 (alioth): HAPTIC BOOT-HANG FIX (compile-only) <<<
+
+First hardware run with `haptichakios=1` reached the launchd early-boot phase
+and then watchdog-rebooted; without the flag the same build booted. Cause: the
+AW8697 probe's GENI/QUP waits had no shared bound, and its 5 s start delay was
+a `delay()` busy-spin. Fix in `0501-hakios-haptic-torch.patch`: every poll is
+bounded by `mach_absolute_time` (2 ms per wait, 20 ms for the whole probe,
+plus a round cap); on expiry one line
+`HAKIOS HAPTIC: timed out waiting for <what> (0x%x)` is printed, gpio130 is
+driven low, no further register is written, and the thread returns. The probe
+is still only spawned by `alioth_haptic_init()` (called from
+`sweet_ufs_init()` on alioth and only when the boot arg is present) but runs
+on its own kernel thread; the pre-probe delay is now
+`assert_wait_deadline()`/`thread_block()`, the GPU adapter pattern. The torch
+reads type/subtype before `show()` or any write: alioth's `0x18/0x0000`
+prints once, forces `lit=0`/`wanted=0`, and never lights. 0501 was
+regenerated against the post-0500 tree and order-simulated on blacktop
+`6639065` + `0001..0118`: `0119` -> `0200` -> `0300` -> `0400` -> `0500` ->
+`0501`; it does not touch `bsd/dev/sweet_gpu.c`. Compile: `0 of 2 files
+failed` (xnu-cc, `gh run view 45852234119`). Next: temporary-boot with
+`haptichakios=1 haptichakiosdelay=0` and confirm the GUI appears with either
+the AW8697 proof or exactly one timeout line. Notes:
+`hakios-port-small/PORT-NOTES.md`.
+
+## 2026-11-28 (splitboot): Open Mapple's dual boot checked against alioth — defer
+
+Read `open-mapple/mapple_splitboot` and its site: it is **not** a bootloader
+replacement and **not** A/B. It carves `xnusys` off the end of `userdata` in the
+GPT, flashes an HFS+ root into it, and chains a menu (`mtkloader` + PMIC keys)
+in front of Android's own kernel in the boot image; the menu either relocates
+Android's `Image` to 0x40080000 or boots XNU. The bootloader stays stock. The
+code is MediaTek-only (MTK display/PMIC/UART, 0x40080000, 32 MiB boot), and its
+carve direction would hand our iOS root's first 16 GiB back to Android. The
+alioth equivalent is a GPT **front**-carve (`darwin` over the existing HFS
+volume, `userdata` moved after it), a menu in our shim, and `fastboot
+set_active` done from the shim via `misc`; our kernel already takes a root by
+GPT name (`ufsroot=`). Deferred: the only new brick vector is the first GPT
+write, which Power+VolDown/`fastboot boot`/`boot_a` do not cover.
+Decision doc: `docs/splitboot-feasibility.md`.
+https://github.com/open-mapple/mapple_splitboot · https://open-mapple.pages.dev/splitboot/
+
+## 2026-11-28 (AdrenoMetal): Metal-on-Adreno checked against alioth — after the GL path
+
+Read `UniXNU/AdrenoMetal` (415 commits, active, MIT; upstream A740 on macOS 27 /
+iPadOS 27, no releases), its `FFT-infra` fork with `Adreno650` (A650 on iPadOS
+17.7.11) and `NWylynko/ios-flame` (the same stack on iOS 16.7.16 / A640).
+AdrenoMetal is only the userland Metal frontend plus the
+`MetalPluginName`/`IOAcceleratorES` discovery bundle over metal2vulkan and
+Turnip; it is not an `IOAcceleratorES` provider and cannot open `HakiosGPU`'s
+msm-DRM ABI. A650 UI compositing is shown only on iPadOS 17.7.11 (FFT; partial —
+widgets/posters/Wi-Fi missing, fragile) and iOS 16 only on A640 (ios-flame, an
+older fork). **Verdict: after the GL path** — then a NativeAdreno-v1 facade over
+`HakiosGPU` with the iOS 16 Turnip/frontend, or FFT's full A650 stack if an
+iPadOS 17.7.11 rebase is acceptable; do not drop in upstream AdrenoMetal on
+iOS 16. Doc: `docs/adrenometal-feasibility.md`.
+https://github.com/UniXNU/AdrenoMetal · https://github.com/FFT-infra/UniXNU-alioth · https://github.com/NWylynko/ios-flame
+
+## 2026-11-28 (ios-guacamole ios16): Metal on A640 checked — iOS 16 stack found, still A640-only
+
+Read `coreycusick/ios-guacamole` branch **`ios16`** (commit `29e3cf3`, 2026-11-20; README
+retired 2026-11-12 to focus on iOS 27.2). It runs iOS **16.7.16 (20H392)** iPhone X userland
+on XNU 8796 on a OnePlus 7 Pro (SM8150, **Adreno 640**). Its "Metal acceleration" is a real
+device-tested CA compositor: an `IOAcceleratorES` stub published from `AppleCLCD` (0088)
+carries `MetalPluginName=SweetMetal2` / `MetalPluginClassName=SweetMTL2Device` (0144; 0145
+adds the present fence);
+Metal loads `SweetMetal2.bundle`, whose frontend (`NativeBridgeMetalFrontend.mm`) drives
+metal2vulkan + Turnip through a 609-line **NativeAdreno ABI v1** user client over their
+existing `sweet_gpu.c`/RedwoodGPU ring (BO alloc/import/map, 16 IBs, CP fences, `0x4147`).
+backboardd, WebKit GPU/WebContent and Telegram are listed in `/var/local/mtl2-clients`;
+`NOTES.md:2223` confirms "backboardd composes with Metal, NOT libsweet-gl". Evidence: owner
+reports + `mtltest` PASS + swipe rate 25 -> 37-44 fps; no screenshot/video/CI, DeviceLost
+and GPU hangs need recovery, GLES-only apps still crash.
+This is the same ios-flame lineage at a newer, fully documented state: it supplies the
+iOS 16 `IOAcceleratorES` + frontend + facade that upstream AdrenoMetal lacks, and the facade
+maps cleanly onto our `hakios_gpu_ready/map/submit(_in)/done/last` KPI and existing
+per-client spaces. It is still A640-only (chip 0x06040001, GMEM/bank/UBWC, 585 MHz, SM8150
+pool ranges) and does not solve a650 or our 256-dword submit stop. **Verdict: ordering
+unchanged — finish GL/submit first; then this is the concrete reference for the NativeAdreno
+facade, and its userland bundle can be built offline in parallel.**
+Doc: `docs/guacamole-ios16-metal.md`.
+https://github.com/coreycusick/ios-guacamole/tree/ios16
+
+## 2026-11-28 (registry): iOSOnAnd surveyed — native-Metal and QCA6390 leads
+
+Read <https://hackios.appaiproxy.com/> (iOSOnAnd) and its public JSON API: 296 phones, 600 repos,
+26 areas, per-row provenance (`reddit claim` / registry / maintainer / artifact). Registry, not a
+wiki or marketing; operator not disclosed. Full inventory, claims-vs-evidence table and ranked
+reading list: `docs/hackios-port-registry.md`. Read-only; no build, flash or device command.
+
+Top three finds for our open problems:
+
+1. **(a)(b)(c) `oosexgang/hakios-metal`** (MIT; now `oosexgang/hakios-xnu-kernel/hakios-metal/`):
+   a native Metal implementation in C++ on the **msm-DRM/HakiosGPU ABI**, PM4 + a6xx encoders checked
+   against Mesa XML, compute/blit/first draw, AIR→NIR→ir3 without Vulkan. Same kernel ABI as ours,
+   unlike AdrenoMetal's NativeAdreno/v2 + Turnip. Its README records our hang signature: a dispatch
+   that never finishes sets **no fault bit**, only the wait timeout; `gpu_recover=1` resets in ~0.1 s
+   and names the hanging line. Read before more AdrenoMetal work.
+   https://github.com/oosexgang/hakios-metal
+
+2. **(e)(f) `rui12366B/UniXNU-gts7xlwifi`**: SM8250-AB + Adreno 650 (same family/GPU as alioth),
+   iPadOS 17.7.11, with **QCA6390 Wi-Fi via Linux ath11k + a wpa_supplicant service**, ADSP audio,
+   persistent UFS Data and USB device mode. The only non-HakiOS QCA6390+SM8250 working Wi-Fi found
+   in this survey; its README is a state table with per-area detail, not a claim list.
+   https://github.com/rui12366B/UniXNU-gts7xlwifi
+
+3. **(a)(b) the reference's `docs/ru/metal.md` and `bsd/dev/hakios.adreno.c`**: the exact Metal
+   discovery chain (`IOAcceleratorES` → `MetalPluginName`/`MetalPluginClassName` → bundle →
+   `_MTLDevice` subclass), proof the port publishes an empty `IOAcceleratorES` ("sgx") so
+   CoreAnimation does not wait 30 s, and the per-client SMMU switch that lives in
+   `bsd/dev/hakios.adreno.c` (`space_switch`/`ring_switch`, `CP_SMMU_TABLE_UPDATE 0x53`), not in
+   `drivers/gpu` — the file our 11-27 diff read. Lead for the 256-dword stop under `gpu_spaces=1`.
+   https://github.com/xiongnemo/hakios-alioth/blob/alioth/docs/ru/metal.md
+
+Correction to our framing: Metal is **not** required for a GPU-composited UI on iOS 16 — the
+reference's SpringBoard/backboardd composite through its own EAGLContext on Mesa/freedreno; Metal is
+for installed apps. The compositor path is GLES, so the submit stall still gates the UI. Also, Wi-Fi
+on alioth is solved on the HakiOS stack (ath11k/LinuxKPI, 5 GHz); the UniXNU alioth "no Wi-Fi" is a
+different stack failing at PCIe DBI step 10 with ath12k, not a chip limit.

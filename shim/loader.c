@@ -74,6 +74,42 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+/*
+ * The 3D core's and the USB controller's DMA both go through the apps SMMU.
+ * Its stream-0 match was left TYPE=FAULT by the bootloader, which is why xnu's
+ * DWC3 cannot fetch a descriptor and why the GPU's render writes never land
+ * (the command processor's own writes do). TrustZone owns the SMMU by the time
+ * xnu runs - writes from the kernel read back unchanged - so the only place
+ * this can be set is here, before xnu starts, with the MMU off.
+ *
+ * SMR0: VALID, ID 0, no MASK; S2CR0: TYPE 1 = bypass.
+ */
+#ifdef ALIOTH
+#define APPS_SMMU_PA	0x15000000UL
+#define SMMU_SMR0	(APPS_SMMU_PA + 0x800)
+#define SMMU_S2CR0	(APPS_SMMU_PA + 0xc00)
+#define SMMU_SCTLR	(APPS_SMMU_PA + 0x000)
+
+static inline uint32_t smmu_rd(uintptr_t a) { return *(volatile uint32_t *)a; }
+static inline void smmu_wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+
+static void
+smmu_stream0_bypass(void)
+{
+	uint32_t sctlr = smmu_rd(SMMU_SCTLR), s2cr = smmu_rd(SMMU_S2CR0);
+	con_hex2("SMMU", "sctlr=", sctlr, "s2cr0=", s2cr);
+	smmu_wr(SMMU_SMR0, 0x80000000u);	/* VALID, ID 0, MASK 0 */
+	smmu_wr(SMMU_S2CR0, 0x1u);		/* TYPE 1: bypass */
+	__asm__ volatile("dsb sy" ::: "memory");
+	uint32_t smr2 = smmu_rd(SMMU_SMR0), s2cr2 = smmu_rd(SMMU_S2CR0);
+	con_hex2("SMMU", "smr0=", smr2, "s2cr0=", s2cr2);
+	con_str("SMMU", (s2cr2 & 3u) == 1u ? "stream 0 is in bypass: DMA reaches memory" :
+	    "stream 0 stayed as it was (TrustZone owns the SMR/S2CR: not writable here)");
+}
+#else
+static void smmu_stream0_bypass(void) { }
+#endif
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 const char *loader_boot(uintptr_t dtb)
@@ -135,6 +171,17 @@ const char *loader_boot(uintptr_t dtb)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+
+	smmu_stream0_bypass();
+	/* Hold the answer on screen a few seconds so it can be photographed (the kernel clears it). */
+	{
+		uint64_t freq, start, now_v;
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+		do {
+			__asm__ volatile("mrs %0, cntpct_el0" : "=r"(now_v));
+		} while (now_v - start < 4ull * freq);
+	}
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);

@@ -39,21 +39,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Theos and the iOS SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            theos
+            theos/sdks
+          key: theos-${{ env.THEOS_SHA }}-${{ env.SDK_SHA256 }}
+
       - name: Fetch Theos (pinned)
         run: |
+          if [ -d theos/.git ] && [ "$(git -C theos rev-parse HEAD)" = "$THEOS_SHA" ]; then
+            echo "theos restored from cache"
+          else
+          rm -rf theos
           git init -q theos
           git -C theos remote add origin "$THEOS_REPO"
           git -C theos fetch -q --depth 1 origin "$THEOS_SHA"
           git -C theos checkout -q FETCH_HEAD
+          fi
           echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
           echo "Theos: $(git -C theos rev-parse HEAD)"
 
       - name: Fetch iPhoneOS16.5.sdk (pinned)
         run: |
           mkdir -p "$THEOS/sdks"
+          if [ -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            echo "SDK restored from cache"
+          else
           curl -fL --retry 3 -o /tmp/iPhoneOS16.5.sdk.tar.xz "$SDK_URL"
           echo "$SDK_SHA256  /tmp/iPhoneOS16.5.sdk.tar.xz" | shasum -a 256 -c -
           tar -xJf /tmp/iPhoneOS16.5.sdk.tar.xz -C "$THEOS/sdks"
+          fi
           test -d "$THEOS/sdks/iPhoneOS16.5.sdk" || {
             echo "::error::iPhoneOS16.5.sdk did not extract into $THEOS/sdks"
             exit 1
@@ -69,6 +86,55 @@ jobs:
           IOS_SDK="$IOS_SDK" CLANG="$CLANG_BIN" ./build.sh
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cp out/usbsh out/usbmux "$GITHUB_WORKSPACE/artifacts/"
+
+      - name: Mesa build dependencies
+        run: |
+          brew install meson ninja bison flex
+          # macOS ships bison 2.3, which cannot parse ir3_parser.y (%code needs >= 2.6)
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix bison)/bin/bison" --version | head -1
+
+      - name: llvm tools (llvm-ar, llvm-ranlib, llvm-strip for Mesa)
+        run: |
+          # Xcode's toolchain does not ship llvm-ar/ranlib/strip on the runners.
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix llvm)/bin/llvm-ar" --version | head -1
+
+      - name: Cache the Mesa source and build tree
+        uses: actions/cache@v4
+        with:
+          path: hakios-port-userland/build
+          key: mesa-${{ hashFiles('hakios-port-userland/mesa/patches/*.patch') }}-${{ hashFiles('hakios-port-userland/build-mesa.sh', 'hakios-port-userland/hakios-drm/**') }}
+
+      - name: Build Mesa (freedreno) + DRM client + gl_test
+        # Additive: this only adds files to artifacts/.  The usbsh/usbmux job
+        # above is unchanged.  build-mesa.sh pins Mesa 25.0.7 and the eight
+        # patches in hakios-port-userland/mesa/patches/.
+        run: |
+          set -o pipefail
+          CLANG_BIN=$(xcrun --find clang)
+          IOS_SDK="$IOS_SDK" CLANG="$CLANG_BIN" hakios-port-userland/build-userland-gpu.sh
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp hakios-port-userland/out/gl_test \
+             hakios-port-userland/out/libOSMesa.8.dylib \
+             hakios-port-userland/out/exported-gl.txt \
+             "$GITHUB_WORKSPACE/artifacts/"
+
+      - name: Sign every Mach-O artifact (ad-hoc)
+        run: |
+          # iOS runs arm64 binaries only from a valid signature; ad-hoc ("-")
+          # is enough for our AMFI policy, and the dylib needs it as much as
+          # the executables.
+          for f in artifacts/*; do
+            case "$(file -b "$f")" in
+              Mach-O*)
+                codesign -f -s - "$f"
+                codesign -v "$f" && echo "signed: $f"
+                ;;
+            esac
+          done
 
       - name: Build sweet-autorun when this branch has it
         run: |

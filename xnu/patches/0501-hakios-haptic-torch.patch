@@ -1,0 +1,1331 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bbf0e6a..5c4358e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,8 @@ bsd/dev/hakios.dwc3.c			standard
+ bsd/dev/hakios_usb_adapter.c		standard
+ bsd/dev/alioth_keys.c			standard
+ bsd/dev/alioth_touch.c			standard
++bsd/dev/alioth_haptic.c			standard
++bsd/dev/alioth_torch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/alioth_haptic.c b/bsd/dev/alioth_haptic.c
+new file mode 100644
+index 0000000..3f4753d
+--- /dev/null
++++ b/bsd/dev/alioth_haptic.c
+@@ -0,0 +1,632 @@
++/*
++ * ALIOTH HAPTIC (Redmi K40 / POCO F3 / Mi 11X, SM8250-AC): Awinic AW8697
++ * linear-resonant actuator, probed and verified read-only+one-safe-write.
++ *
++ * Ported from xiongnemo/hakios-alioth's bsd/dev/hakios.haptic.c (AW8697
++ * path), with the bus access rebuilt on this tree's GENI/QUP pattern from
++ * bsd/dev/alioth_touch.c instead of the reference's GPIO bit-banging:
++ *
++ *   I2C        QUPV3 wrapper 1 serial engine 5 (qupv3_se11, base 0xa84000),
++ *              pins gpio60 (SDA) / gpio61 (SCL), function "qup11" (mux 1),
++ *              address 0x5a, 400 kHz. alioth's own DTS puts the AW8697 at
++ *              &qupv3_se11_i2c / aw8697_haptic@5A (xiaomi-sm8250-common.dtsi).
++ *   reset      gpio130, active low: low 5 ms then high, as the vendor driver
++ *   interrupt  gpio129 (pulled up, not used: this probe polls)
++ *   clocks     GCC QUPV3 wrap1 m/s AHB + core/core_2x + s5 branch
++ *              (enable 0x52008 bits 20/21/19/18/27; RCG 0x18600)
++ *
++ * Default boot is untouched: nothing is mapped, reset, read or written
++ * unless the command line carries haptichakios=1 (haptichakiosdelay=N
++ * changes the default 5 s delay). Level 1 does exactly one safe write: the
++ * interrupt mask SYSINTM (0x03) = 0xff, read back. No waveform is started,
++ * so the motor cannot buzz; at the end the chip is put back into reset
++ * (gpio130 low). A missing I2C firmware, a busy engine, a NACK or a value
++ * that does not read back all end the probe with a line and leave the
++ * default boot path as it found it.
++ *
++ * Every wait is bounded by mach_absolute_time: 2 ms per register poll and
++ * 20 ms for the whole probe. On expiry exactly one line names the wait,
++ * the chip is held in reset and nothing else is written. The first alioth
++ * run hung the boot here; a guest driver must never be able to do that.
++ *
++ * The chip id is AW8697 register 0x00 = 0x97 (the AW86927 at 0x9270 lives
++ * on other boards; alioth uses the AW8697).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++
++void alioth_haptic_init(void);
++
++#define HAP_GCC_PA       0x00100000u   /* kona GCC */
++#define HAP_TLMM_PA      0x0f000000u   /* kona TLMM, 16 MiB DT window */
++#define HAP_TLMM_SOUTH   0x500000u     /* gpio 60/61/129/130 live here */
++#define HAP_TLMM_SIZE    0x100000u
++#define HAP_SE_PA        0x00a84000u   /* qupv3_se11: QUPV3 wrap1 SE5 */
++#define HAP_SE_SIZE      0x4000u
++
++/* gcc-kona.c: wrap1 m_ahb bit20 (halt 0x18004), s_ahb bit21 (halt 0x18008,
++ * hwcg bit1), core bit19 (halt 0x23138), core_2x bit18 (halt 0x23140),
++ * s5 bit27 (halt 0x185fc), RCG cmd_rcgr 0x18600. */
++#define HAP_GCC_VOTE     0x52008u
++#define HAP_GCC_MASK     ((1u << 18) | (1u << 19) | (1u << 20) | \
++                          (1u << 21) | (1u << 27))
++#define HAP_RCG          0x18600u
++
++/* kona TLMM per-pin block: cfg at +0, io at +4. */
++#define HAP_GPIO(n)      ((uint32_t)(n) * 0x1000u)
++#define HAP_PIN_SDA      60
++#define HAP_PIN_SCL      61
++#define HAP_PIN_RESET    130
++#define HAP_PIN_INT      129
++
++/* GENI SE registers (identical layout to alioth_touch.c / geni-se.h). */
++#define SE_STATUS        0x040u
++#define SE_MCLK          0x048u
++#define SE_FW            0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_M_CMD0        0x600u
++#define SE_M_CMD_CTRL    0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_S_IRQ_CLR     0x648u
++#define SE_TX            0x700u
++#define SE_RX            0x780u
++#define SE_TX_COUNT      0x800u
++#define SE_RX_COUNT      0x804u
++#define SE_HW_TX         0x0e24u
++#define SE_HW_RX         0x0e28u
++
++#define SE_I2C_TX_LEN    0x26cu
++#define SE_I2C_RX_LEN    0x270u
++#define SE_I2C_SCL       0x278u
++#define SE_DMA           0x258u
++#define SE_BYTE_GRAN     0x254u
++#define SE_GSI_EVENT     0x0e18u
++#define SE_IRQ_ROUTE     0x0e1cu
++#define SE_DMA_GEN_CFG   0x0e30u
++#define SE_CGC           0x028u
++#define SE_OUTPUT_CTRL   0x024u
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_SER_M_CLK     0x048u
++
++/* M_CMD opcodes (i2c-geni.c): write 1, read 2; parameters: [26:9] address,
++ * bit 2 STOP_STRETCH (keep the bus for the following read). */
++#define I2C_WRITE        1u
++#define I2C_READ         2u
++#define I2C_STOP_STRETCH 0x4u
++
++#define M_DONE           (1u << 0)
++#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | \
++                          (1u << 5) | (1u << 10) | (1u << 12) | (1u << 13) | \
++                          (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
++
++#define AW_ADDRESS       0x5a
++#define AW_ID            0x00u
++#define AW_SYSINTM       0x03u
++#define AW_GLBRD5        0x46u
++
++/*
++ * Every register wait is bounded by the system counter. One wait gets at
++ * most HAP_POLL_NS, the whole probe HAP_TOTAL_NS (the 5+8 ms reset pulses
++ * come out of that). HAP_POLL_ROUNDS is a second, independent ceiling so a
++ * non-advancing counter (or a broken delay()) still terminates the poll.
++ * A guest driver must never be able to spin the boot to a watchdog reset.
++ */
++#define HAP_POLL_NS      (2ull * NSEC_PER_MSEC)
++#define HAP_TOTAL_NS     (20ull * NSEC_PER_MSEC)
++#define HAP_POLL_ROUNDS  20000u
++
++static struct {
++	vm_offset_t gcc, tlmm, se;
++	uint64_t deadline_ns;
++	bool ready, dead, released;
++} h;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint64_t
++hap_ns(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++static bool
++hap_expired(void)
++{
++	return h.dead || hap_ns() >= h.deadline_ns;
++}
++
++/* The one line a timeout is allowed to print; no register write follows. */
++static bool
++hap_timeout(const char *what, uint32_t seen)
++{
++	/* Exactly one timeout line per probe, whatever path gets here first. */
++	if (!h.dead) {
++		printf("HAKIOS HAPTIC: timed out waiting for %s (0x%x)\n",
++		    what, seen);
++	}
++	h.dead = true;
++	return false;
++}
++
++static void
++wait_ms(unsigned ms)
++{
++	/* XNU delay() counts microseconds. */
++	delay(ms * 1000u);
++}
++
++static void
++gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
++    bool high)
++{
++	uint32_t off = HAP_GPIO(pin);
++	uint32_t cfg = rd(h.tlmm, off);
++	if (out) {
++		wr(h.tlmm, off + 4u,
++		    (rd(h.tlmm, off + 4u) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	wr(h.tlmm, off, cfg);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask, const char *what)
++{
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
++		uint32_t value = rd(base, off);
++
++		if (!(value & mask)) {
++			return true;
++		}
++		if (h.dead || hap_ns() >= until) {
++			return hap_timeout(what, value);
++		}
++		delay(10);
++	}
++	return hap_timeout(what, rd(base, off));
++}
++
++static bool
++haptic_clocks(void)
++{
++	uint32_t dfs = rd(h.gcc, HAP_RCG + 0x14u);
++	uint32_t cfg = rd(h.gcc, HAP_RCG + 4u);
++
++	wr(h.gcc, HAP_GCC_VOTE, rd(h.gcc, HAP_GCC_VOTE) | HAP_GCC_MASK);
++	if (dfs & 1u) {
++		/* SE clock is on DFS performance level 0; require XO/1. */
++		uint32_t level = rd(h.gcc, HAP_RCG + 0x1cu);
++		if ((level & 0x371fu) != 1u) {
++			printf("HAKIOS HAPTIC: wrap1 s5 DFS level0=%#x is not XO/1\n",
++			    level);
++			return false;
++		}
++	} else {
++		/* XO parent 0, divider 1: 19.2 MHz. No PLL/voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		wr(h.gcc, HAP_RCG + 4u, cfg);
++		wr(h.gcc, HAP_RCG, rd(h.gcc, HAP_RCG) | 1u);
++		if (!wait_clear(h.gcc, HAP_RCG, 1u,
++		    "wrap1 s5 RCG update")) {
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x23138, 0x23140, 0x185fc};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		char what[40];
++
++		/* wrap1 s_ahb runs in hardware clock gating and reads halted. */
++		if (branches[i] == 0x18008u &&
++		    (rd(h.gcc, 0x18008u) & (1u << 1))) {
++			continue;
++		}
++		snprintf(what, sizeof(what), "GCC branch %#x halt",
++		    branches[i]);
++		if (!wait_clear(h.gcc, branches[i], 1u << 31, what)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++se_abort(void)
++{
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++	bool acked = false;
++
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
++	wr(h.se, SE_M_CMD_CTRL, 2); /* abort the M command */
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
++		if (rd(h.se, SE_M_IRQ) & (1u << 5)) {
++			acked = true;
++			break;
++		}
++		if (h.dead || hap_ns() >= until) {
++			break;
++		}
++		delay(10);
++	}
++	if (!acked) {
++		/* Leave the bus alone; the probe is already over. */
++		(void)hap_timeout("M command abort", rd(h.se, SE_M_IRQ));
++		return;
++	}
++	for (unsigned i = 0; i < 64 && (rd(h.se, SE_RX_COUNT) & 0x1ffffffu);
++	    ++i) {
++		(void)rd(h.se, SE_RX);
++	}
++	wr(h.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (rd(h.se, SE_TX_COUNT) & 0xfffffffu) {
++		h.dead = true;
++		printf("HAKIOS HAPTIC: TX FIFO not empty after abort\n");
++	}
++}
++
++static bool
++se_init(void)
++{
++	if (hap_expired()) {
++		return hap_timeout("probe budget before SE11 init", 0);
++	}
++	uint32_t fw = rd(h.se, SE_FW);
++	uint32_t tx = rd(h.se, SE_HW_TX), rx = rd(h.se, SE_HW_RX);
++
++	printf("HAKIOS HAPTIC: SE11 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, rd(h.se, SE_STATUS), tx, rx);
++	/* GENI_SE_I2C == 3. Without the ABL-loaded I2C firmware, do not touch. */
++	if (((fw >> 8) & 0xffu) != 3u) {
++		printf("HAKIOS HAPTIC: SE11 is not an I2C engine; nothing touched\n");
++		return false;
++	}
++	if (rd(h.se, SE_STATUS) & 1u) {
++		printf("HAKIOS HAPTIC: SE11 already busy; nothing touched\n");
++		return false;
++	}
++	wr(h.se, SE_GSI_EVENT, 0);
++	wr(h.se, SE_IRQ_ROUTE, 0);          /* no external/GIC routing */
++	wr(h.se, SE_S_IRQ_CLR, 0xffffffffu);
++	wr(h.se, SE_M_IRQ_CLR, 0xffffffffu);
++	wr(h.se, SE_DMA, 0);                /* FIFO mode */
++	wr(h.se, SE_CGC, rd(h.se, SE_CGC) | 0x7fu);
++	wr(h.se, SE_DMA_GEN_CFG, rd(h.se, SE_DMA_GEN_CFG) | 0x0fu);
++	wr(h.se, SE_OUTPUT_CTRL, 0x7fu);
++	wr(h.se, SE_FORCE_DEFAULT, 1);
++	wr(h.se, SE_CLK_SEL, 0);
++	/* 400 kHz: clk_div 2, t_high 7, t_low 10, t_cycle 24 (i2c-geni.c). */
++	wr(h.se, SE_SER_M_CLK, (2u << 4) | 1u);
++	wr(h.se, SE_I2C_SCL, (7u << 20) | (10u << 10) | 24u);
++	wr(h.se, SE_BYTE_GRAN, 0);
++	wr(h.se, SE_M_IRQ_EN, 0x7fu);
++	wr(h.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if ((rd(h.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (rd(h.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		se_abort();
++		if (h.dead) {
++			return false;
++		}
++	}
++	/* Read back the clock programming so a boot log shows it took. */
++	printf("HAKIOS HAPTIC: i2c 400kHz m_clk=%#x scl=%#x clk_sel=%#x\n",
++	    rd(h.se, SE_SER_M_CLK), rd(h.se, SE_I2C_SCL), rd(h.se, SE_CLK_SEL));
++	return true;
++}
++
++/*
++ * One GENI I2C command. `len' bytes from `buf' for a write, or `len' bytes
++ * into `buf' for a read. `stretch' keeps the bus for a repeated START.
++ */
++static int
++i2c_xfer(bool read, const uint8_t *tx, uint8_t *rx, unsigned len, bool stretch)
++{
++	uint32_t cmd = (read ? I2C_READ : I2C_WRITE) << 27;
++	uint32_t param = ((uint32_t)AW_ADDRESS << 9) |
++	    (stretch ? I2C_STOP_STRETCH : 0u);
++	uint32_t stat = 0;
++
++	if (hap_expired() || len == 0 || len > 64) {
++		return EIO;
++	}
++	if (rd(h.se, SE_STATUS) & 1u) {
++		se_abort();
++		return h.dead ? EIO : EBUSY;
++	}
++	wr(h.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (read) {
++		wr(h.se, SE_I2C_RX_LEN, len);
++	} else {
++		wr(h.se, SE_I2C_TX_LEN, len);
++		/* Prefill: the engine starts clocking as soon as the command is
++		 * written, and a small transfer fits the 32-word FIFO. */
++		for (unsigned i = 0; i < len; i += 4) {
++			uint32_t w = 0;
++			for (unsigned b = 0; b < 4 && i + b < len; ++b) {
++				w |= (uint32_t)tx[i + b] << (8 * b);
++			}
++			wr(h.se, SE_TX, w);
++		}
++	}
++	wr(h.se, SE_M_CMD0, cmd | param);
++	uint64_t until = hap_ns() + HAP_POLL_NS;
++	if (until > h.deadline_ns) {
++		until = h.deadline_ns;
++	}
++	for (unsigned i = 0; i < HAP_POLL_ROUNDS; ++i) {
++		stat = rd(h.se, SE_M_IRQ);
++		if (stat & M_ERRORS) {
++			printf("HAKIOS HAPTIC: i2c %s irq=%#x\n",
++			    read ? "read" : "write", stat);
++			wr(h.se, SE_M_IRQ_CLR, stat);
++			se_abort();
++			return EIO;
++		}
++		if (stat & M_DONE) {
++			break;
++		}
++		if (h.dead || hap_ns() >= until) {
++			break;
++		}
++		delay(10);
++	}
++	if (!(stat & M_DONE)) {
++		/* No M_IRQ_CLR, no abort write: the probe is over. */
++		(void)hap_timeout(read ? "i2c read completion" :
++		    "i2c write completion", stat);
++		return EIO;
++	}
++	wr(h.se, SE_M_IRQ_CLR, stat);
++	if (read) {
++		unsigned got = 0;
++		uint32_t count = rd(h.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64u) {
++			count = 64u;
++		}
++		while (got < len && (count-- != 0)) {
++			uint32_t w = rd(h.se, SE_RX);
++			for (unsigned b = 0; b < 4 && got < len; ++b) {
++				rx[got++] = (uint8_t)(w >> (8 * b));
++			}
++		}
++		if (got < len) {
++			printf("HAKIOS HAPTIC: i2c read short %u of %u\n", got, len);
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++static int
++regs_read(uint8_t reg, uint8_t *values, unsigned count)
++{
++	int error = i2c_xfer(false, &reg, NULL, 1, true);
++	if (error) {
++		return error;
++	}
++	return i2c_xfer(true, NULL, values, count, false);
++}
++
++static int
++regs_write(uint8_t reg, const uint8_t *values, unsigned count)
++{
++	uint8_t buf[65];
++	if (count + 1 > sizeof(buf)) {
++		return EINVAL;
++	}
++	buf[0] = reg;
++	for (unsigned i = 0; i < count; ++i) {
++		buf[i + 1] = values[i];
++	}
++	return i2c_xfer(false, buf, NULL, count + 1, false);
++}
++
++static void
++reset_pin(bool high)
++{
++	gpio(HAP_PIN_RESET, 0, 0, 0, true, high);   /* 2 mA, as the vendor */
++	h.released = high;
++}
++
++/* Any timeout ends here: actuator unpowered, nothing else written. */
++static void
++hold_reset(void)
++{
++	if (h.tlmm) {
++		reset_pin(false);
++		h.released = false;
++	}
++}
++
++static bool
++put(uint8_t reg, uint8_t value, uint8_t *back)
++{
++	if (regs_write(reg, &value, 1)) {
++		/* A timeout already printed its one line. */
++		if (!h.dead) {
++			printf("HAKIOS HAPTIC: %#04x <- %#04x NOT ACKNOWLEDGED\n",
++			    reg, value);
++		}
++		return false;
++	}
++	if (regs_read(reg, back, 1)) {
++		if (!h.dead) {
++			printf("HAKIOS HAPTIC: %#04x could not be read back\n",
++			    reg);
++		}
++		return false;
++	}
++	printf("HAKIOS HAPTIC: %#04x <- %#04x, reads %#04x%s\n", reg, value,
++	    *back, *back == value ? "" : " (NOT AS WRITTEN)");
++	return *back == value;
++}
++
++static void
++probe(void)
++{
++	uint8_t id = 0, back = 0, state = 0xff;
++	bool ok = true, was_released;
++
++	h.deadline_ns = hap_ns() + HAP_TOTAL_NS;
++	h.dead = false;
++	h.gcc = ml_io_map(HAP_GCC_PA, 0x60000);
++	h.tlmm = ml_io_map(HAP_TLMM_PA + HAP_TLMM_SOUTH, HAP_TLMM_SIZE);
++	h.se = ml_io_map(HAP_SE_PA, HAP_SE_SIZE);
++	if (!h.gcc || !h.tlmm || !h.se) {
++		printf("HAKIOS HAPTIC: MMIO mapping failed\n");
++		hold_reset();
++		return;
++	}
++	printf("HAKIOS HAPTIC: gpio%u SDA gpio%u SCL gpio%u reset gpio%u int, "
++	    "chip 0x%02x on SE11 0x%x\n", HAP_PIN_SDA, HAP_PIN_SCL,
++	    HAP_PIN_RESET, HAP_PIN_INT, AW_ADDRESS, HAP_SE_PA);
++	if (!haptic_clocks() || !se_init()) {
++		hold_reset();
++		return;
++	}
++	/* I2C pins: function qup11 (mux 1), no pull, as the vendor pinctrl. */
++	gpio(HAP_PIN_SDA, 1, 0, 2, false, false);
++	gpio(HAP_PIN_SCL, 1, 0, 2, false, false);
++	gpio(HAP_PIN_INT, 0, 3, 2, false, false);   /* input, pull-up */
++
++	/* Release reset the way the vendor driver does: low 5 ms, high, ready. */
++	uint32_t cfg = rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET));
++	printf("HAKIOS HAPTIC: reset gpio%u cfg=%#x io=%#x before\n",
++	    HAP_PIN_RESET, cfg, rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET) + 4u));
++	reset_pin(false);
++	wait_ms(5);
++	reset_pin(true);
++	wait_ms(8);
++	printf("HAKIOS HAPTIC: reset gpio%u cfg=%#x io=%#x after (high=released)\n",
++	    HAP_PIN_RESET, rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET)),
++	    rd(h.tlmm, HAP_GPIO(HAP_PIN_RESET) + 4u));
++	if (hap_expired()) {
++		(void)hap_timeout("probe budget before AW8697 read", 0);
++		hold_reset();
++		return;
++	}
++
++	if (regs_read(AW_ID, &id, 1)) {
++		if (h.dead) {
++			goto done;
++		}
++		printf("HAKIOS HAPTIC: nobody answers at 0x%02x (AW8697 held in "
++		    "reset or not powered)\n", AW_ADDRESS);
++		ok = false;
++	} else {
++		printf("HAKIOS HAPTIC: reg0 id=%#04x%s\n", id,
++		    id == 0x97 ? ": AW8697 answers" : ": NOT the AW8697 expected");
++		ok = id == 0x97;
++	}
++	if (ok) {
++		/* The only write: mask interrupts. It cannot start the motor. */
++		ok = put(AW_SYSINTM, 0xff, &back);
++		if (h.dead) {
++			goto done;
++		}
++	}
++	if (ok && !regs_read(AW_GLBRD5, &state, 1)) {
++		if (h.dead) {
++			goto done;
++		}
++		printf("HAKIOS HAPTIC: GLBRD5 %#04x state=%u%s\n", state,
++		    state & 0x0fu, (state & 0x0fu) == 0 ? " (standby)" : "");
++	}
++	if (ok) {
++		uint8_t r[8] = {0};
++		if (!regs_read(0x00, r, sizeof(r))) {
++			if (h.dead) {
++				goto done;
++			}
++			printf("HAKIOS HAPTIC: regs 00-07: %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x\n", r[0], r[1], r[2], r[3], r[4],
++			    r[5], r[6], r[7]);
++		}
++		printf("HAKIOS HAPTIC: AW8697 verified; no waveform was started\n");
++	}
++done:
++	/* Never leave the actuator enabled: hold it in reset again. */
++	was_released = h.released;
++	hold_reset();
++	if (was_released && !h.dead) {
++		printf("HAKIOS HAPTIC: chip held in reset (gpio%u low); done\n",
++		    HAP_PIN_RESET);
++	}
++}
++
++static int haptic_sleep_chan;
++
++static void
++haptic_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 5;
++	uint64_t deadline;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("haptichakiosdelay", &delay_s,
++	    sizeof(delay_s));
++	if (delay_s > 60) {
++		delay_s = 60;
++	}
++	printf("HAKIOS HAPTIC: probe in %u s (haptichakios=1)\n", delay_s);
++	/* Sleep, do not spin: launchd must keep running under the watchdog. */
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&haptic_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	probe();
++	thread_terminate(current_thread());
++}
++
++void
++alioth_haptic_init(void)
++{
++	thread_t thread;
++	uint32_t level = 0;
++
++	if (!PE_parse_boot_argn("haptichakios", &level, sizeof(level)) ||
++	    level == 0) {
++		return;
++	}
++	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("HAKIOS HAPTIC: could not start the probe thread\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/alioth_torch.c b/bsd/dev/alioth_torch.c
+new file mode 100644
+index 0000000..084e02f
+--- /dev/null
++++ b/bsd/dev/alioth_torch.c
+@@ -0,0 +1,506 @@
++/*
++ * ALIOTH FLASHLIGHT (Redmi K40 / POCO F3 / Mi 11X, SM8250-AC): the PM8150L
++ * flash LED module at SPMI SID 5, peripheral 0xd300, channel 0.
++ *
++ * Ported from xiongnemo/hakios-alioth's bsd/dev/hakios.torch.c (their UMI
++ * PM8150L path, which is the same PMIC/register layout alioth's own DTS
++ * declares as qcom,leds@d300). The SPMI transport is this tree's
++ * bsd/dev/sweet_spmi.c: reads there are shared with the battery, and the one
++ * added write path is restricted to SID 5 / 0xd300 through a channel owned
++ * by execution environment 0.
++ *
++ * Default boot is untouched. Boot args:
++ *
++ *   torchstep=1        set the torch ON once at torchma mA (default 125,
++ *                      clamped 25..500) for torchsecs (default 2, 1..30),
++ *                      print every rail/status readback, then OFF.
++ *   torchstep=2        expose /dev/hakios-torch; a 32-bit little-endian write
++ *                      is the wanted current in mA (0 = off). The same mA and
++ *                      time limits apply; after torchmaxs (default 30) it goes
++ *                      dark until a 0 is written and the torch is asked again.
++ *   torchdelay=N       seconds before the one-shot runs (default 5).
++ *
++ * Safety is the point of this driver: every write is read back, only the
++ * module's documented writable registers are touched, the module is checked
++ * for faults and the PM8150L temperature alarm before it is lit, and every
++ * exit path (fault, timeout, run end) attempts all OFF writes even if an ON
++ * write failed. The light is never left on by the boot arg: torchstep=1
++ * always turns it off after torchsecs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern kern_return_t thread_terminate(thread_t);
++
++void alioth_torch_init(void);
++
++#define TORCH_SID        5u
++#define TORCH_BASE       0xd300u
++#define TORCH_ADDR(reg)  (TORCH_BASE | (unsigned)(reg))
++#define ALARM_SID        4u
++#define ALARM_BASE       0x2400u
++#define ALARM_ADDR(reg)  (ALARM_BASE | (unsigned)(reg))
++
++#define FLASH_REVISION1  0x00u
++#define FLASH_TYPE       0x04u
++#define FLASH_SUBTYPE    0x05u
++#define FLASH_STATUS1    0x08u
++#define FLASH_STATUS2    0x09u
++#define FLASH_INT_RT_STS 0x10u
++#define FLASH_SAFETY0    0x40u
++#define FLASH_ITARGET0   0x43u
++#define FLASH_MODULE_EN  0x46u
++#define FLASH_IRESOLUTION 0x47u
++#define FLASH_STROBE0    0x49u
++#define FLASH_EN_LED     0x4cu
++#define FLASH_HDRM_AUTO  0x50u
++#define FLASH_ISC_DELAY  0x52u
++
++#define ALARM_SUBTYPE    0x05u
++#define ALARM_STATUS     0x08u
++
++#define IRES_UA          12500u    /* qcom,ires-ua */
++#define TORCH_MIN_MA     25u
++#define TORCH_MAX_MA     500u      /* stock allows 500 per channel */
++#define TORCH_DEFAULT_MA 125u      /* Android's torch level */
++#define TORCH_MAX_S      30u
++#define HOT_BATTERY_C    45
++
++static volatile uint32_t wanted;   /* mA asked for through /dev/hakios-torch */
++static uint32_t max_seconds = TORCH_MAX_S;
++static bool broken, lit, configured;
++static unsigned wrote;
++
++/* Only these module registers may be written (the vendor driver's set). */
++static const uint8_t writable[] = {
++	FLASH_SAFETY0, FLASH_SAFETY0 + 1, FLASH_ITARGET0, FLASH_ITARGET0 + 1,
++	FLASH_MODULE_EN, FLASH_IRESOLUTION, FLASH_HDRM_AUTO, FLASH_ISC_DELAY,
++	FLASH_STROBE0, FLASH_STROBE0 + 1, FLASH_EN_LED,
++};
++
++static bool
++get(uint8_t reg, uint8_t *value)
++{
++	if (sweet_spmi_read(TORCH_SID, TORCH_ADDR(reg), value)) {
++		printf("HAKIOS TORCH: reading %#04x failed\n", reg);
++		return false;
++	}
++	return true;
++}
++
++static bool
++put(uint8_t reg, uint8_t value)
++{
++	uint8_t back = 0xff;
++	bool allowed = false;
++
++	for (unsigned i = 0; i < sizeof(writable); ++i) {
++		allowed |= writable[i] == reg;
++	}
++	if (!allowed) {
++		printf("HAKIOS TORCH: refusing to write non-module register %#04x\n",
++		    reg);
++		return false;
++	}
++	if (broken) {
++		return false;
++	}
++	if (sweet_spmi_write(TORCH_SID, TORCH_ADDR(reg), value)) {
++		printf("HAKIOS TORCH: %#04x <- %#04x NOT ACKNOWLEDGED\n", reg,
++		    value);
++		broken = true;
++		return false;
++	}
++	wrote++;
++	if (get(reg, &back) || back != value) {
++		printf("HAKIOS TORCH: %#04x <- %#04x reads %#04x (NOT AS WRITTEN)\n",
++		    reg, value, back);
++		broken = true;
++		return false;
++	}
++	return true;
++}
++
++/* OFF writes must still be attempted after a failed ON transaction. */
++static bool
++off_put(uint8_t reg, uint8_t value)
++{
++	bool was = broken;
++	broken = false;
++	bool ok = put(reg, value);
++	broken |= was;
++	return ok;
++}
++
++static bool
++put_bits(uint8_t reg, uint8_t mask, uint8_t value)
++{
++	uint8_t now;
++	if (!get(reg, &now)) {
++		return false;
++	}
++	return (now & mask) == (value & mask) ||
++	    put(reg, (uint8_t)((now & ~mask) | (value & mask)));
++}
++
++static bool
++dark(void)
++{
++	bool ok = true;
++	ok &= off_put(FLASH_EN_LED, 0x00);
++	ok &= off_put(FLASH_MODULE_EN, 0x00);
++	ok &= off_put(FLASH_ITARGET0, 0x00);
++	ok &= off_put(FLASH_SAFETY0, 0x13);
++	lit = !ok && lit;
++	return ok;
++}
++
++static unsigned
++alarm_stage(void)
++{
++	uint8_t subtype = 0, status = 0;
++
++	if (sweet_spmi_read(ALARM_SID, ALARM_ADDR(ALARM_SUBTYPE), &subtype) ||
++	    sweet_spmi_read(ALARM_SID, ALARM_ADDR(ALARM_STATUS), &status)) {
++		return 0xffu;
++	}
++	return subtype == 0x08u ? (status & 0x03u) : ((status >> 4) & 0x07u);
++}
++
++/* Fault / overtemperature / low-supply guard. Returns a reason or NULL. */
++static const char *
++trouble(void)
++{
++	static char why[128];
++	uint8_t rt = 0, s1 = 0, s2 = 0;
++	unsigned stage = alarm_stage();
++
++	if (!get(FLASH_INT_RT_STS, &rt) || !get(FLASH_STATUS1, &s1) ||
++	    !get(FLASH_STATUS2, &s2)) {
++		return "a flag read failed";
++	}
++	if ((rt & 0x01u) || s1 != 0 || (s2 & 0x13u) || stage != 0u) {
++		snprintf(why, sizeof(why),
++		    "fault rt=%#04x s1=%#04x s2=%#04x alarm_stage=%u", rt, s1, s2,
++		    stage);
++		return why;
++	}
++	return NULL;
++}
++
++static void
++show(const char *when)
++{
++	uint8_t rev = 0, type = 0, subtype = 0, rt = 0, s1 = 0, s2 = 0;
++	uint8_t mod = 0, chan = 0, target = 0, ires = 0, alarm_sub = 0;
++	uint8_t alarm = 0;
++
++	(void)get(FLASH_REVISION1, &rev);
++	(void)get(FLASH_TYPE, &type);
++	(void)get(FLASH_SUBTYPE, &subtype);
++	(void)get(FLASH_INT_RT_STS, &rt);
++	(void)get(FLASH_STATUS1, &s1);
++	(void)get(FLASH_STATUS2, &s2);
++	(void)get(FLASH_MODULE_EN, &mod);
++	(void)get(FLASH_EN_LED, &chan);
++	(void)get(FLASH_ITARGET0, &target);
++	(void)get(FLASH_IRESOLUTION, &ires);
++	(void)sweet_spmi_read(ALARM_SID, ALARM_ADDR(ALARM_SUBTYPE), &alarm_sub);
++	(void)sweet_spmi_read(ALARM_SID, ALARM_ADDR(ALARM_STATUS), &alarm);
++	printf("HAKIOS TORCH: %s: type=%#04x subtype=%#04x rev=%#04x "
++	    "rt=%#04x s1=%#04x s2=%#04x en=%#04x ch=%#04x itarget=%u ires=%#04x "
++	    "alarm=%#04x/%#04x stage=%#x\n", when, type, subtype, rev, rt, s1, s2,
++	    mod, chan, target, ires, alarm_sub, alarm, alarm_stage());
++}
++
++static bool
++configure(void)
++{
++	if (configured) {
++		return true;
++	}
++	/*
++	 * Android resets headroom auto mode and sets the inrush/short-detection
++	 * delay to 192 us; the ABL leaves the delay at zero. Apply both before
++	 * either channel can be enabled.
++	 */
++	if (!put(FLASH_HDRM_AUTO, 0x00) ||
++	    !put_bits(FLASH_ISC_DELAY, 0x03u, 0x03u) ||
++	    !put_bits(FLASH_STROBE0, 0x04u, 0x00u) ||
++	    !put(FLASH_SAFETY0, 0x13u)) {
++		return false;
++	}
++	configured = true;
++	return true;
++}
++
++static bool
++light(unsigned ma)
++{
++	if (ma < TORCH_MIN_MA) {
++		ma = TORCH_MIN_MA;
++	}
++	if (ma > TORCH_MAX_MA) {
++		ma = TORCH_MAX_MA;
++	}
++	unsigned code = (ma + IRES_UA / 2000u) / (IRES_UA / 1000u) - 1u;
++	if (code > 39u) {
++		code = 39u;
++	}
++	const char *why = trouble();
++	if (why != NULL) {
++		printf("HAKIOS TORCH: not lit: %s\n", why);
++		(void)dark();
++		return false;
++	}
++	if (!configure() ||
++	    !put_bits(FLASH_IRESOLUTION, 0x03u, 0x00u) ||
++	    !put_bits(FLASH_ITARGET0, 0x7fu, (uint8_t)code)) {
++		(void)dark();
++		return false;
++	}
++	if (!lit) {
++		lit = true; /* even a failed ON is rolled back */
++		if (!put(FLASH_MODULE_EN, 0x80u) ||
++		    !put_bits(FLASH_EN_LED, 0x07u, 0x01u)) {
++			(void)dark();
++			return false;
++		}
++	}
++	return true;
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static int torch_sleep_chan;
++
++static void
++wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	/* Sleep, do not spin: a 30 s light must not hold a CPU busy. */
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&torch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* /dev/hakios-torch: a 32-bit little-endian mA value; 0 is off. */
++static int
++torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t value;
++	int error;
++
++	while (uio_resid(uio) >= (user_ssize_t)sizeof(value)) {
++		if ((error = uiomove((caddr_t)&value, sizeof(value), uio)) != 0) {
++			return error;
++		}
++		wanted = value > TORCH_MAX_MA ? TORCH_MAX_MA : value;
++	}
++	return 0;
++}
++
++static int
++torch_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t value = lit ? wanted : 0;
++	return uiomove((caddr_t)&value,
++	    (int)MIN(sizeof(value), (size_t)uio_resid(uio)), uio);
++}
++
++static int
++torch_open(__unused dev_t dev, __unused int flags, __unused int type,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw torch_cdevsw = {
++	.d_open = torch_open, .d_close = torch_open, .d_read = torch_read,
++	.d_write = torch_write, .d_ioctl = eno_ioctl, .d_stop = eno_stop,
++	.d_reset = eno_reset, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++serve(void)
++{
++	uint32_t applied = 0, times = 0, cut = 0;
++	uint64_t since = 0, last_look = 0;
++	bool waiting_for_off = false;
++	int major = cdevsw_add(-1, &torch_cdevsw);
++
++	if (major < 0 ||
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL,
++	    0666, "hakios-torch") == NULL) {
++		printf("HAKIOS TORCH: /dev/hakios-torch cannot be made\n");
++		return;
++	}
++	printf("HAKIOS TORCH: /dev/hakios-torch ready (write mA, 0=off; at most "
++	    "%u mA, %u s at a time)\n", TORCH_MAX_MA, max_seconds);
++	while (!broken) {
++		uint32_t want = wanted;
++		uint64_t now = now_ms();
++
++		if (want == 0) {
++			waiting_for_off = false;
++		}
++		if (waiting_for_off) {
++			want = 0;
++		}
++		if (want != applied) {
++			if (want == 0 ? dark() : light(want)) {
++				if (applied == 0) {
++					since = now;
++					times++;
++				}
++				applied = want;
++				show(want == 0 ? "off" : "on");
++			} else {
++				break;
++			}
++		}
++		if (applied != 0 && now - since >= max_seconds * 1000ull) {
++			cut++;
++			printf("HAKIOS TORCH: on for %u s (limit); off until 0 is "
++			    "written again\n", max_seconds);
++			waiting_for_off = true;
++			if (!dark()) {
++				break;
++			}
++			applied = 0;
++			continue;
++		}
++		if (applied != 0 && now - last_look >= 100) {
++			const char *why;
++			last_look = now;
++			if ((why = trouble()) != NULL) {
++				printf("HAKIOS TORCH: OFF: %s\n", why);
++				(void)dark();
++				break;
++			}
++		}
++		wait_ms(20);
++	}
++	if (lit) {
++		(void)dark();
++	}
++	printf("HAKIOS TORCH: light given up (%u times lit, %u cut at %u s)\n",
++	    times, cut, max_seconds);
++}
++
++static void
++one_shot(unsigned ma, unsigned seconds)
++{
++	printf("HAKIOS TORCH: one-shot ON at %u mA for %u s\n", ma, seconds);
++	if (!light(ma)) {
++		printf("HAKIOS TORCH: the module did not light\n");
++		show("after failed ON");
++		return;
++	}
++	wait_ms(50);
++	show("50 ms after ON");
++	wait_ms(seconds * 1000u);
++	const char *why = trouble();
++	if (why != NULL) {
++		printf("HAKIOS TORCH: OFF early: %s\n", why);
++	}
++	if (dark()) {
++		printf("HAKIOS TORCH: off after %u s; %u writes, all read back\n",
++		    seconds, wrote);
++	} else {
++		printf("HAKIOS TORCH: OFF WRITES FAILED; try holding power\n");
++	}
++	show("after OFF");
++}
++
++static void
++torch_thread(void *arg, wait_result_t result)
++{
++	uint32_t step = 1, ma = TORCH_DEFAULT_MA, seconds = 2, delay_s = 5;
++	unsigned level = (unsigned)(uintptr_t)arg;
++
++	(void)result;
++	(void)PE_parse_boot_argn("torchma", &ma, sizeof(ma));
++	(void)PE_parse_boot_argn("torchsecs", &seconds, sizeof(seconds));
++	(void)PE_parse_boot_argn("torchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("torchmaxs", &max_seconds,
++	    sizeof(max_seconds));
++	(void)PE_parse_boot_argn("torchstep", &step, sizeof(step));
++	if (seconds < 1 || seconds > TORCH_MAX_S) {
++		seconds = seconds < 1 ? 1 : TORCH_MAX_S;
++	}
++	if (max_seconds < 1 || max_seconds > TORCH_MAX_S) {
++		max_seconds = max_seconds < 1 ? 1 : TORCH_MAX_S;
++	}
++	if (delay_s > 60) {
++		delay_s = 60;
++	}
++	printf("HAKIOS TORCH: starting in %u s (torchstep=%u)\n", delay_s, step);
++	wait_ms(delay_s * 1000u);
++	if (sweet_spmi_init() != 0) {
++		printf("HAKIOS TORCH: SPMI unavailable; nothing touched\n");
++		thread_terminate(current_thread());
++	}
++	/*
++	 * Identify the module before showing or writing anything. alioth's
++	 * PM8150L slot answers type=0x18 subtype=0x0000, not the UMI's
++	 * 0x18/0x0004: never touch that module. One line, then done.
++	 */
++	uint8_t type = 0, subtype = 0;
++	if (get(FLASH_TYPE, &type) || get(FLASH_SUBTYPE, &subtype) ||
++	    type != 0x18u || subtype != 0x04u) {
++		printf("HAKIOS TORCH: type=%#04x subtype=%#04x is not the "
++		    "PM8150L flash module; nothing written, light stays off\n",
++		    type, subtype);
++		lit = false;
++		wanted = 0;
++		thread_terminate(current_thread());
++	}
++	show("module before");
++	if (level == 1) {
++		one_shot(ma, seconds);
++	} else {
++		serve();
++	}
++	thread_terminate(current_thread());
++}
++
++void
++alioth_torch_init(void)
++{
++	thread_t thread;
++	uint32_t step = 0;
++
++	if (!PE_parse_boot_argn("torchstep", &step, sizeof(step)) || step == 0) {
++		return;
++	}
++	if (step > 2) {
++		step = 2;
++	}
++	if (kernel_thread_start(torch_thread, (void *)(uintptr_t)step,
++	    &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("HAKIOS TORCH: could not start the torch thread\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 29ae886..208e286 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -97,8 +97,13 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool alioth_block = sid == 2 &&
+ 	    (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
+ 	    peripheral == 0x13 || peripheral == 0x40 || peripheral == 0x41);
++	/* alioth's PM8150L flash module (SID 5, 0xd300), read side only here;
++	 * writes go through sweet_spmi_write() below. The PM8150L temperature
++	 * alarm (SID 4, 0x2400) is read as the torch's thermal guard. */
++	bool flash_block = sid == 5 && peripheral == 0xd3;
++	bool alarm_block = sid == 4 && peripheral == 0x24;
+ 	if (!sp_ready || !out || addr > 0xffffu ||
+-	    (!sweet_block && !alioth_block)) {
++	    (!sweet_block && !alioth_block && !flash_block && !alarm_block)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -131,4 +136,95 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * One-byte PMIC write. Deliberately narrow: only alioth's PM8150L flash
++ * module (SID 5, peripheral 0xd3), only through a channel whose owner is
++ * execution environment 0, and only one byte per transfer. The torch driver
++ * checks the register list; this function is the last gate before a PMIC
++ * register changes.
++ *
++ * The arbiter's write channels live at 0x0c600000 + 0x10000 * APID. The
++ * channel is mapped once and reused. A dropped transfer (the button driver
++ * sees those from time to time) is retried twice; any other error is fatal
++ * for this lane (poisoned, like a timed-out read).
++ */
++#define SP_CHNLS_PA 0x0c600000u
++#define SP_STATUS_DONE    0x1u
++#define SP_STATUS_FAILURE 0x2u
++#define SP_STATUS_DENIED  0x4u
++#define SP_STATUS_DROPPED 0x8u
++
++static vm_offset_t sp_wr;
++static uint16_t sp_wr_apid = SP_NO_APID;
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	unsigned peripheral = addr >> 8;
++	if (!sp_ready || sid != 5 || peripheral != 0xd3 || addr > 0xffffu) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	/* Find a channel for SID5/0xd3 that belongs to our execution env. */
++	uint16_t apid = SP_NO_APID;
++	for (unsigned i = 0; i < sp_count; ++i) {
++		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != ((sid << 8) | peripheral)) {
++			continue;
++		}
++		if ((sp_rd(sp_cfg, 0x700u + 4u * i) & 7u) == 0u) {
++			apid = (uint16_t)i;
++			break;
++		}
++	}
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	if (sp_wr == 0 || sp_wr_apid != apid) {
++		/* One channel is enough: the flash module's. */
++		sp_wr = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++		sp_wr_apid = apid;
++	}
++	if (!sp_wr) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	uint32_t cmd = ((addr & 0xffu) << 4); /* write long, one byte */
++	int result = -1;
++	for (unsigned tries = 0; tries < 3; ++tries) {
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(sp_wr + 0x10) = value;
++		*(volatile uint32_t *)(sp_wr + 0x00) = cmd;
++		__asm__ volatile("dsb osh" ::: "memory");
++		uint32_t status = 0;
++		unsigned waited;
++		for (waited = 0; waited < 1000; ++waited) {
++			status = sp_rd(sp_wr, 0x08u);
++			if (status & SP_STATUS_DONE) {
++				break;
++			}
++			delay(1);
++		}
++		if (!(status & SP_STATUS_DONE)) {
++			sp_poisoned[apid] = true;
++			printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u\n",
++			    sid, addr, apid);
++			break;
++		}
++		if (status & (SP_STATUS_FAILURE | SP_STATUS_DENIED)) {
++			printf("SWEET SPMI: write refused(%#x) sid=%u addr=%#x\n",
++			    status, sid, addr);
++			break;
++		}
++		if (status & SP_STATUS_DROPPED) {
++			continue; /* not made: ask again */
++		}
++		result = 0;
++		break;
++	}
++	IOLockUnlock(sp_lock);
++	return result;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..2b1df07 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,10 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* One-byte write, thread context only; only the PM8150L flash module
++ * (SID 5, 0xd300) and only through a channel owned by execution
++ * environment 0. 0 success, -1 failure. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 10e43f4..d95935c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,6 +59,8 @@ extern void hakios_adreno_init(void);
+ extern void hakios_usb_init(void);
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
++extern void alioth_haptic_init(void);
++extern void alioth_torch_init(void);
+ extern bool alioth_board(void);
+ 
+ #define REG_CAP         0x00
+@@ -678,6 +680,24 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	/* Adreno 650 phase-1 probe; does nothing without boot-arg sweetgpu=N. */
+ 	sweet_gpu_init();
++	/*
++	 * alioth self-contained extras, each off unless its own boot arg is
++	 * present: haptichakios=1 (AW8697 probe) and torchstep=1|2 (PM8150L
++	 * flashlight). Both only ever run on the alioth board.
++	 */
++	if (alioth_board()) {
++		uint32_t haptichakios = 0;
++		uint32_t torchstep = 0;
++
++		if (PE_parse_boot_argn("haptichakios", &haptichakios,
++		    sizeof(haptichakios)) && haptichakios != 0) {
++			alioth_haptic_init();
++		}
++		if (PE_parse_boot_argn("torchstep", &torchstep,
++		    sizeof(torchstep)) && torchstep != 0) {
++			alioth_torch_init();
++		}
++	}
+ 	/*
+ 	 * xiongnemo/hakios-alioth's USB stack (hakios-port-usb), opt-in only:
+ 	 * without usbhakios=1 the default boot is unchanged.

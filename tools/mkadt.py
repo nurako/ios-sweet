@@ -168,6 +168,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', gpu_props=()):
 
     chosen = node('chosen', [
         ph(),
+        # xiongnemo/hakios-alioth's board driver asks /chosen for this and
+        # compares exactly 7 bytes with "alioth" (bsd/dev/hakios.board.c
+        # hakios_board_is_alioth(): size == 7 && memcmp(..., "alioth", 7)).
+        # Seven bytes means the terminating NUL is included, so cstr() is
+        # required. It selects the K40's 370/470/570/670 MHz GPU table and
+        # the 2400-line panel instead of the UMI defaults.
+        *([('hakios-board', cstr('alioth'))] if board == 'alioth' else []),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),

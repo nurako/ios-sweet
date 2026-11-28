@@ -1,0 +1,321 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,19 @@
+ bsd/dev/hakios.input.c		standard
+ bsd/dev/hakios.virtio_input.c	standard
+ bsd/dev/hakios.goodix.c	standard
++bsd/dev/umi_touch.c		standard
++bsd/dev/umi_keys.c		standard
++bsd/dev/umi_rpmh.c		standard
++bsd/dev/umi_touch_boost.c		standard
++bsd/dev/umi_wifi.c		standard
++bsd/dev/umi_bluetooth.c		standard
++bsd/dev/umi_mhi.c		standard
++bsd/dev/umi_pcie.c		standard
++bsd/dev/umi_camera.c		standard
++bsd/dev/umi_camera_dma.c		standard
++bsd/dev/hakios.usb.c		standard
++bsd/dev/hakios.dwc3.c		standard
++bsd/dev/hakios.slpi.c		standard
+ bsd/dev/hakios.buttons.c	standard
+ bsd/dev/hakios.battery.c	standard
+ bsd/dev/hakios.ufs.c	standard
+@@ -639,3 +650,11 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++
++# Xiaomi Mi 10 device overlay support
++bsd/dev/hakios.board.c standard
++bsd/dev/hakios.thermal.c standard
++bsd/dev/hakios.display.c standard
++bsd/dev/alioth_dsi.c standard
++bsd/dev/alioth_mdm.c standard
++bsd/dev/alioth_mhi.c standard
+--- a/bsd/conf/Makefile.arm64
++++ b/bsd/conf/Makefile.arm64
+@@ -1,3 +1,7 @@
++# Camera probe runs on a kernel thread without a userspace SIMD context.
++umi_camera.o_CFLAGS_ADD += -mgeneral-regs-only
++umi_camera_dma.o_CFLAGS_ADD += -mgeneral-regs-only
++
+ ######################################################################
+ #BEGIN  Machine dependent Makefile fragment for arm
+ ######################################################################
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -149,6 +149,7 @@
+ #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
+ #include <sys/hakios.input.h>
+ #include <sys/hakios.audio.h>
++#include <sys/hakios.bluetooth.h>
+ #include <sys/hakios.virtio_blk.h>
+ #include <sys/hakios.sparse.h>
+ #if APFS
+@@ -985,6 +986,7 @@
+ 		devfs_kernel_mount(mounthere);
+ 		hakios_input_init();           /* /dev/hakios-touch */
+ 		hakios_audio_init();           /* /dev/hakios-audio */
++		umi_bluetooth_init();      /* explicit UMI transport diagnostic */
+ 		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
+ 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
+ #if APFS
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -66,12 +66,15 @@
+ Kasan_EXPORTS := $(SRCROOT)/config/Kasan_enabled.$(KASAN_ARCH_SUFFIX).exports
+ endif
+ 
++# UMI links a device-specific subset of the XNU exports. Emit only symbols present
++# in this kernel so each generated kext symbol set matches the linked image.
+ define symbol_set_template
+ $(1)_EXPORTS := $$(addprefix $$(SOURCE)/,$$(filter $(1)%,$$(EXPORTS_FILES)))
+ $$(TARGET)/$(1).symbolset: MY_EXPORTS_ARGS := $$(foreach file,$$($(1)_EXPORTS),-export $$(file))
+ $$(TARGET)/$(1).symbolset: $$($(1)_EXPORTS) $$(TARGET)/allsymbols $$(KEXT_CREATE_SYMBOL_SET)
+ 	@$$(LOG_SYMBOLSET) "$(1)$$(Color0) ($$(ColorLF)$$(CURRENT_ARCH_CONFIG_LC)$$(Color0))"
+ 	$$(_v)$$(KEXT_CREATE_SYMBOL_SET)			\
++		-sect					\
+ 		$$(ARCH_FLAGS_$$(CURRENT_ARCH_CONFIG))	\
+ 		-import $$(TARGET)/allsymbols		\
+ 		$$(MY_EXPORTS_ARGS)			\
+@@ -119,19 +122,21 @@
+ 
+ check_all_exports: $(TARGET)/allsymbols $(KEXT_CREATE_SYMBOL_SET)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Private,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Unsupported,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 
+ $(OBJPATH)/$(MD_SUPPORTED_KPI_FILENAME): $(EXPORTS_FILES)
+ 	@$(LOG_SUPPORTED_KPI) "$(CURRENT_ARCH_CONFIG_LC)"
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -87,6 +87,9 @@
+ iokit/Kernel/hakios.battery.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
++iokit/Kernel/hakios.bluetooth.cpp			optional iokitcpp
++iokit/Kernel/hakios.usbmux.cpp			optional iokitcpp
++iokit/Kernel/hakios.sensors.cpp			optional iokitcpp
+ iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
+ 
+ iokit/Kernel/IOCPU.cpp					optional iokitcpp
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -394,4 +394,4 @@
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	panic("Unhandled implementation specific error ESR=%#x FAR=%p PC=%p",
++	    esr, (void *)far, (void *)get_saved_state_pc(state));
+ }
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,8 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/* Qualcomm peripherals use permanent mappings for PCIe, GPU and audio. */
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -82,3 +83,11 @@
++/* UMI camera diagnostics must not overrun the permanent MMIO window. */
++uint64_t umi_camera_iomap_free(void);
++uint64_t
++umi_camera_iomap_free(void)
++{
++	return io_submap && io_submap->size < IO_MAP_SIZE ? IO_MAP_SIZE - io_submap->size : 0;
++}
++
+ /*
+  * Allocate and map memory for devices that may need to be mapped before
+  * Mach VM is running. Allows caller to specify mapping protection
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -107,3 +107,4 @@
+ osfmk/arm64/generic_arm64_support.c	optional nos_arm_asm
+ osfmk/arm64/loader_return.c	optional nos_arm_asm
++osfmk/arm64/hakios_prof.c	optional nos_arm_asm
+ osfmk/arm64/user_exception_trace.c	standard
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5699,6 +5699,23 @@
+ SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
+     "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+ 
++/*
++ * (redmi-k40) A NAME "*SUFFIX" in kern.exec_inject names every program whose directory's name ends in SUFFIX:
++ * "*.app" and "*.appex" are all the applications and their extensions, which RunningBoard starts from wherever
++ * they were installed. The path is the one looked up, its last component the program's file name.
++ */
++static bool
++exec_inject_in_bundle(struct image_params *imgp, const char *suffix, size_t length)
++{
++	const char *start = imgp->ip_ndp->ni_cnd.cn_pnbuf;
++	const char *name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++
++	if (start == NULL || name == NULL || length == 0 || name < start + length + 1 || name[-1] != '/') {
++		return false;
++	}
++	return strncmp(name - 1 - length, suffix, length) == 0;
++}
++
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5734,6 +5751,10 @@
+ 			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
+ 			    strncmp(word, name, namelen) == 0) {
+ 				matched = true;         /* this group names this program; its library is added once */
++			}
++			if (!matched && liblen != 0 && p - word > 1 && word[0] == '*' &&
++			    exec_inject_in_bundle(imgp, word + 1, (size_t)(p - word) - 1)) {
++				matched = true;         /* (redmi-k40) "*.app": a program in such a bundle */
+ 			}
+ 		}
+ 		if (matched && liblen != 0 && used + 1 + liblen < size) {
+@@ -5948,6 +5969,53 @@
+ 		}
+ 		imgp->ip_argspace -= new_ptr_size;
+ 		imgp->ip_envc++;
++	}
++	/*
++	 * (redmi-k40) ... and for everybody what the boot-arg exec_env=NAME=VALUE[,NAME=VALUE...] says:
++	 * CA_FRAME_RATE_POLICY=2, by which CoreAnimation gives an iPhone with this 120 Hz panel the default
++	 * frame rates of the iPads' (80-120 Hz, not 60-80) in every program, applications that
++	 * RunningBoard starts included, where no launchd plist reaches. A program's own value comes
++	 * first in its environment and wins.
++	 */
++	{
++		static char exec_env[256];
++		static int exec_env_parsed;
++		const char *p;
++
++		if (!exec_env_parsed) {
++			if (!PE_parse_boot_arg_str("exec_env", exec_env, sizeof(exec_env))) {
++				exec_env[0] = 0;
++			}
++			exec_env_parsed = 1;
++		}
++		for (p = exec_env; *p != 0;) {
++			char one[128];
++			size_t n = 0;
++
++			while (*p != 0 && *p != ',' && n < sizeof(one) - 1) {
++				one[n++] = *p++;
++			}
++			one[n] = 0;
++			while (*p != 0 && *p != ',') {
++				p++;
++			}
++			if (*p == ',') {
++				p++;
++			}
++			if (n == 0 || strchr(one, '=') == NULL) {
++				continue;
++			}
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(one), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
+ 	}
+ 
+ 	/* Save space for envv[] NULL terminator */
+diff --git a/bsd/netinet/tcp_usrreq.c b/bsd/netinet/tcp_usrreq.c
+--- a/bsd/netinet/tcp_usrreq.c
++++ b/bsd/netinet/tcp_usrreq.c
+@@ -2076,6 +2076,8 @@
+ 	return 0;
+ }
+ 
++extern int hakios_usb_mux_pid(void);   /* (redmi-k40) bsd/dev/hakios.usb.c: -1 unless usb=3 has a mux */
++
+ static int
+ tcp_lookup_peer_pid_locked(struct socket *so, pid_t *out_pid)
+ {
+@@ -2112,6 +2114,15 @@
+ 
+ 	if (finp) {
+ 		*out_pid = finp->inp_socket->last_pid;
++		/*
++		 * (redmi-k40) usb=3: an iPhone's USB mux is in its kernel (AppleUSBDeviceMux); this phone's is a program
++		 * (/redwood/bin/usbmux), and lockdownd takes a connection from 127.0.0.1 for one over USB only when its
++		 * peer is the kernel (pid 0; else "non kernel peer ... Peer is unsafe."). The process holding the iPhone
++		 * port (bsd/dev/hakios.usb.c) is that mux: it is said to be the kernel here, and only it.
++		 */
++		if (*out_pid > 0 && *out_pid == hakios_usb_mux_pid()) {
++			*out_pid = 0;
++		}
+ 		error = 0;
+ 		in_pcb_checkstate(finp, WNT_RELEASE, 0);
+ 	}
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3322,6 +3322,19 @@
+ 
+ 		void* osent = csblob_os_entitlements_get(blob);
+ 		if (!osent) {
++			/*
++			 * (redmi-k40) No AMFI has made the entitlements an object here (libkern/amfi/miniamfi.c): the
++			 * XML entitlements of the signature itself, its hash checked against the code directory, as
++			 * csops answered before AMFI did. Without them a program asking for another's entitlements the
++			 * Security framework's way got nothing (remotepairingdeviced refused lockdownd, which then refused
++			 * to pair, 2026-10-30).
++			 */
++			void *xml = NULL;
++			size_t xml_length = 0;
++
++			if (csblob_get_entitlements(blob, &xml, &xml_length) == 0 && xml != NULL && xml_length != 0) {
++				error = csops_copy_token(xml, xml_length, usize, uaddr);
++			}
+ 			goto out;
+ 		}
+ 		CS_GenericBlob* xmlblob = NULL;
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffb..a3b162e 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2163,12 +2163,11 @@ STATIC int
+ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+-	int error;
+-	char buf[BOOT_LINE_LENGTH];
+-
+-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+-	return error;
++	/*
++	 * (redmi-k40) all of a line longer than boot_args' BOOT_LINE_LENGTH, from the device tree (pexpert/arm/
++	 * pe_bootargs.c): straight from PE_boot_args(), which is never written after the boot -- read only (size 0)
++	 */
++	return sysctl_io_string(req, PE_boot_args(), 0, 0, NULL);
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, bootargs,

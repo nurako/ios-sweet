@@ -1,0 +1,1076 @@
+/*
+ * usbsh: commands from the computer over the phone's USB serial port (the kernel's /dev/hakios-usb,
+ * boot-arg usb=2: bsd/dev/hakios.usb.c), run on iOS, their output sent back.
+ *
+ * The port carries the kernel's log until the computer types something; then the log pauses and
+ * what is typed comes here, a line at a time (echoed, with backspace). A line is a built-in or a
+ * program with its arguments ("quotes" keep spaces): a name without a slash is looked for in
+ * /redwood/bin, /usr/bin, /bin, /usr/sbin, /sbin, /usr/libexec. Its standard output and error come
+ * back as it writes them; Ctrl-C interrupts it (twice: kills it). "log" gives the port back to the
+ * log, until the next thing typed. Started by launchd at boot (com.hakios.usbsh); without usb=2
+ * there is no port and it ends at once.
+ *
+ * "usbsh -l PORT" (test images only: rc.jobs): the same over TCP on the phone's Wi-Fi, for a computer
+ * that has the USB link busy with the loader (screenshots). A connection's first line must be the
+ * token in /redwood/fw/netsh-token, else it is closed; one connection at a time.
+ */
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#if __has_include(<sys/reboot.h>)
+#include <sys/reboot.h>
+#else
+/* The iPhoneOS SDK has no sys/reboot.h; libSystem still exports reboot(2). */
+#define RB_AUTOBOOT     0
+#define RB_HALT         0x0008
+extern int reboot(int);
+#endif
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define HAKIOS_USB_LOG  _IO('u', 1)     /* (bsd/dev/hakios.usb.c) */
+/*
+ * HAKIOS_USB_RESTART: mode 0 normal, 1 fastboot, 2 recovery. The kernel writes the board's
+ * IMEM restart_reason and runs its clean shutdown, so the phone comes back in that mode.
+ */
+#define HAKIOS_USB_RESTART      _IOW('u', 6, int)
+
+extern char **environ;
+
+/* csops(2): what the kernel says of a process's code signature (sys/codesign.h) */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define CS_OPS_STATUS                   0
+#define CS_OPS_ENTITLEMENTS_BLOB        7
+#define CS_OPS_DER_ENTITLEMENTS_BLOB    16
+
+/* libproc (libSystem exports it; the iOS SDK has no header): the kernel's message buffer, oldest first; 0 on failure */
+extern int proc_kmsgbuf(void *buffer, uint32_t buffersize);
+
+static int port = -1;
+static int talking;                     /* the computer has typed since the log last had the port */
+static int network;                     /* -l: port is a TCP connection ("log" ends it) */
+static int hang_up;
+static int leave_shell;                 /* the USB shell's "log": close and wait for the next request */
+static char cwd[1024] = "/";
+
+/* To the port, '\n' as "\r\n" (a terminal on the other side). */
+static void
+out_bytes(const char *p, size_t n)
+{
+	char buf[1024];
+	size_t m = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		if (p[i] == '\n') {
+			buf[m++] = '\r';
+		}
+		buf[m++] = p[i];
+		if (m >= sizeof(buf) - 2) {
+			(void)write(port, buf, m);
+			m = 0;
+		}
+	}
+	if (m > 0) {
+		(void)write(port, buf, m);
+	}
+}
+
+static void out(const char *format, ...) __printflike(1, 2);
+static void bootlog(const char *format, ...) __printflike(1, 2);
+
+static void
+out(const char *format, ...)
+{
+	char line[2048];
+	va_list list;
+	int n;
+
+	va_start(list, format);
+	n = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	out_bytes(line, n < 0 ? 0 : (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
+}
+
+static void
+prompt(void)
+{
+	out("ios:%s# ", cwd);
+}
+
+/* Words of a line: spaces separate, "double quotes" keep them. */
+static int
+split(char *line, char **argv, int most)
+{
+	int argc = 0;
+	char *p = line;
+
+	while (*p && argc < most - 1) {
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		if (*p == '"') {
+			argv[argc++] = ++p;
+			while (*p && *p != '"') {
+				p++;
+			}
+		} else {
+			argv[argc++] = p;
+			while (*p && *p != ' ' && *p != '\t') {
+				p++;
+			}
+		}
+		if (*p) {
+			*p++ = 0;
+		}
+	}
+	argv[argc] = NULL;
+	return argc;
+}
+
+static void
+cmd_ls(const char *path)
+{
+	DIR *d = opendir(path);
+	struct dirent *e;
+	unsigned n = 0;
+
+	if (d == NULL) {
+		out("ls: %s: %s\n", path, strerror(errno));
+		return;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char full[2048];
+		struct stat st;
+
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) {
+			continue;
+		}
+		snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+		if (lstat(full, &st) != 0) {
+			out("  ?          %s\n", e->d_name);
+		} else {
+			out("  %c%03o %10lld  %s%s\n", S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : S_ISCHR(st.st_mode) ? 'c' : '-',
+			    st.st_mode & 0777, (long long)st.st_size, e->d_name, S_ISDIR(st.st_mode) ? "/" : "");
+		}
+		n++;
+	}
+	closedir(d);
+	out("(%u entries)\n", n);
+}
+
+static void
+cmd_cat(const char *path)
+{
+	char buf[4096];
+	ssize_t n;
+	size_t total = 0;
+	int f = open(path, O_RDONLY);
+
+	if (f < 0) {
+		out("cat: %s: %s\n", path, strerror(errno));
+		return;
+	}
+	while ((n = read(f, buf, sizeof(buf))) > 0 && total < (1u << 20)) {
+		out_bytes(buf, (size_t)n);
+		total += (size_t)n;
+	}
+	close(f);
+	if (total >= (1u << 20)) {
+		out("\n(cat: stopped at 1 MB)\n");
+	}
+}
+
+/*
+ * A file whole, for the computer to keep (tools/netsh.py --get): "b64: BEGIN SIZE", its bytes in base64 lines of 76
+ * characters, "b64: END". Screenshots in the photo library, crash reports: nothing else on a test image reads them out.
+ */
+static void
+cmd_b64(const char *path)
+{
+	static const char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	unsigned char in[57 * 64];
+	char line[80];
+	struct stat st;
+	ssize_t n;
+	int f = open(path, O_RDONLY);
+
+	if (f < 0 || fstat(f, &st) != 0) {
+		out("b64: %s: %s\n", path, strerror(errno));
+		if (f >= 0) {
+			close(f);
+		}
+		return;
+	}
+	out("b64: BEGIN %lld\n", (long long)st.st_size);
+	for (;;) {
+		ssize_t got;
+
+		for (n = 0; n < (ssize_t)sizeof(in) && (got = read(f, in + n, sizeof(in) - (size_t)n)) > 0; n += got) {
+		}                                       /* (whole buffers: padding only at the very end) */
+		if (n == 0) {
+			break;
+		}
+		for (ssize_t at = 0; at < n; at += 57) {
+			ssize_t take = n - at < 57 ? n - at : 57;
+			size_t m = 0;
+
+			for (ssize_t i = 0; i < take; i += 3) {
+				unsigned v = (unsigned)in[at + i] << 16;
+				int have = take - i;
+
+				if (have > 1) {
+					v |= (unsigned)in[at + i + 1] << 8;
+				}
+				if (have > 2) {
+					v |= in[at + i + 2];
+				}
+				line[m++] = digits[v >> 18 & 63];
+				line[m++] = digits[v >> 12 & 63];
+				line[m++] = have > 1 ? digits[v >> 6 & 63] : '=';
+				line[m++] = have > 2 ? digits[v & 63] : '=';
+			}
+			line[m++] = '\n';
+			out_bytes(line, m);
+		}
+	}
+	close(f);
+	out("b64: END\n");
+}
+
+static void
+cmd_uname(void)
+{
+	struct utsname u;
+	char version[64] = "", model[64] = "";
+	size_t len;
+	struct timeval boot;
+	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+
+	uname(&u);
+	len = sizeof(version);
+	sysctlbyname("kern.osversion", version, &len, NULL, 0);
+	len = sizeof(model);
+	sysctlbyname("hw.machine", model, &len, NULL, 0);
+	len = sizeof(boot);
+	sysctl(mib, 2, &boot, &len, NULL, 0);
+	out("%s %s %s %s (%s, iOS build %s), up %ld s\n%s\n", u.sysname, u.nodename, u.release, u.machine, model, version,
+	    (long)(time(NULL) - boot.tv_sec), u.version);
+}
+
+static void
+cmd_ps(void)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0;
+	struct kinfo_proc *procs;
+
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || (procs = malloc(len + 16 * sizeof(*procs))) == NULL) {
+		out("ps: %s\n", strerror(errno));
+		return;
+	}
+	len += 16 * sizeof(*procs);
+	if (sysctl(mib, 3, procs, &len, NULL, 0) != 0) {
+		out("ps: %s\n", strerror(errno));
+		free(procs);
+		return;
+	}
+	out("  PID  PPID   UID  COMMAND\n");
+	for (size_t i = 0; i < len / sizeof(*procs); i++) {
+		out("%5d %5d %5u  %s\n", procs[i].kp_proc.p_pid, procs[i].kp_eproc.e_ppid, procs[i].kp_eproc.e_ucred.cr_uid,
+		    procs[i].kp_proc.p_comm);
+	}
+	out("(%zu processes)\n", len / sizeof(*procs));
+	free(procs);
+}
+
+static const char *
+find_program(const char *name, char *buf, size_t size)
+{
+	static const char *const dirs[] = { "/redwood/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec" };
+
+	if (strchr(name, '/')) {
+		return name;
+	}
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		snprintf(buf, size, "%s/%s", dirs[i], name);
+		if (access(buf, X_OK) == 0) {
+			return buf;
+		}
+	}
+	return NULL;
+}
+
+/* A program, its output to the port as it comes; Ctrl-C from the computer interrupts it. */
+static void
+run(char **argv)
+{
+	char where[1024];
+	const char *path = find_program(argv[0], where, sizeof(where));
+	posix_spawn_file_actions_t actions;
+	int pipefd[2], status = 0, interrupts = 0;
+	pid_t pid;
+	int watch = 1;                  /* (a connection that hangs up: no more Ctrl-C to look for) */
+
+	if (path == NULL) {
+		out("%s: no such program (help: what there is)\n", argv[0]);
+		return;
+	}
+	if (pipe(pipefd) != 0) {
+		out("usbsh: pipe: %s\n", strerror(errno));
+		return;
+	}
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], 1);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], 2);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	posix_spawn_file_actions_addclose(&actions, port);
+	errno = posix_spawn(&pid, path, &actions, NULL, argv, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(pipefd[1]);
+	if (errno != 0) {
+		out("%s: %s\n", path, strerror(errno));
+		close(pipefd[0]);
+		return;
+	}
+	for (;;) {
+		fd_set r;
+		char buf[4096];
+		ssize_t n;
+
+		FD_ZERO(&r);
+		FD_SET(pipefd[0], &r);
+		if (watch) {
+			FD_SET(port, &r);
+		}
+		if (select((pipefd[0] > port ? pipefd[0] : port) + 1, &r, NULL, NULL, NULL) < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			break;
+		}
+		if (watch && FD_ISSET(port, &r)) {
+			n = read(port, buf, sizeof(buf));
+			if (n <= 0 && network) {
+				watch = 0;
+			}
+			for (ssize_t i = 0; i < n; i++) {
+				if (buf[i] == 3) {
+					kill(pid, ++interrupts > 1 ? SIGKILL : SIGINT);
+					out("^C\n");
+				}
+			}
+		}
+		if (FD_ISSET(pipefd[0], &r)) {
+			n = read(pipefd[0], buf, sizeof(buf));
+			if (n <= 0) {
+				break;
+			}
+			out_bytes(buf, (size_t)n);
+		}
+	}
+	close(pipefd[0]);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+	}
+	if (WIFSIGNALED(status)) {
+		out("[killed by signal %d]\n", WTERMSIG(status));
+	} else if (WEXITSTATUS(status) != 0) {
+		out("[exit status %d]\n", WEXITSTATUS(status));
+	}
+}
+
+/*
+ * fill FILE MB: a file of so many megabytes written (not zeros), for filling the data volume -- ramfs's pages and
+ * the kernel's address space (TODO 2m, 2026-11-03). "fill FILE 0" removes it.
+ */
+static void
+cmd_fill(const char *path, long mb)
+{
+	static char chunk[1 << 20];
+	struct timespec began, done;
+	long written = 0;
+	int fd;
+
+	if (mb <= 0) {
+		out("fill: %s %s\n", path, unlink(path) == 0 ? "removed" : strerror(errno));
+		return;
+	}
+	memset(chunk, 0x5a, sizeof(chunk));
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		out("fill: %s: %s\n", path, strerror(errno));
+		return;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	while (written < mb) {
+		ssize_t n = write(fd, chunk, sizeof(chunk));
+
+		if (n != (ssize_t)sizeof(chunk)) {
+			out("fill: after %ld MB: %s\n", written, n < 0 ? strerror(errno) : "a short write");
+			break;
+		}
+		written++;
+	}
+	close(fd);
+	clock_gettime(CLOCK_MONOTONIC, &done);
+	out("fill: %s: %ld MB in %ld ms\n", path, written, (long)((done.tv_sec - began.tv_sec) * 1000 +
+	    (done.tv_nsec - began.tv_nsec) / 1000000));
+}
+
+/*
+ * udp PORT SECONDS: what comes to a UDP port in so long -- each datagram's sender, the address it was sent to (a
+ * broadcast or ours) and its first bytes. For a world of Minecraft's on LAN that the iPad does not find (TODO 2n):
+ * whether a broadcast to port 19132 reaches a socket at all.
+ */
+static void
+cmd_udp(int udp_port, int seconds)
+{
+	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons((uint16_t)udp_port) };
+	int s = socket(AF_INET, SOCK_DGRAM, 0), on = 1, got = 0;
+	time_t end = time(NULL) + seconds;
+
+	if (s < 0) {
+		out("udp: socket: %s\n", strerror(errno));
+		return;
+	}
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+	(void)setsockopt(s, IPPROTO_IP, IP_RECVDSTADDR, &on, sizeof(on));
+	if (bind(s, (struct sockaddr *)&at, sizeof(at)) != 0) {
+		out("udp: bind to port %d: %s\n", udp_port, strerror(errno));
+		close(s);
+		return;
+	}
+	out("udp: listening on port %d for %d s\n", udp_port, seconds);
+	while (time(NULL) < end) {
+		struct timeval wait = { .tv_sec = 1 };
+		fd_set ready;
+		unsigned char data[64];
+		char control[64], to[32] = "?", from[32];
+		struct sockaddr_in sender;
+		struct iovec iov = { .iov_base = data, .iov_len = sizeof(data) };
+		struct msghdr msg = { .msg_name = &sender, .msg_namelen = sizeof(sender), .msg_iov = &iov, .msg_iovlen = 1,
+			              .msg_control = control, .msg_controllen = sizeof(control) };
+		ssize_t n;
+
+		FD_ZERO(&ready);
+		FD_SET(s, &ready);
+		if (select(s + 1, &ready, NULL, NULL, &wait) <= 0) {
+			continue;
+		}
+		n = recvmsg(s, &msg, 0);
+		if (n < 0) {
+			continue;
+		}
+		for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
+			if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVDSTADDR) {
+				inet_ntop(AF_INET, CMSG_DATA(c), to, sizeof(to));
+			}
+		}
+		inet_ntop(AF_INET, &sender.sin_addr, from, sizeof(from));
+		out("udp: %zd bytes from %s:%u to %s, first byte %#x\n", n, from, ntohs(sender.sin_port), to,
+		    n > 0 ? data[0] : 0);
+		got++;
+	}
+	out("udp: %d datagrams in %d s\n", got, seconds);
+	close(s);
+}
+
+/*
+ * (2026-11-22) tcpsink PORT SECONDS / tcpsource PORT SECONDS: Wi-Fi's throughput, end to end. The phone listens on a TCP
+ * port for one connection (for at most SECONDS), then reads and drops everything (sink: what comes in) or sends zeros
+ * (source: what goes out) until the other side closes or SECONDS have passed, and says how many bytes in how long.
+ * tools/wifi-tput.py is the other side, on the computer.
+ */
+/*
+ * (N10b) ... [KB]: the socket's buffer for the way it streams (SO_RCVBUF for the sink, SO_SNDBUF for the source) set
+ * to KB before the connection -- whether the window is what holds a direction back; the buffer as it was when the
+ * connection came and when it ended (TCP's autotuning grows it) is said either way.
+ */
+static void
+cmd_tcp_rate(const char *name, int tcp_port, int seconds, int sending, int buf_kb)
+{
+	int which = sending ? SO_SNDBUF : SO_RCVBUF, buf_start = 0, buf_end = 0;
+	socklen_t buf_len = sizeof(int);
+	struct sockaddr_in at = { .sin_len = sizeof(at), .sin_family = AF_INET, .sin_port = htons((uint16_t)tcp_port) };
+	int s = socket(AF_INET, SOCK_STREAM, 0), on = 1, c = -1;
+	struct timeval wait = { .tv_sec = seconds > 0 ? seconds : 1 };
+	struct timespec began, now;
+	static char buf[65536];
+	long long bytes = 0;
+	fd_set ready;
+	long ms;
+
+	if (s < 0) {
+		out("%s: socket: %s\n", name, strerror(errno));
+		return;
+	}
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	if (buf_kb > 0) {
+		int bytes = buf_kb * 1024;
+
+		if (setsockopt(s, SOL_SOCKET, which, &bytes, sizeof(bytes)) != 0) {
+			out("%s: %s %d KB: %s\n", name, sending ? "SO_SNDBUF" : "SO_RCVBUF", buf_kb, strerror(errno));
+		}
+	}
+	if (bind(s, (struct sockaddr *)&at, sizeof(at)) != 0 || listen(s, 1) != 0) {
+		out("%s: port %d: %s\n", name, tcp_port, strerror(errno));
+		close(s);
+		return;
+	}
+	out("%s: listening on port %d for %d s\n", name, tcp_port, seconds);
+	FD_ZERO(&ready);
+	FD_SET(s, &ready);
+	if (select(s + 1, &ready, NULL, NULL, &wait) <= 0 || (c = accept(s, NULL, NULL)) < 0) {
+		out("%s: nobody came\n", name);
+		close(s);
+		return;
+	}
+	close(s);
+	{
+		/* (a peer that goes away must not kill the shell with SIGPIPE, nor one that stalls hold it for ever) */
+		struct timeval stall = { .tv_sec = 3 };
+
+		(void)setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+		(void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &stall, sizeof(stall));
+		(void)setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stall, sizeof(stall));
+		(void)getsockopt(c, SOL_SOCKET, which, &buf_start, &buf_len);
+	}
+	memset(buf, 0, sizeof(buf));
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	for (;;) {
+		ssize_t n = sending ? write(c, buf, sizeof(buf)) : read(c, buf, sizeof(buf));
+
+		if (n <= 0) {
+			break;
+		}
+		bytes += n;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec - began.tv_sec >= seconds) {
+			break;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	buf_len = sizeof(int);
+	(void)getsockopt(c, SOL_SOCKET, which, &buf_end, &buf_len);
+	close(c);
+	ms = (long)((now.tv_sec - began.tv_sec) * 1000 + (now.tv_nsec - began.tv_nsec) / 1000000);
+	out("%s: %lld bytes %s in %ld ms = %.2f MB/s (%.1f Mbit/s); %s %d KB at the start, %d KB at the end\n", name, bytes,
+	    sending ? "sent" : "received", ms, ms > 0 ? (double)bytes / 1048576.0 * 1000.0 / ms : 0.0,
+	    ms > 0 ? (double)bytes * 8.0 / 1000.0 / ms : 0.0, sending ? "SO_SNDBUF" : "SO_RCVBUF", buf_start / 1024, buf_end / 1024);
+}
+
+/*
+ * The kernel's message buffer as it is now -- what printf() and IOLog() wrote, oldest first -- during the run: the loader
+ * gets it only when the kernel is back, and it holds about 16 minutes of a game (2026-11-03: the minute that mattered
+ * had gone round). tools/klog-pull.py takes it every 2 minutes over the network, so a long run keeps all of it and one
+ * that ends in a reset keeps what came before.
+ */
+static void
+cmd_dmesg(void)
+{
+	static char buf[(1 << 20) + 2];
+	int n = proc_kmsgbuf(buf, sizeof(buf));
+
+	if (n <= 0) {
+		out("dmesg: the kernel gave nothing (%s)\n", strerror(errno));
+		return;
+	}
+	out_bytes(buf, (size_t)n);
+	if (buf[n - 1] != '\n') {
+		out("\n");
+	}
+}
+
+/*
+ * reboot [fastboot|recovery]: HAKIOS_USB_RESTART asks the kernel to write the board's IMEM
+ * restart_reason and run the clean shutdown (reboot_kernel -> PEHaltRestart -> PSCI SYSTEM_RESET),
+ * so the bootloader comes back in that mode. Only a plain reboot falls back to reboot(2) if the
+ * ioctl is missing (an older kernel); a mode has no meaning without the reason write.
+ *
+ * The USB link disappears with the process, so say so before the shutdown starts and give the
+ * host a moment to read the line. Neither path returns on success; if it does, say why.
+ */
+static void
+cmd_reboot(int mode)
+{
+	static const char *const names[] = { "reboot", "fastboot", "recovery" };
+	int m = mode;
+
+	out("usbsh: %s: writing the restart reason and shutting down (USB drops)\n", names[mode]);
+	sleep(1);
+	if (ioctl(port, HAKIOS_USB_RESTART, &m) == 0) {
+		out("usbsh: the kernel returned without restarting\n");
+		return;
+	}
+	out("usbsh: HAKIOS_USB_RESTART: %s\n", strerror(errno));
+	if (mode == 0) {
+		out("usbsh: falling back to reboot(2)\n");
+		sync();
+		if (reboot(RB_AUTOBOOT) != 0) {
+			out("usbsh: reboot(RB_AUTOBOOT): %s\n", strerror(errno));
+		}
+	}
+}
+
+/* halt: no IMEM reason; the clean BSD path, then the platform's PSCI SYSTEM_OFF. */
+static void
+cmd_halt(void)
+{
+	out("usbsh: halting: USB drops, the phone powers off\n");
+	sleep(1);
+	sync();
+	if (reboot(RB_HALT) != 0) {
+		out("usbsh: reboot(RB_HALT): %s\n", strerror(errno));
+	}
+}
+
+static void
+help(void)
+{
+	out("usbsh: commands over USB, run on iOS\n"
+	    "  ls [DIR]  cat FILE  b64 FILE  cd DIR  pwd  getenv NAME  uname  ps  kill [-SIG] PID  log  help\n"
+	    "  reboot [fastboot|recovery] / halt (clean shutdown, then SoC reset / power off; USB drops)\n"
+	    "  fill FILE MB (0: remove it)  udp PORT SECONDS  dmesg (the kernel's message buffer)\n"
+	    "  tcpsink PORT SECONDS [KB] / tcpsource PORT SECONDS [KB] (one connection: bytes in / out, MB/s; KB: its buffer)\n"
+	    "  anything else: a program and its arguments; names are looked for in\n"
+	    "  /redwood/bin /usr/bin /bin /usr/sbin /sbin /usr/libexec -- e.g. battery_test, vol_ls /, net_test\n"
+	    "  Ctrl-C interrupts a program; 'log' gives the port back to the kernel's log\n");
+}
+
+static void
+execute(char *line)
+{
+	char *argv[64];
+	int argc = split(line, argv, 64);
+
+	if (argc == 0) {
+		return;
+	}
+	if (!strcmp(argv[0], "help") || !strcmp(argv[0], "?")) {
+		help();
+	} else if (network && (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit"))) {
+		hang_up = 1;
+	} else if (!strcmp(argv[0], "log") || !strcmp(argv[0], "exit")) {
+		out("usbsh: log mode again (send the magic line to return)\n");
+		ioctl(port, HAKIOS_USB_LOG);
+		talking = 0;
+		leave_shell = 1;
+	} else if (!strcmp(argv[0], "ls")) {
+		cmd_ls(argc > 1 ? argv[1] : ".");
+	} else if (!strcmp(argv[0], "cat") && argc > 1) {
+		for (int i = 1; i < argc; i++) {
+			cmd_cat(argv[i]);
+		}
+	} else if (!strcmp(argv[0], "b64") && argc > 1) {
+		cmd_b64(argv[1]);
+	} else if (!strcmp(argv[0], "cd")) {
+		if (chdir(argc > 1 ? argv[1] : "/") != 0) {
+			out("cd: %s\n", strerror(errno));
+		}
+		if (getcwd(cwd, sizeof(cwd)) == NULL) {
+			strlcpy(cwd, "?", sizeof(cwd));
+		}
+	} else if (!strcmp(argv[0], "pwd")) {
+		out("%s\n", cwd);
+	} else if (!strcmp(argv[0], "getenv") && argc > 1) {
+		const char *value = getenv(argv[1]);
+
+		out("%s=%s\n", argv[1], value ? value : "(not set)");
+	} else if (!strcmp(argv[0], "sysctl") && argc > 1 && strchr(argv[1], '=') != NULL) {
+		/* (11-18) sysctl NAME=VALUE: set an integer sysctl (kern.hakios.bl_auto_pct, the auto-brightness) */
+		char name[128];
+		const char *eq = strchr(argv[1], '=');
+		size_t n = (size_t)(eq - argv[1]);
+		int value = atoi(eq + 1), old = 0;
+		size_t size = sizeof(old);
+
+		if (n == 0 || n >= sizeof(name)) {
+			out("sysctl: a name, then =VALUE\n");
+		} else {
+			memcpy(name, argv[1], n);
+			name[n] = '\0';
+			if (sysctlbyname(name, &old, &size, &value, sizeof(value)) != 0) {
+				out("%s: %s\n", name, strerror(errno));
+			} else {
+				out("%s: %d -> %d\n", name, old, value);
+			}
+		}
+	} else if (!strcmp(argv[0], "sysctl") && argc > 1) {
+		/* sysctl NAME [COUNT [MS]]: an integer sysctl, COUNT times MS apart (default once); one longer than an
+		   integer (a string: kern.hakios.kthreads, 11-21) is printed once, as text */
+		int times = argc > 2 ? atoi(argv[2]) : 1, gap = argc > 3 ? atoi(argv[3]) : 500;
+		size_t want = 0;
+
+		if (sysctlbyname(argv[1], NULL, &want, NULL, 0) == 0 && want > sizeof(int)) {
+			size_t size = want + 16384, got = size;
+			char *text = malloc(size);
+
+			if (text == NULL || sysctlbyname(argv[1], text, &got, NULL, 0) != 0) {
+				out("%s: %s\n", argv[1], strerror(errno));
+			} else {
+				got = got < size ? got : size - 1;
+				text[got] = '\0';
+				out_bytes(text, strlen(text));
+			}
+			free(text);
+			times = 0;
+		}
+		for (int i = 0; i < times && i < 1000; i++) {
+			int value = 0;
+			size_t size = sizeof(value);
+
+			if (sysctlbyname(argv[1], &value, &size, NULL, 0) != 0) {
+				out("%s: %s\n", argv[1], strerror(errno));
+				break;
+			}
+			out("%s = %d\n", argv[1], value);
+			if (i + 1 < times) {
+				usleep((useconds_t)gap * 1000);
+			}
+		}
+	} else if (!strcmp(argv[0], "cs") && argc > 1) {
+		/* cs PID [NAME]: the process's code-signing flags and both entitlement blobs, as programs get them */
+		pid_t pid = (pid_t)atoi(argv[1]);
+		uint32_t flags = 0;
+		static uint8_t blob[64 * 1024];
+		int r = csops(pid, CS_OPS_STATUS, &flags, sizeof(flags));
+
+		out("cs %d: status %s, flags %#x\n", pid, r == 0 ? "ok" : strerror(errno), flags);
+		for (int kind = 0; kind < 2; kind++) {
+			unsigned op = kind == 0 ? CS_OPS_ENTITLEMENTS_BLOB : CS_OPS_DER_ENTITLEMENTS_BLOB;
+			uint32_t length;
+
+			memset(blob, 0, sizeof(blob));
+			r = csops(pid, op, blob, sizeof(blob));
+			length = (uint32_t)blob[4] << 24 | (uint32_t)blob[5] << 16 | (uint32_t)blob[6] << 8 | blob[7];
+			out("  %s entitlements: %s, magic %02x%02x%02x%02x, %u bytes%s\n", kind == 0 ? "XML" : "DER",
+			    r == 0 ? "ok" : strerror(errno), blob[0], blob[1], blob[2], blob[3], length,
+			    argc > 2 && length <= sizeof(blob) && memmem(blob, length, argv[2], strlen(argv[2])) != NULL ?
+			    ", has the name" : "");
+		}
+	} else if (!strcmp(argv[0], "fill") && argc > 2) {
+		cmd_fill(argv[1], atol(argv[2]));
+	} else if (!strcmp(argv[0], "udp") && argc > 2) {
+		cmd_udp(atoi(argv[1]), atoi(argv[2]));
+	} else if ((!strcmp(argv[0], "tcpsink") || !strcmp(argv[0], "tcpsource")) && argc > 2) {
+		cmd_tcp_rate(argv[0], atoi(argv[1]), atoi(argv[2]), argv[0][3] == 's' && argv[0][4] == 'o', argc > 3 ? atoi(argv[3]) : 0);
+	} else if (!strcmp(argv[0], "reboot")) {
+		if (argc == 1) {
+			cmd_reboot(0);
+		} else if (!strcmp(argv[1], "fastboot")) {
+			cmd_reboot(1);
+		} else if (!strcmp(argv[1], "recovery")) {
+			cmd_reboot(2);
+		} else {
+			out("reboot: %s: use 'reboot', 'reboot fastboot' or 'reboot recovery'\n", argv[1]);
+		}
+	} else if (!strcmp(argv[0], "halt")) {
+		cmd_halt();
+	} else if (!strcmp(argv[0], "dmesg")) {
+		cmd_dmesg();
+	} else if (!strcmp(argv[0], "uname")) {
+		cmd_uname();
+	} else if (!strcmp(argv[0], "ps")) {
+		cmd_ps();
+	} else if (!strcmp(argv[0], "kill") && argc > 1) {
+		int sig = SIGTERM, at = 1;
+
+		if (argv[1][0] == '-' && argc > 2) {
+			sig = atoi(argv[1] + 1);
+			at = 2;
+		}
+		if (kill(atoi(argv[at]), sig) != 0) {
+			out("kill: %s\n", strerror(errno));
+		}
+	} else {
+		run(argv);
+	}
+}
+
+/* What comes from the computer, a line at a time: over USB for ever, over the network until it hangs up. */
+static int
+serve(void)
+{
+	char line[1024];
+	size_t len = 0;
+
+	for (;;) {
+		char buf[256];
+		ssize_t n = read(port, buf, sizeof(buf));
+
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			printf("usbsh: the port: %s\n", strerror(errno));
+			return 1;
+		}
+		if (n == 0 && network) {
+			return 0;
+		}
+		for (ssize_t i = 0; i < n; i++) {
+			char c = buf[i];
+
+			if (!talking) {
+				talking = 1;
+				len = 0;
+			}
+			if (c == '\r' || c == '\n') {
+				if (c == '\n' && i > 0 && buf[i - 1] == '\r') {
+					continue;
+				}
+				out("\n");
+				line[len] = 0;
+				execute(line);
+				len = 0;
+				if (hang_up || leave_shell) {
+					leave_shell = 0;
+					return 0;
+				}
+				if (talking) {
+					prompt();
+				}
+			} else if (c == 0x7f || c == 8) {
+				if (len > 0) {
+					len--;
+					out("\b \b");
+				}
+			} else if (c == 3) {
+				len = 0;
+				out("^C\n");
+				prompt();
+			} else if (c >= 0x20 && len < sizeof(line) - 1) {
+				line[len++] = c;
+				out_bytes(&c, 1);
+			}
+		}
+	}
+}
+
+/* A line from a connection, within so many seconds: 0 if it did not come. */
+static int
+read_line(int fd, char *buf, size_t size, int seconds)
+{
+	size_t len = 0;
+	time_t until = time(NULL) + seconds;
+
+	while (len < size - 1) {
+		fd_set r;
+		struct timeval tv = { .tv_sec = 1 };
+		char c;
+
+		if (time(NULL) > until) {
+			return 0;
+		}
+		FD_ZERO(&r);
+		FD_SET(fd, &r);
+		if (select(fd + 1, &r, NULL, NULL, &tv) <= 0) {
+			continue;
+		}
+		if (read(fd, &c, 1) != 1) {
+			return 0;
+		}
+		if (c == '\n') {
+			break;
+		}
+		if (c != '\r') {
+			buf[len++] = c;
+		}
+	}
+	buf[len] = 0;
+	return 1;
+}
+
+/* -l PORT: the same over TCP, for whoever starts with the token. */
+static int
+listen_on(int tcp_port)
+{
+	char token[128] = "", got[128];
+	int f = open("/redwood/fw/netsh-token", O_RDONLY), s, one = 1;
+	ssize_t n = f >= 0 ? read(f, token, sizeof(token) - 1) : -1;
+	struct sockaddr_in a = { .sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons((uint16_t)tcp_port) };
+
+	if (f >= 0) {
+		close(f);
+	}
+	while (n > 0 && (token[n - 1] == '\n' || token[n - 1] == '\r')) {
+		n--;
+	}
+	if (n < 16) {
+		printf("usbsh: no token (/redwood/fw/netsh-token): not listening\n");
+		return 1;
+	}
+	token[n] = 0;
+	s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0 || setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+	    bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(s, 2) != 0) {
+		printf("usbsh: TCP port %d: %s\n", tcp_port, strerror(errno));
+		return 1;
+	}
+	printf("usbsh: listening on TCP port %d\n", tcp_port);
+	network = 1;
+	for (;;) {
+		int c = accept(s, NULL, NULL);
+
+		if (c < 0) {
+			if (errno != EINTR) {
+				sleep(1);
+			}
+			continue;
+		}
+		if (read_line(c, got, sizeof(got), 10) && strcmp(got, token) == 0) {
+			port = c;
+			talking = 1;
+			hang_up = 0;
+			out("usbsh over the network: 'help' for commands, 'exit' to hang up\n");
+			prompt();
+			serve();
+			port = -1;
+		}
+		close(c);
+	}
+}
+
+/*
+ * A line to the boot console (and so, with 0047/0119, the persistent ring),
+ * independently of launchd's StandardOutPath -- that is /dev/null in the job
+ * we install, because a job whose stdout is /dev/console can fail to launch on
+ * this root. Only state transitions go here; the shell's own I/O is the USB
+ * port.
+ */
+static void
+bootlog(const char *format, ...)
+{
+	static FILE *console;
+	va_list list;
+
+	if (console == NULL) {
+		console = fopen("/dev/console", "a");
+	}
+	if (console == NULL) {
+		return;
+	}
+	va_start(list, format);
+	vfprintf(console, format, list);
+	va_end(list);
+	fputc('\n', console);
+	fflush(console);
+}
+
+/* The usb=N value from kern.bootargs, or -1. */
+static int
+usb_level(void)
+{
+	char args[1024] = "";
+	size_t len = sizeof(args) - 1;
+	const char *p;
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return -1;
+	}
+	args[len] = 0;
+	for (p = args; (p = strstr(p, "usb=")) != NULL; p += 4) {
+		if ((p == args || p[-1] == ' ') && p[4] >= '0' && p[4] <= '9') {
+			return atoi(p + 4);
+		}
+	}
+	return -1;
+}
+
+int
+main(int argc, char **argv)
+{
+	int level, ctl = -1;
+	unsigned tries = 0;
+
+	signal(SIGPIPE, SIG_IGN);
+	chdir("/");
+	if (argc > 2 && !strcmp(argv[1], "-l")) {
+		return listen_on(atoi(argv[2]));
+	}
+	level = usb_level();
+	if (level != 2) {
+		/*
+		 * One owner per boot: usb=2 is the CDC-ACM shell and belongs to
+		 * usbsh; usb=3 is the iPhone mux and belongs to usbmux. Never race
+		 * for /dev/hakios-usb -- whoever loses would exit and be silent.
+		 */
+		bootlog("USBSH: usb=%d, not usb=2: %s", level,
+		    level == 3 ? "usbmux owns the port" : "no CDC-ACM port on this boot");
+		return 0;
+	}
+	/*
+	 * The log is the invariant: usbsh does not open /dev/hakios-usb at boot. It waits on the control node
+	 * until the kernel has seen the host's magic line and stopped the log; only then does the port belong to
+	 * the shell. After "log" or the kernel's idle timeout it closes the port and waits here again.
+	 */
+	bootlog("USBSH: usb=2: log mode; waiting for the shell magic on /dev/hakios-usb-shell");
+	for (;;) {
+		char c;
+		ssize_t n;
+
+		if (ctl < 0) {
+			ctl = open("/dev/hakios-usb-shell", O_RDONLY);
+			if (ctl < 0) {
+				if (tries == 0 || tries % 30 == 29) {
+					bootlog("USBSH: /dev/hakios-usb-shell not ready (%s), still waiting (%u s)",
+					    strerror(errno), tries + 1);
+				}
+				tries++;
+				sleep(1);
+				continue;
+			}
+		}
+		n = read(ctl, &c, 1);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) {
+				continue;
+			}
+			bootlog("USBSH: control node: %s; reopening", n < 0 ? strerror(errno) : "closed");
+			close(ctl);
+			ctl = -1;
+			sleep(1);
+			continue;
+		}
+		bootlog("USBSH: host asked for a shell; opening /dev/hakios-usb");
+		for (tries = 0, port = -1; tries < 10; tries++) {
+			port = open("/dev/hakios-usb", O_RDWR);
+			if (port >= 0) {
+				break;
+			}
+			sleep(1);
+		}
+		if (port < 0) {
+			bootlog("USBSH: the shell request expired before open (%s); back to the log", strerror(errno));
+			continue;
+		}
+		bootlog("USBSH: shell took the port; 'log' or 120 s idle returns it to the log");
+		talking = 1;
+		leave_shell = 0;
+		prompt();
+		n = serve();
+		close(port);
+		port = -1;
+		bootlog("USBSH: shell ended (%s); waiting for the next request",
+		    n == 0 ? "log mode requested" : "port closed or idle timeout");
+	}
+}
