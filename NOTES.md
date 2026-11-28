@@ -1,4 +1,22 @@
 
+## 2026-11-28 (late) - GPU: per-client spaces fixed the opcode error; the draw still wedges
+
+- Shared space: `CP int 0x1` (opcode error), IB stops at 256 dwords.
+- Per-client spaces (`gpu_spaces=1`): `CP int 0`, the CP consumes ~448 dwords, then
+  `RBBM_STATUS 0xe51005` (CP/HLSQ/SP/VPC/PC busy), no fault bit, fence word 0. The
+  readback is no longer all zeros (white corner, ~15k pixels vs 26% expected): the
+  draw reaches the front end and never drains. This is the `hakios-metal` signature.
+- A `CP_SMMU_TABLE_UPDATE` attempt made it worse (opcode error returned): our word 3
+  used `core_space.context` where Linux writes `CONTEXTBANK(0)`; the sequence is now
+  behind `gpu_table_update=1`, default off. Recorded in `hakios-port-ref/DIFF-SUBMIT.md`.
+- A byte-verified `CACHE_INVALIDATE` before the IBs is emitted (`preamble:
+  CACHE_INVALIDATE at ring 131..132`) and did not clear the wedge on its own.
+- `reboot fastboot` from usbsh writes the IMEM reason (`hakios: restart reason
+  0x77665500 written (mode 1)`) but Xiaomi's ABL boots recovery anyway; the reliable
+  chain stays `adb reboot fastboot` -> fastbootd -> `fastboot reboot bootloader`
+  (`tools/sweet-fastboot.sh`).
+
+
 ## 2026-11-28 - GPU submit: the CP stops 256 dwords into every IB
 
 Every client submission now reaches the CP, parses the ring and starts the
