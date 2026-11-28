@@ -4180,7 +4180,13 @@ static bool
 gpu_spaces_on(void)
 {
 	if (gpu_spaces < 0) {
-		uint32_t value = 1;
+		/*
+		 * The reference driver on this phone runs every client in the one shared
+		 * SMMU space; that is the arrangement its submit/IB path is known to work
+		 * in. Per-client spaces stay available with gpu_spaces=1 but are not the
+		 * default while the client IB path is being brought up.
+		 */
+		uint32_t value = 0;
 
 		PE_parse_boot_argn("gpu_spaces", &value, sizeof(value));
 		gpu_spaces = value != 0;
@@ -4768,18 +4774,11 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	in = gpu_space_now != NULL ? gpu_space_now : &core_space;
 	in->last_fence = gpu_fence;
 	fence_space[gpu_fence % FENCE_SPACES] = gpu_space_now;
+	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
-	/*
-	 * A page-table switch is done by this processor; the UCHE (the shaders'
-	 * cache) still holds lines of the previous space. Without this the SP can
-	 * fetch a stale shader and never go idle, so CP_WAIT_FOR_IDLE and the fence
-	 * behind it never came back. Linux's a6xx_set_pagetable emits the same event.
-	 */
-	ring_command(CP_EVENT_WRITE, 1);
-	ring(EVENT_CACHE_INVALIDATE);
 	for (uint32_t i = 0; i < count; i++) {
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
@@ -4821,8 +4820,8 @@ gpu_submit(struct gpu_space *switch_to, const uint64_t *addresses, const uint32_
 	}
 	if (adreno_loud) {
 		printf("adreno: loud: ring tail:");
-		for (uint32_t k = 0; k < 8; k++) {
-			uint32_t at = (ring_at + RING_WORDS - 8 + k) % RING_WORDS;
+		for (uint32_t k = 0; k < 40; k++) {
+			uint32_t at = (ring_at + RING_WORDS - 40 + k) % RING_WORDS;
 			printf(" %u:%08x", at, ((uint32_t *)core_ring.memory)[at]);
 		}
 		printf("\n");
