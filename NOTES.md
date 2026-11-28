@@ -1,4 +1,18 @@
 
+## 2026-11-28 - GPU submit: the CP stops 256 dwords into every IB
+
+Every client submission now reaches the CP, parses the ring and starts the
+command buffer, then stops after exactly 256 dwords with `CP int 0x1`
+(opcode error) and `CP_SQE_STAT_DATA` reading 0; `CP_IB1_REM_SIZE` freezes at
+1736-256. Reproduced with our own packet order and with the reference
+(hakios-alioth) submit ported verbatim, in the shared SMMU space, so it is not
+packet order or spaces. 256 dwords is 1 KiB, the size of one CP IB prefetch
+chunk, which points at how the IB memory is presented (cache attributes /
+second chunk fetch) rather than at the dwords themselves. Next idea: allocate
+the GEM buffers the way the reference does and/or with cache-inhibited
+attributes, and watch `CP_IB1_REM_SIZE` after the first chunk.
+
+
 ## 2026-11-28 (reboot): usbsh reboot / fastboot / recovery
 
 `usbsh` now has `reboot`, `reboot fastboot`, `reboot recovery` and `halt`.
