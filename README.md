@@ -21,7 +21,7 @@ device tree, and XNU mounts a 16 GiB HFS+ image from the start of `userdata`. Sp
 the home screen, Settings opens, touch and the volume/power keys respond, all eight CPUs are
 initialised, and the kernel log and a shell come out over USB. The GPU is the current wall: the
 ported Adreno 650 driver brings up the whole block and draws its own test frame, but Mesa client
-submissions stop 256 dwords into the first indirect buffer, so the client's frame reads as zeros.
+submissions reach the command processor but the pipeline wedges mid-IB; the frame is mostly zeros with a white corner. With one SMMU space per client (`gpu_spaces=1`) the earlier opcode error is gone and the CP consumes ~448 dwords before the hang.
 
 > Experimental bring-up, not a usable phone OS. The iOS root lives in the `userdata` partition and
 > **erased Android's user data** when it was flashed (bootloader, boot, dtbo, vbmeta, super,
@@ -46,7 +46,7 @@ submissions stop 256 dwords into the first indirect buffer, so the client's fram
 | USB | **Works.** Device mode: CDC-ACM console at `1209:316d`, manufacturer `Xiaomi`, product `Mi 11X`; the kernel log always flows and a shell attaches on demand |
 | SWEETBOX | **Works.** A 1 MiB mailbox before the log ring accepts a checksummed payload from recovery ADB and installs it on the next boot; a new `/usr/local/bin/usbsh` was installed this way without reflashing `userdata` |
 | GPU core | **Works.** The ported hakios-alioth Adreno 650 driver (patch `0200`) brings up zap/TrustZone, GMU firmware, HFI, the 3D core, the command processor, SMMU, the 2D fill and the panel, publishes `HakiosGPU` (msm-DRM ABI), takes the GPU interrupt (INTID 332 / SPI 300) and draws its orange/white/blue test bands |
-| GPU client | **Broken.** Mesa 25.0.7/freedreno identifies `FD650` and `gl_test` reaches the end of its steps, but every client submission stops 256 dwords into the first indirect buffer (`CP int 0x1`), so the drawn frame is zeros. It drew the triangle correctly once, on 2026-11-27 |
+| GPU client | **Partly working.** Mesa 25.0.7/freedreno identifies `FD650` and `gl_test` completes every step; with `gpu_spaces=1` the CP no longer raises an opcode error and consumes ~448 dwords of the IB before the pipeline wedges (`HLSLQ/SP` busy, no fault bit). The readback shows a white corner rather than the 26% triangle. The triangle was drawn correctly once, on 2026-11-27 |
 | Wi-Fi / BT / cellular / audio / camera | **No drivers.** Wi-Fi is the next research project (see below) |
 | Haptics / torch | **Parked.** The AW8697 never answers on the assumed GENI SE11 bus (the probe resets the boot before its first print), so its real bus and GPIOs still need checking; the flash module reports type `0x18`/subtype `0x0000`, not PM8150L, so the torch driver refuses |
 | Persistent boot | **Prepared, not applied.** `boot_b` image, installer and restore path are documented and measured; nothing has been flashed |
@@ -307,18 +307,18 @@ Verified on alioth:
 - The Mesa 25.0.7/freedreno client (`gl_test`, `libOSMesa.8.dylib`, the `hakios-drm` stand-in) gets
   `FD650`, allocates buffers, maps them and submits; `gl_test` reaches its last step.
 
-What is broken: every client submission stops after exactly **256 dwords** of the first indirect
-buffer, with `CP int 0x1` (opcode error), `CP_SQE_STAT_DATA` reading 0 and `CP_IB1_REM_SIZE`
-freezing at 1736-256. That is 1 KiB, one CP IB prefetch chunk, so the fault points at how the IB
-memory is presented (cache attributes or the second chunk fetch), not at the packet order. It
-reproduces with the reference submit ported verbatim, in a shared SMMU space. The resulting frame
-is zeros. The same client drew the triangle correctly once on 2026-11-27; later submissions timed
-out and the recent changes made the 256-dword stop consistent.
+What is broken: the pipeline wedges mid-IB instead of finishing. With the default one shared SMMU
+space the CP stopped after exactly **256 dwords** with `CP int 0x1` (opcode error, `CP_SQE_STAT_DATA`
+0). With `gpu_spaces=1` (one space per client, which is what the working reference build uses) the
+opcode error is gone: the CP consumes about **448 dwords** (`CP_IB1_REM_SIZE` 1736 -> 1288,
+`ROQ 247`) and then sits with `RBBM_STATUS 0xe51005` (CP/HLSQ/SP/VPC/PC busy), no fault bit and the
+fence word still 0 — the same "no fault, only a wait timeout" signature `hakios-metal` documents.
+The readback is no longer all zeros: a white corner and ~15k pixels inside the triangle, against
+26% expected. The triangle itself was drawn correctly once, on 2026-11-27.
 
-The current default is one shared SMMU space (`gpu_spaces=0`); `gpu_spaces=1` restores per-client
-tables, which stopped the CP on the first submission earlier. The next experiment is to allocate
-GEM buffers the way the reference does and/or with cache-inhibited attributes, and watch
-`CP_IB1_REM_SIZE` after the first chunk.
+Next: name the packet at IB dword 448 (end of binning or a nested indirect buffer), check whether a
+per-client space needs `CP_SMMU_TABLE_UPDATE` (0x53, present in the reference's metal notes), and
+make a hung client wait always print the last CP command and IB offset before recovering.
 
 A lesson worth keeping: SMMU/GMU registers are emulated by the hypervisor and only plain,
 non-inlined single `ldr`/`str` accesses work — a C loop can compile to a post-indexed load and
