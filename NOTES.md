@@ -2321,3 +2321,20 @@ failed` (xnu-cc, `gh run view 45852234119`). Next: temporary-boot with
 `haptichakios=1 haptichakiosdelay=0` and confirm the GUI appears with either
 the AW8697 proof or exactly one timeout line. Notes:
 `hakios-port-small/PORT-NOTES.md`.
+
+## 2026-11-28 (splitboot): Open Mapple's dual boot checked against alioth — defer
+
+Read `open-mapple/mapple_splitboot` and its site: it is **not** a bootloader
+replacement and **not** A/B. It carves `xnusys` off the end of `userdata` in the
+GPT, flashes an HFS+ root into it, and chains a menu (`mtkloader` + PMIC keys)
+in front of Android's own kernel in the boot image; the menu either relocates
+Android's `Image` to 0x40080000 or boots XNU. The bootloader stays stock. The
+code is MediaTek-only (MTK display/PMIC/UART, 0x40080000, 32 MiB boot), and its
+carve direction would hand our iOS root's first 16 GiB back to Android. The
+alioth equivalent is a GPT **front**-carve (`darwin` over the existing HFS
+volume, `userdata` moved after it), a menu in our shim, and `fastboot
+set_active` done from the shim via `misc`; our kernel already takes a root by
+GPT name (`ufsroot=`). Deferred: the only new brick vector is the first GPT
+write, which Power+VolDown/`fastboot boot`/`boot_a` do not cover.
+Decision doc: `docs/splitboot-feasibility.md`.
+https://github.com/open-mapple/mapple_splitboot · https://open-mapple.pages.dev/splitboot/
