@@ -7,9 +7,14 @@ The three reboot modes call `ioctl(/dev/hakios-usb, HAKIOS_USB_RESTART, &mode)`
 uncached), writes `restart_reason@65c` (0x146bf65c alioth / 0x146aa65c sweet,
 `board_imem=`), `dsb sy`, prints `hakios: restart reason 0x... written (mode
 N); restarting`, then `reboot_kernel(RB_AUTOBOOT, NULL)` -- the `reboot(2)`
-path to `PEHaltRestart(kPERestartCPU)`. 0016 now implements
+path to `PEHaltRestart(kPERestartCPU)`. **0120** implements
 `SweetPlatformExpert::haltRestart()` with PSCI SYSTEM_RESET/SYSTEM_OFF;
 without it `PE_halt_restart` is NULL and the kernel spins at `MACH Reboot`.
+CI 46127059873 failed because the hook was first put in 0016, which changed
+0059's context; 0016 is restored byte-for-byte from `hakios-integrate`
+(`4822377`) and 0120 is the only addition. Chain verified on the 46123576757
+buildtree with 0200..0501 reversed: 0001..0119 -> 0120 -> 0200 -> 0300 ->
+0400 -> 0500 -> 0501 all apply.
 Reason values follow LK/Xiaomi aboot: fastboot 0x77665500, recovery
 0x77665502, normal/ADB 0x77665501 (the shim's `RESTART_BOOTLOADER` is the
 fastboot value). 0300 regenerated from a pre-0300 46123576757 buildtree,

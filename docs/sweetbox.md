@@ -170,7 +170,7 @@ tools/sweet-box.py apply /tmp/usbsh.box
 ```
 
 The `fastboot`/`recovery` modes also need the matching kernel (0300's
-`HAKIOS_USB_RESTART` and 0016's `haltRestart`); see `docs/usb-shell.md`.
+`HAKIOS_USB_RESTART` and 0120's `haltRestart`); see `docs/usb-shell.md`.
 
 ### Reading the result
 

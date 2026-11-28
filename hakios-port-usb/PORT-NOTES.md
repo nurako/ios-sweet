@@ -427,7 +427,7 @@ msm-poweroff convention: `FASTBOOT_MODE 0x77665500`, `RECOVERY_MODE
 was probably lost (it still booted Android), hence the uncached kernel write.
 
 `reboot_kernel` is the `reboot(2)` path (sync, proc_shutdown, unmount,
-`host_reboot` -> `halt_all_cpus` -> `PEHaltRestart(kPERestartCPU)`). 0016 now
+`host_reboot` -> `halt_all_cpus` -> `PEHaltRestart(kPERestartCPU)`). 0120 now
 gives `SweetPlatformExpert` a `haltRestart()` that issues PSCI `SYSTEM_RESET`
 (and `SYSTEM_OFF` for `kPEHaltCPU`); before that `PE_halt_restart` was NULL and
 the kernel spun at `MACH Reboot`. `halt` uses `reboot(RB_HALT)` directly.

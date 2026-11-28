@@ -1258,7 +1258,7 @@ usbdev_select(__unused dev_t dev, int which, void *wql, struct proc *p)
  *
  * reboot_kernel() is the same path as reboot(2): sync, kill processes, unmount, then
  * host_reboot -> halt_all_cpus -> PEHaltRestart(kPERestartCPU). It only actually resets
- * with the platform expert's haltRestart (patch 0016), which issues PSCI SYSTEM_RESET.
+ * with the platform expert's haltRestart (patch 0120), which issues PSCI SYSTEM_RESET.
  */
 static int
 hakios_restart(int mode)
