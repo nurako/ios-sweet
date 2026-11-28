@@ -3818,7 +3818,7 @@ static uint64_t gpu_ticks;              /* how long the core has worked on the s
 static volatile uint64_t gpu_busy_total; /* ... the same, never set back: the governor's (gpu_gov_thread) */
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
-static TUNABLE(uint32_t, gTableUpdate, "gpu_table_update", 0);
+static TUNABLE(uint32_t, gTableUpdate, "gpu_table_update", 1);
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
@@ -4190,13 +4190,13 @@ gpu_spaces_on(void)
 {
 	if (gpu_spaces < 0) {
 		/*
-		 * The reference (hakios-metal, drivers/board/adreno.c:3676 hakios_gpu_submit)
-		 * has one SMMU space for every client and no CP_SMMU_TABLE_UPDATE in the
-		 * ring; its draws complete there. A per-client space needs that packet
-		 * (Linux a6xx_set_pagetable) and ours is still unproven on this phone, so
-		 * gpu_spaces=1 alone is refused rather than wedging the front end again.
+		 * Measured on the phone (2026-11-28): a client draw completes only with a
+		 * space of its own AND CP_SMMU_TABLE_UPDATE in the ring; with the shared
+		 * space the command processor refuses an opcode 256 dwords into the IB.
+		 * Both are the default, then; gpu_spaces=0 and gpu_table_update=0 restore
+		 * the earlier experiments.
 		 */
-		uint32_t value = 0;
+		uint32_t value = 1;
 
 		PE_parse_boot_argn("gpu_spaces", &value, sizeof(value));
 		gpu_spaces = value != 0;
