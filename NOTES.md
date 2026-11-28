@@ -1,4 +1,27 @@
 
+## 2026-11-28 (late 2) - GPU: the hakios-metal reference runs one shared SMMU space
+
+The native-Metal reference (now `oosexgang/hakios-xnu-kernel`,
+`components/metal`; old repo `oosexgang/hakios-metal`) speaks the same
+HakiosGPU/msm ABI. Its kernel submit (`drivers/board/adreno.c:3676-3732`) is:
+`ring_time(fence,0)`, `CP_EVENT_WRITE INVALIDATE_DEPTH`, `... INVALIDATE_COLOR`,
+one `CP_INDIRECT_BUFFER` per command buffer, optional `CP_WAIT_FOR_IDLE`,
+`ring_time(fence,1)`, `CP_SCRATCH_REG2 = fence`, and a 4-word `CACHE_FLUSH`
+event; **no** SMMU table update, no protected mode, no CP_PROTECT. Its wait
+(`drivers/iokit/BoardGPU.cpp:276-309`) polls the fence word, and a >=1 s timeout
+calls `hakios_gpu_report("no answer")` then `hakios_gpu_recover()`; the report
+names the command by `CP_IB1_BASE`/`CP_IB1_REM_SIZE` (`adreno.c:3745-3752`).
+The draw's batch start (CP_SET_MODE, the three invalidates, HLSQ_INVALIDATE_CMD,
+WFI, static registers, CP_SET_DRAW_STATE disable-all) is in the IB, not the ring.
+
+Changes this round: default `gpu_spaces=0` (the reference's one space), and
+`gpu_spaces=1` is refused with a line unless `gpu_table_update=1` or the
+`gpu_ring_switch` window is open (our CP table-update encoding is still
+unproven). Removed the pre-IB `CACHE_INVALIDATE` that is not in the reference;
+it stays inside the `gpu_table_update=1` switch. The timeout/recover path now
+prints `CP_IB1` dwords/ROQ and decodes the packet at `IB dword N`, eight dwords
+either side. 0200 regenerated; `check-patch-sources` 9 match; xnu-cc 0/2.
+
 ## 2026-11-28 (gpu2): systematic diff against the working alioth reference
 
 Fetched the real driver for this phone (xiongnemo/hakios-alioth, branch

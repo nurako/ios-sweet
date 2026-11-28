@@ -38,3 +38,15 @@ ring_send (CP_RB_WPTR)
 
 No IB splitting: `words` is `cmd.size / 4` (Linux `submit_cmd.size / 4`).
 `CP_SCRATCH_REG2` is 0x0885 (type-4 register write).
+
+## The native-Metal reference (`oosexgang/hakios-xnu-kernel`, `components/metal`)
+
+It speaks the same HakiosGPU/msm ABI and its kernel submit is byte-for-byte the
+block above (`drivers/board/adreno.c:3676-3732`) — with no SMMU switch, no
+`CP_SET_PROTECTED_MODE`, no `CP_PROTECT`, and no IB split. `gpuWait`
+(`drivers/iokit/BoardGPU.cpp:276-309`) polls `hakios_gpu_done(fence)` every
+200 us; a wait of >= 1 s prints `hakios_gpu_report("no answer")` and then, with
+`gpu_recover=1`, resets the core. The report names the stuck command by
+`CP_IB1_BASE` and `CP_IB1_REM_SIZE` (`adreno.c:3745-3752`). Its one address
+space is what ours now defaults to: a per-client space needs
+`CP_SMMU_TABLE_UPDATE`, and ours is still behind `gpu_table_update=1`.

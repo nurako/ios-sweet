@@ -82,6 +82,7 @@ uint32_t hakios_gpu_ring_rptr(void);
 uint32_t hakios_gpu_ib_rem(void);
 uint32_t hakios_gpu_roq_ib1(void);
 void hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr);
+void hakios_gpu_ib_dump(const char *why);       /* defined below, called from bsd/dev/hakios.adreno.c */
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
@@ -219,6 +220,96 @@ static bool gGPUReported;
 static const uint8_t * gLastIb;                  /* the last submission's first IB, for the hang dump */
 static uint32_t gLastIbWords;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+
+/* The command processor's opcodes that a hung draw is likely to stop on (adreno_pm4.xml). */
+static const char *
+cpOpcodeName(uint32_t opcode)
+{
+	switch (opcode) {
+	case 0x10: return "CP_NOP";
+	case 0x12: return "CP_WAIT_MEM_WRITES";
+	case 0x13: return "CP_WAIT_FOR_ME";
+	case 0x26: return "CP_WAIT_FOR_IDLE";
+	case 0x2c: return "CP_BLIT";
+	case 0x3c: return "CP_WAIT_REG_MEM";
+	case 0x3d: return "CP_MEM_WRITE";
+	case 0x3f: return "CP_INDIRECT_BUFFER";
+	case 0x46: return "CP_EVENT_WRITE";
+	case 0x48: return "CP_ME_INIT";
+	case 0x53: return "CP_SMMU_TABLE_UPDATE";
+	case 0x5f: return "CP_SET_PROTECTED_MODE";
+	case 0x65: return "CP_SET_MARKER";
+	case 0x66: return "CP_SET_SECURE_MODE";
+	case 0x73: return "CP_MEM_TO_MEM";
+	case 0x75: return "CP_MEMCPY";
+	default: return "CP_OPCODE";
+	}
+}
+
+/*
+ * The dwords around where the command processor stopped, and the packet that contains the
+ * last one it ran. The reference names the hang by CP_IB1_BASE and CP_IB1_REM_SIZE
+ * (drivers/board/adreno.c:3750-3752); the dword in that buffer is what turns "a draw is stuck"
+ * into "the draw stopped at this packet", which is what adreno_loud=1 is for.
+ */
+void
+hakios_gpu_ib_dump(const char *why)
+{
+	const uint32_t *ib = (const uint32_t *)gLastIb;
+	uint32_t rem, consumed, from, to;
+
+	if (!gGPULoud || ib == NULL || gLastIbWords == 0) {
+		return;
+	}
+	rem = hakios_gpu_ib_rem();
+	if (rem > gLastIbWords) {
+		IOLog("HakiosGPU: loud: %s: IB rem %u is past the %u words already submitted: not this IB\n", why, rem,
+		    gLastIbWords);
+		return;
+	}
+	consumed = gLastIbWords - rem;
+	from = consumed > 8 ? consumed - 8 : 0;
+	to = MIN(consumed + 8, gLastIbWords);
+	IOLog("HakiosGPU: loud: %s: at IB dword %u of %u (CP_IB1_REM_SIZE %u, ROQ_AVAIL_IB1 %#x); dwords %u..%u:", why,
+	    consumed, gLastIbWords, rem, hakios_gpu_roq_ib1(), from, to);
+	for (uint32_t k = from; k < to; k++) {
+		IOLog("%s%u:%08x", k == consumed ? " [" : " ", k, ib[k]);
+		if (k == consumed) {
+			IOLog("]");
+		}
+	}
+	IOLog("%s\n", consumed < gLastIbWords ? " (the bracketed dword is the next one the CP would run)" : "");
+
+	if (consumed != 0) {
+		uint32_t pc = 0, hdrAt = 0, hdr = 0, len = 0;
+		bool found = false;
+
+		while (pc < consumed) {
+			hdr = ib[pc];
+			if ((hdr >> 28) == 4) {
+				len = 1 + (hdr & 0x7f);
+			} else if ((hdr >> 28) == 7) {
+				len = 1 + (hdr & 0x3fff);
+			} else {
+				pc++;
+				continue;
+			}
+			if (pc + len >= consumed) {
+				hdrAt = pc;
+				found = true;
+				break;
+			}
+			pc += len;
+		}
+		if (found && (hdr >> 28) == 4) {
+			IOLog("HakiosGPU: loud:   the packet at IB dword %u is a type-4 write of %u register(s) from 0x%x "
+			    "(0x%08x)\n", hdrAt, hdr & 0x7f, (hdr >> 8) & 0x3ffff, hdr);
+		} else if (found) {
+			IOLog("HakiosGPU: loud:   the packet at IB dword %u is %s (opcode 0x%x, %u words, 0x%08x)\n", hdrAt,
+			    cpOpcodeName((hdr >> 16) & 0x7f), (hdr >> 16) & 0x7f, hdr & 0x3fff, hdr);
+		}
+	}
+}
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
@@ -489,16 +580,6 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u; "
 			    "IB rem %u, ROQ_AVAIL_IB1 %#x\n", fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(),
 			    hakios_gpu_last(), hakios_gpu_ib_rem(), hakios_gpu_roq_ib1());
-			if (gLastIb != NULL && gLastIbWords != 0 && hakios_gpu_ib_rem() <= gLastIbWords) {
-				uint32_t consumed = gLastIbWords - hakios_gpu_ib_rem(), from = consumed >= 8 ? consumed - 8 : 0;
-
-				IOLog("HakiosGPU: loud: hung at IB dword %u of %u; dwords %u..%u:", consumed, gLastIbWords, from,
-				    MIN(consumed + 8, gLastIbWords));
-				for (uint32_t k = from; k < MIN(consumed + 8, gLastIbWords); k++) {
-					IOLog(" %u:%08x", k, ((const uint32_t *)gLastIb)[k]);
-				}
-				IOLog("%s\n", consumed < gLastIbWords ? " (the dword at the stop is the first after the colon)" : "");
-			}
 		}
 	}
 	return false;
