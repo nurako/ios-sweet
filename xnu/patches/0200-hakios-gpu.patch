@@ -14,10 +14,10 @@ index dee13fe..380b8b9 100644
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/hakios.adreno.c b/bsd/dev/hakios.adreno.c
 new file mode 100644
-index 0000000..fd34355
+index 0000000..2a85a6e
 --- /dev/null
 +++ b/bsd/dev/hakios.adreno.c
-@@ -0,0 +1,5518 @@
+@@ -0,0 +1,5545 @@
 +/*
 + * The GPU of the POCO X5 Pro (HK, Adreno 642L/Yupik) or Xiaomi Mi 10 (UMI,
 + * Adreno 650/Kona), woken step by step toward a picture that it fills and the panel shows.
@@ -2722,6 +2722,7 @@ index 0000000..fd34355
 +#define CP_SQE_STAT_ADDR        GPU_WORD(0x0908)
 +#define CP_SQE_STAT_DATA        GPU_WORD(0x0909)
 +#define CP_IB1_DWORDS          GPU_WORD(0x0943)
++#define CP_ROQ_AVAIL_IB1       GPU_WORD(0x0949)
 +#define CP_SET_PROTECTED_MODE  0x5f
 +#define CP_SMMU_TABLE_UPDATE   0x53
 +#define CP_ROQ_AVAIL_IB1        GPU_WORD(0x0949)       /* (a6xx: bits 16-31 the words still in the ROQ) */
@@ -3835,6 +3836,7 @@ index 0000000..fd34355
 +static volatile uint64_t gpu_busy_total; /* ... the same, never set back: the governor's (gpu_gov_thread) */
 +static uint32_t gpu_timed_count;
 +static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
++static TUNABLE(uint32_t, gTableUpdate, "gpu_table_update", 0);
 +static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 +uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
 +extern void hakios_tl(const char *format, ...) __printflike(1, 2);
@@ -4516,6 +4518,18 @@ index 0000000..fd34355
 +	return core_runs ? rd(gpu.base + CP_RB_RPTR) : 0;
 +}
 +
++uint32_t
++hakios_gpu_ib_rem(void)
++{
++	return core_runs ? rd(gpu.base + CP_IB1_REM_SIZE) : 0;
++}
++
++uint32_t
++hakios_gpu_roq_ib1(void)
++{
++	return core_runs ? rd(gpu.base + CP_ROQ_AVAIL_IB1) : 0;
++}
++
 +/* The ring's software pointers and the core's, for the handover line and the loud submit lines. */
 +void
 +hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr)
@@ -4804,7 +4818,7 @@ index 0000000..fd34355
 +	 * a6xx_set_pagetable (and the metal reference) put CP_SMMU_TABLE_UPDATE in
 +	 * the ring before the IB. Then the UCHE must drop the previous space's lines.
 +	 */
-+	if (gpu_spaces_on() && gpu_space_now != NULL) {
++	if (gTableUpdate && gpu_spaces_on() && gpu_space_now != NULL) {
 +		uint64_t root = kvtophys((vm_offset_t)gpu_space_now->root);
 +
 +		ring_command(CP_SET_PROTECTED_MODE, 1);
@@ -4818,12 +4832,25 @@ index 0000000..fd34355
 +		ring(EVENT_CACHE_INVALIDATE);
 +		ring_command(CP_SET_PROTECTED_MODE, 1);
 +		ring(1);
++		if (adreno_loud) {
++			printf("adreno: loud: table update dwords: 5f/1/0, 53/4/%#x/%#x/0/%u, EVENT/1/%u, 5f/1/1\n",
++			    (uint32_t)root, (uint32_t)(root >> 32 & 0xffff) | (gpu_space_now->context & 0xffff) << 16,
++			    core_space.context, EVENT_CACHE_INVALIDATE);
++		}
 +	}
 +	ring_time(gpu_fence, 0);
 +	ring_command(CP_EVENT_WRITE, 1);
 +	ring(EVENT_INVALIDATE_DEPTH);
 +	ring_command(CP_EVENT_WRITE, 1);
 +	ring(EVENT_INVALIDATE_COLOR);
++	{
++		uint32_t at = ring_at;
++		ring_command(CP_EVENT_WRITE, 1);
++		ring(EVENT_CACHE_INVALIDATE);
++		if (adreno_loud) {
++			printf("adreno: loud: preamble: CACHE_INVALIDATE at ring %u..%u\n", at, ring_at - 1);
++		}
++	}
 +	for (uint32_t i = 0; i < count; i++) {
 +		if (i == 0) {
 +			last_ib_address = addresses[i];
@@ -6693,10 +6720,10 @@ index b5b3ba9..57a3567 100644
  			paddr = kvtophys(addr);
 diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
 new file mode 100644
-index 0000000..3eda559
+index 0000000..8089db6
 --- /dev/null
 +++ b/iokit/Kernel/hakios.gpu.cpp
-@@ -0,0 +1,2275 @@
+@@ -0,0 +1,2294 @@
 +/*
 + * HakiosGPU: the phone's Adreno for programs to draw with.
 + *
@@ -6778,6 +6805,8 @@ index 0000000..3eda559
 +uint32_t hakios_gpu_space_context(void *space);
 +uint64_t hakios_gpu_space_root(void *space);
 +uint32_t hakios_gpu_ring_rptr(void);
++uint32_t hakios_gpu_ib_rem(void);
++uint32_t hakios_gpu_roq_ib1(void);
 +void hakios_gpu_ring_snapshot(uint32_t *at, uint32_t *sent, uint32_t *rptr, uint32_t *wptr);
 +void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 +void hakios_gpu_report(const char * why);
@@ -6913,6 +6942,8 @@ index 0000000..3eda559
 +
 +static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 +static bool gGPUReported;
++static const uint8_t * gLastIb;                  /* the last submission's first IB, for the hang dump */
++static uint32_t gLastIbWords;
 +static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 +
 +/* What the last seconds' submissions were and cost here, for the log. */
@@ -7181,8 +7212,19 @@ index 0000000..3eda559
 +		if (fence != saidFence || mach_absolute_time() - saidAt >= oneSecond) {
 +			saidFence = fence;
 +			saidAt = mach_absolute_time();
-+			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u\n",
-+			    fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(), hakios_gpu_last());
++			IOLog("HakiosGPU: loud: fence %u NOT DONE after %llu us (patience %llu ms); fence word %u, last submitted %u; "
++			    "IB rem %u, ROQ_AVAIL_IB1 %#x\n", fence, ns / NSEC_PER_USEC, milliseconds, hakios_gpu_fence_word(),
++			    hakios_gpu_last(), hakios_gpu_ib_rem(), hakios_gpu_roq_ib1());
++			if (gLastIb != NULL && gLastIbWords != 0 && hakios_gpu_ib_rem() <= gLastIbWords) {
++				uint32_t consumed = gLastIbWords - hakios_gpu_ib_rem(), from = consumed >= 8 ? consumed - 8 : 0;
++
++				IOLog("HakiosGPU: loud: hung at IB dword %u of %u; dwords %u..%u:", consumed, gLastIbWords, from,
++				    MIN(consumed + 8, gLastIbWords));
++				for (uint32_t k = from; k < MIN(consumed + 8, gLastIbWords); k++) {
++					IOLog(" %u:%08x", k, ((const uint32_t *)gLastIb)[k]);
++				}
++				IOLog("%s\n", consumed < gLastIbWords ? " (the dword at the stop is the first after the colon)" : "");
++			}
 +		}
 +	}
 +	return false;
@@ -8436,6 +8478,10 @@ index 0000000..3eda559
 +		}
 +		addresses[count] = b->address + cmds[i].submit_offset;
 +		words[count++] = cmds[i].size / 4;
++		if (count == 1 && b->kernel != NULL) {
++			gLastIb = b->kernel + cmds[i].submit_offset;
++			gLastIbWords = cmds[i].size / 4;
++		}
 +	}
 +	GPU_LOUD("HakiosGPU: loud: submit: client fence field %u, %u command buffers at", request->fence, count);
 +	if (gGPULoud && count != 0) {

@@ -13,6 +13,16 @@ the handover); next boot `gpu=1 gpu_irq=1 adreno_loud=1`, then add
 per-client spaces by default (`gpu_spaces=1`), not the shared space.
 Details: `hakios-port-ref/DIFF-SUBMIT.md`.
 
+## 2026-11-28 (gpu2): table update opt-in; UCHE invalidate before IB
+
+The SMMU-table-update packet sequence returned CP opcode error, so it is behind
+gpu_table_update=1 (default 0) and the Linux/reference bytes are recorded in
+hakios-port-ref/DIFF-SUBMIT.md. Default per-client path now emits only the
+verified CP_EVENT_WRITE CACHE_INVALIDATE before the IBs; timeout prints IB rem,
+ROQ_AVAIL_IB1 and 8 IB dwords around the stop. 0200 regenerated (guard 9/9);
+regen-0200.sh copied from hakios-integrate but the CI tree version skew needed
+the splice path.
+
 ## 2026-11-28 (gpu2): per-client SMMU table update in the ring
 
 Per-client run stalls 448 dwords into the IB with ROQ full, no fault. The ring
