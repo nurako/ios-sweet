@@ -2449,3 +2449,40 @@ unchanged — finish GL/submit first; then this is the concrete reference for th
 facade, and its userland bundle can be built offline in parallel.**
 Doc: `docs/guacamole-ios16-metal.md`.
 https://github.com/coreycusick/ios-guacamole/tree/ios16
+
+## 2026-11-28 (registry): iOSOnAnd surveyed — native-Metal and QCA6390 leads
+
+Read <https://hackios.appaiproxy.com/> (iOSOnAnd) and its public JSON API: 296 phones, 600 repos,
+26 areas, per-row provenance (`reddit claim` / registry / maintainer / artifact). Registry, not a
+wiki or marketing; operator not disclosed. Full inventory, claims-vs-evidence table and ranked
+reading list: `docs/hackios-port-registry.md`. Read-only; no build, flash or device command.
+
+Top three finds for our open problems:
+
+1. **(a)(b)(c) `oosexgang/hakios-metal`** (MIT; now `oosexgang/hakios-xnu-kernel/hakios-metal/`):
+   a native Metal implementation in C++ on the **msm-DRM/HakiosGPU ABI**, PM4 + a6xx encoders checked
+   against Mesa XML, compute/blit/first draw, AIR→NIR→ir3 without Vulkan. Same kernel ABI as ours,
+   unlike AdrenoMetal's NativeAdreno/v2 + Turnip. Its README records our hang signature: a dispatch
+   that never finishes sets **no fault bit**, only the wait timeout; `gpu_recover=1` resets in ~0.1 s
+   and names the hanging line. Read before more AdrenoMetal work.
+   https://github.com/oosexgang/hakios-metal
+
+2. **(e)(f) `rui12366B/UniXNU-gts7xlwifi`**: SM8250-AB + Adreno 650 (same family/GPU as alioth),
+   iPadOS 17.7.11, with **QCA6390 Wi-Fi via Linux ath11k + a wpa_supplicant service**, ADSP audio,
+   persistent UFS Data and USB device mode. The only non-HakiOS QCA6390+SM8250 working Wi-Fi found
+   in this survey; its README is a state table with per-area detail, not a claim list.
+   https://github.com/rui12366B/UniXNU-gts7xlwifi
+
+3. **(a)(b) the reference's `docs/ru/metal.md` and `bsd/dev/hakios.adreno.c`**: the exact Metal
+   discovery chain (`IOAcceleratorES` → `MetalPluginName`/`MetalPluginClassName` → bundle →
+   `_MTLDevice` subclass), proof the port publishes an empty `IOAcceleratorES` ("sgx") so
+   CoreAnimation does not wait 30 s, and the per-client SMMU switch that lives in
+   `bsd/dev/hakios.adreno.c` (`space_switch`/`ring_switch`, `CP_SMMU_TABLE_UPDATE 0x53`), not in
+   `drivers/gpu` — the file our 11-27 diff read. Lead for the 256-dword stop under `gpu_spaces=1`.
+   https://github.com/xiongnemo/hakios-alioth/blob/alioth/docs/ru/metal.md
+
+Correction to our framing: Metal is **not** required for a GPU-composited UI on iOS 16 — the
+reference's SpringBoard/backboardd composite through its own EAGLContext on Mesa/freedreno; Metal is
+for installed apps. The compositor path is GLES, so the submit stall still gates the UI. Also, Wi-Fi
+on alioth is solved on the HakiOS stack (ath11k/LinuxKPI, 5 GHz); the UniXNU alioth "no Wi-Fi" is a
+different stack failing at PCIe DBI step 10 with ath12k, not a chip limit.
